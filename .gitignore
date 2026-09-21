@@ -6,6 +6,8 @@ web/dist/
 .env
 .env.*
 !.env.example
+!.env.*.example
+/.wrangler.*.generated.json
 *.log
 coverage/
 test-results/

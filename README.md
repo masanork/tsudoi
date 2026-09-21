@@ -29,23 +29,23 @@ See the full product and technical requirements in [`docs/specification.md`](doc
 
 `wrangler.jsonc` is a public template. It contains no account-specific resource IDs or production domains. The default environment is intended for local development and the Deploy to Cloudflare button; `staging` and `production` are named environments with separate resource names.
 
-Before deploying `staging` or `production`, replace the `example.com` hostnames and verified sender address in the corresponding environment. The `RP_ID` must be the hostname used by `APP_ORIGIN`. Configure a custom domain in the Cloudflare dashboard, or add a `routes` entry to your private deployment configuration.
+Before deploying `staging` or `production`, copy `.env.<environment>.example` to `.env.<environment>.local` and fill in the account, resource, domain, and verified sender values. The local file is ignored by git. `RP_ID` must be the hostname used by `APP_ORIGIN`.
 
-Resource IDs are intentionally omitted. Wrangler/Deploy to Cloudflare can provision D1, R2, KV, and Queue resources from their names. If you bind existing resources instead, add their IDs in a private environment-specific config and never commit account-specific values or secrets.
+Resource IDs are intentionally omitted from the public template. The deploy wrapper generates an ignored, environment-specific Wrangler config from the local env file. Leave an ID empty to let Wrangler provision a resource, or provide an existing resource ID. Routes and verified email senders are also supplied by the local env file.
 
 ```bash
 # Local
 npm run db:migrate:local
 npm run dev
 
-# Deploy after configuring the selected environment
+# Deploy after creating .env.<environment>.local
 npm run deploy:staging
 npm run db:migrate:staging
 npm run deploy:production
 npm run db:migrate:production
 ```
 
-Apply the remote migration after the first deployment has provisioned the selected D1 database. For a Deploy to Cloudflare button deployment, select or update the build/deploy commands as needed in the generated project.
+Apply the remote migration after the first deployment has provisioned the selected D1 database. The Deploy to Cloudflare button continues to use the public template; environment-specific deploys use the local wrapper.
 
 ## Local development
 
