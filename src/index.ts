@@ -200,6 +200,37 @@ app.post("/api/participant/logout", async (c) => {
   return c.body(null, 204);
 });
 
+app.post("/api/participant/events/:eventId/message-thread", async (c) => {
+  const attendeeId = c.get("participantAttendeeId");
+  const eventId = c.req.param("eventId");
+  const attendee = await c.env.DB.prepare("SELECT id FROM attendees WHERE id = ? AND event_id = ? AND status = 'active'").bind(attendeeId, eventId).first();
+  if (!attendee) return c.json({ error: "not_found" }, 404);
+  await c.env.DB.prepare("INSERT OR IGNORE INTO message_threads (id, event_id, attendee_id) VALUES (?, ?, ?)").bind(crypto.randomUUID(), eventId, attendeeId).run();
+  const thread = await c.env.DB.prepare("SELECT id, key_generation, created_at FROM message_threads WHERE event_id = ? AND attendee_id = ?").bind(eventId, attendeeId).first();
+  return c.json(thread, 201);
+});
+
+app.get("/api/participant/messages/:threadId", async (c) => {
+  const rows = await c.env.DB.prepare(`SELECT id, sender_kind, ciphertext, algorithm, key_generation, created_at FROM encrypted_messages
+    WHERE thread_id = ? AND thread_id IN (SELECT id FROM message_threads WHERE attendee_id = ?) ORDER BY created_at`)
+    .bind(c.req.param("threadId"), c.get("participantAttendeeId")).all<{ id: string; sender_kind: string; ciphertext: ArrayBuffer; algorithm: string; key_generation: number; created_at: string }>();
+  return c.json(rows.results.map((row) => ({ ...row, ciphertext: bytesToBase64(row.ciphertext) })));
+});
+
+app.post("/api/participant/messages/:threadId", async (c) => {
+  const body = await jsonBody(c);
+  const ciphertext = requiredString(body, "ciphertext");
+  const algorithm = requiredString(body, "algorithm");
+  const keyGeneration = optionalInteger(body.keyGeneration);
+  if (!ciphertext || !algorithm || !keyGeneration) return badRequest(c, "ciphertext, algorithm, and keyGeneration are required");
+  const thread = await c.env.DB.prepare("SELECT id FROM message_threads WHERE id = ? AND attendee_id = ?").bind(c.req.param("threadId"), c.get("participantAttendeeId")).first<{ id: string }>();
+  if (!thread) return c.json({ error: "not_found" }, 404);
+  const id = crypto.randomUUID();
+  await c.env.DB.prepare("INSERT INTO encrypted_messages (id, thread_id, sender_kind, ciphertext, algorithm, key_generation) VALUES (?, ?, 'attendee', ?, ?, ?)")
+    .bind(id, thread.id, base64ToBytes(ciphertext), algorithm, keyGeneration).run();
+  return c.json({ id }, 201);
+});
+
 app.post("/api/tickets/:ticketId/check-in", requireScope("checkin:write"), async (c) => {
   const ticketId = c.req.param("ticketId");
   const body = await jsonBody(c);
@@ -443,6 +474,7 @@ function optionalInteger(value: unknown) { return typeof value === "number" && N
 function randomToken() { const bytes = new Uint8Array(32); crypto.getRandomValues(bytes); return btoa(String.fromCharCode(...bytes)).replaceAll("+", "-").replaceAll("/", "_").replaceAll("=", ""); }
 async function sha256(value: string) { const bytes = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(value)); return [...new Uint8Array(bytes)].map((byte) => byte.toString(16).padStart(2, "0")).join(""); }
 function base64ToBytes(value: string) { const decoded = atob(value); return Uint8Array.from(decoded, (char) => char.charCodeAt(0)); }
+function bytesToBase64(value: ArrayBuffer) { return btoa(String.fromCharCode(...new Uint8Array(value))); }
 function parseAuthenticatorTransports(value: string) {
   const allowed = ["ble", "cable", "hybrid", "internal", "nfc", "smart-card", "usb"] as const;
   const isTransport = (item: unknown): item is typeof allowed[number] => typeof item === "string" && allowed.some((transport) => transport === item);
