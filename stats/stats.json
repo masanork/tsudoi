@@ -1,9 +1,9 @@
 {
-  "generatedAt": "2026-09-21T14:05:33.245Z",
+  "generatedAt": "2026-09-21T14:05:18.742Z",
   "commit": "5f699a1",
   "worker": {
-    "files": 2,
-    "lines": 16351
+    "files": 1,
+    "lines": 608
   },
   "web": {
     "files": 3,

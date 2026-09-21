@@ -15,7 +15,7 @@ async function files(directory) {
       if (ignored.has(entry.name)) continue;
       const path = join(directory, entry.name);
       if (entry.isDirectory()) output.push(...await files(path));
-      else if (codeExtensions.has(extname(entry.name))) output.push(path);
+      else if (codeExtensions.has(extname(entry.name)) && entry.name !== "worker-configuration.d.ts") output.push(path);
     }
   } catch { /* Optional source directory. */ }
   return output;

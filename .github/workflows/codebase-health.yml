@@ -3,6 +3,8 @@ name: Codebase Health
 on:
   push:
     branches: [main]
+  pull_request:
+    branches: [main]
   workflow_dispatch:
 
 permissions:
@@ -26,8 +28,10 @@ jobs:
       - run: npm run test:coverage
       - run: npx playwright install --with-deps chromium
       - run: npm run test:e2e
-      - run: npm run stats:save
+      - if: github.event_name == 'push'
+        run: npm run stats:save
       - name: Commit dashboard changes
+        if: github.event_name == 'push'
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
