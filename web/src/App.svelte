@@ -6,6 +6,11 @@
   type ParticipantTicket = { id: string; status: string; event_name: string; starts_at: string; ends_at: string; timezone: string; venue_name: string | null; cancellation_closes_at: string | null };
   let token = "";
   let organizationId = "";
+  let organizationName = "";
+  let workspaceReady = false;
+  let isAdministrator = false;
+  let screen: "setup" | "home" | "event" | "admin" = "setup";
+  let setupMessage = "この tsudoi を使い始めるには、初期管理者の Passkey を登録してください。";
   let events: Array<{ id: string; name: string; starts_at: string; status: string }> = [];
   let message = "API トークンと組織 ID を入力してください。";
   let eventName = "";
@@ -39,7 +44,20 @@
   let participantMessage = "チケットを確認しています。";
   const ticketPage = typeof window !== "undefined" && window.location.pathname === "/ticket";
 
-  onMount(() => { if (ticketPage) void loadParticipantTicket(); else if (registrationEventId) void loadRegistration(); });
+  onMount(() => {
+    if (ticketPage) void loadParticipantTicket();
+    else if (registrationEventId) void loadRegistration();
+    else {
+      const saved = localStorage.getItem("tsudoi-workspace");
+      if (saved) {
+        try {
+          const workspace = JSON.parse(saved) as { token: string; organizationId: string; isAdministrator: boolean };
+          token = workspace.token; organizationId = workspace.organizationId; isAdministrator = workspace.isAdministrator;
+          workspaceReady = true; screen = "home"; void loadEvents();
+        } catch { localStorage.removeItem("tsudoi-workspace"); }
+      }
+    }
+  });
 
   async function api(path: string, init: RequestInit = {}) {
     const response = await fetch(`/api${path}`, { ...init, headers: { "content-type": "application/json", authorization: `Bearer ${token}`, ...init.headers } });
@@ -57,6 +75,27 @@
       eventName = ""; eventCapacity = ""; registrationOpensAt = ""; registrationClosesAt = ""; await loadEvents(); message = "イベントを作成しました。";
     } catch (error) { message = error instanceof Error ? error.message : "作成に失敗しました。"; }
   }
+  function saveWorkspace() {
+    localStorage.setItem("tsudoi-workspace", JSON.stringify({ token, organizationId, isAdministrator }));
+  }
+  async function registerInitialAdministrator() {
+    try {
+      if (!organizationName.trim()) throw new Error("組織名を入力してください。");
+      if (!window.PublicKeyCredential) throw new Error("この端末は Passkey に対応していません。");
+      setupMessage = "Passkey を登録しています…";
+      const optionsResponse = await fetch("/api/setup/initial-admin/options", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ organizationName: organizationName.trim() }) });
+      const optionBody = await optionsResponse.json();
+      if (!optionsResponse.ok) throw new Error(optionBody.message ?? optionBody.error ?? "初期設定に失敗しました。");
+      const credential = await startRegistration({ optionsJSON: optionBody.options });
+      const response = await fetch("/api/setup/initial-admin/verify", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ challengeId: optionBody.challengeId, response: credential }) });
+      const workspace = await response.json();
+      if (!response.ok) throw new Error(workspace.message ?? workspace.error ?? "初期設定に失敗しました。");
+      token = workspace.token; organizationId = workspace.organizationId; isAdministrator = true; workspaceReady = true; screen = "home"; saveWorkspace();
+      await loadEvents(); message = "初期管理者を登録しました。まずはイベントを作成しましょう。";
+    } catch (error) { setupMessage = error instanceof Error ? error.message : "Passkey を登録できませんでした。"; }
+  }
+  function openEvent(eventId: string) { selectedEventId = eventId; screen = "event"; void selectEvent(eventId); }
+  function reconnectWorkspace() { saveWorkspace(); screen = "home"; void loadEvents(); }
   async function loadParticipantTicket() {
     try {
       const response = await fetch("/api/participant/ticket", { credentials: "same-origin" });
@@ -153,39 +192,55 @@
   {#if ticketQr}<section aria-labelledby="ticket-qr"><h2 id="ticket-qr">あなたの受付QR</h2><p>会場で提示してください。安全のため、他者へ転送しないでください。</p><img src={ticketQr} alt="受付用QRコード" width="320" height="320" /></section>{/if}
   {#if issuedTicket}<section aria-labelledby="passkey-registration"><h2 id="passkey-registration">Passkey を登録する</h2><p>この端末でチケットを安全に再表示できるようにします。PRF対応Passkeyでは、E2EE鍵の保護にも使用します。</p><button onclick={registerPasskey}>Passkey を登録</button>{#if passkeyMessage}<p class="notice" aria-live="polite">{passkeyMessage}</p>{/if}</section>{/if}
 {:else}
-  <header><p class="eyebrow">EVENT ROSTER</p><h1>tsudoi</h1><p>会場の名簿と受付を、静かに確実に。</p></header>
-  <p class="notice" aria-live="polite">{message}</p>
-  <section aria-labelledby="connection"><h2 id="connection">管理者接続</h2>
-    <label>API トークン<input bind:value={token} type="password" autocomplete="off" /></label>
-    <label>組織 ID<input bind:value={organizationId} /></label>
-    <button onclick={loadEvents}>イベントを読み込む</button>
-  </section>
-  <section aria-labelledby="new-event"><h2 id="new-event">新しいイベント</h2>
+  {#if !workspaceReady || screen === "setup"}
+    <header><p class="eyebrow">WELCOME TO TSUDOI</p><h1>tsudoi</h1><p>最初に、初期管理者を登録します。</p></header>
+    <section class="focus-card" aria-labelledby="initial-admin"><h2 id="initial-admin">初期管理者の Passkey を登録</h2>
+      <p>この端末の Passkey で管理を始めます。登録後はイベントの作成画面だけが表示されます。</p>
+      <label>組織名<input bind:value={organizationName} autocomplete="organization" placeholder="例: つどい実行委員会" required /></label>
+      <button onclick={registerInitialAdministrator}>Passkey を登録して始める</button>
+      <p class="notice" aria-live="polite">{setupMessage}</p>
+    </section>
+  {:else}
+    <header class="app-header"><div><p class="eyebrow">EVENT ROSTER</p><h1>tsudoi</h1></div><nav aria-label="管理ナビゲーション">
+      {#if screen !== "home"}<button class="quiet" onclick={() => screen = "home"}>イベント</button>{/if}
+      {#if isAdministrator}<button class="quiet" onclick={() => screen = "admin"}>管理メニュー</button>{/if}
+    </nav></header>
+    {#if screen === "home"}
+      <p class="notice" aria-live="polite">{message}</p>
+      <section class="focus-card" aria-labelledby="new-event"><h2 id="new-event">新しいイベントを作成</h2>
+        <p>イベント名と日時だけで作成できます。詳細はあとから設定できます。</p>
     <form onsubmit={(event) => { event.preventDefault(); void createEvent(); }}>
       <label>イベント名<input bind:value={eventName} required /></label>
       <label>開始日時<input bind:value={startsAt} type="datetime-local" required /></label>
       <label>終了日時<input bind:value={endsAt} type="datetime-local" required /></label>
-      <label>受付開始（空欄で即時）<input bind:value={registrationOpensAt} type="datetime-local" /></label>
-      <label>受付終了（空欄でイベント終了まで）<input bind:value={registrationClosesAt} type="datetime-local" /></label>
-      <label>定員（空欄で無制限）<input bind:value={eventCapacity} type="number" min="1" /></label>
       <button>作成する</button>
     </form>
-  </section>
-  <section aria-labelledby="events"><h2 id="events">イベント</h2>
-    {#if events.length === 0}<p>まだイベントがありません。</p>{:else}<ul>{#each events as event}<li><strong>{event.name}</strong><span>{event.starts_at} · {event.status} <button onclick={() => selectEvent(event.id)}>名簿と集計</button>{#if event.status === "draft"}<button onclick={() => publishEvent(event.id)}>公開</button>{:else if event.status === "published"}<button onclick={() => closeEvent(event.id)}>終了</button>{/if}</span></li>{/each}</ul>{/if}
-  </section>
-  {#if metrics}
-    <section aria-labelledby="metrics"><h2 id="metrics">イベント集計</h2><p class="muted">Event ID: {selectedEventId}</p>
+      </section>
+      <section aria-labelledby="events"><h2 id="events">あなたのイベント</h2>
+        {#if events.length === 0}<p>まだイベントがありません。</p>{:else}<ul>{#each events as event}<li><div><strong>{event.name}</strong><p class="muted">{event.starts_at} · {event.status}</p></div><button onclick={() => openEvent(event.id)}>管理する</button></li>{/each}</ul>{/if}
+      </section>
+    {:else if screen === "admin"}
+      <section aria-labelledby="admin-menu"><h2 id="admin-menu">管理メニュー</h2><p>管理用の接続情報と組織の設定を扱います。</p>
+        <label>API トークン<input bind:value={token} type="password" autocomplete="off" /></label>
+        <label>組織 ID<input bind:value={organizationId} /></label>
+        <button onclick={reconnectWorkspace}>保存して再接続</button>
+      </section>
+    {:else}
+      <section class="event-title"><h2>{events.find((event) => event.id === selectedEventId)?.name ?? "イベント管理"}</h2><p>必要な作業を選んでください。</p></section>
+      <div class="management-grid"><a href="#roster">名簿を管理</a><a href="#check-in">QR 受付</a><a href="#settings">申込フォーム設定</a></div>
+      {#if isAdministrator}
+        {@const currentEvent = events.find((event) => event.id === selectedEventId)}
+        {#if currentEvent?.status === "draft"}<button class="quiet action" onclick={() => publishEvent(selectedEventId)}>イベントを公開する</button>{:else if currentEvent?.status === "published"}<button class="quiet action" onclick={() => closeEvent(selectedEventId)}>イベントを終了する</button>{/if}
+      {/if}
+      {#if metrics}
+        <section aria-labelledby="metrics"><h2 id="metrics">受付状況</h2>
       <dl class="metrics"><div><dt>申込</dt><dd>{metrics.registrations ?? 0}</dd></div><div><dt>発券</dt><dd>{metrics.issued ?? 0}</dd></div><div><dt>取消</dt><dd>{metrics.cancelled ?? 0}</dd></div><div><dt>受付済</dt><dd>{metrics.checked_in ?? 0}</dd></div><div><dt>未受付</dt><dd>{metrics.not_checked_in ?? 0}</dd></div></dl>
-    </section>
-  {/if}
-  {#if selectedEventId}
-    <section aria-labelledby="roster"><h2 id="roster">名簿</h2><p class="muted">表示中のイベントに追加された項目は、自動的にカラムとして表示されます。</p>
+        </section>
+      {/if}
+      <section aria-labelledby="roster"><h2 id="roster">名簿を管理</h2><p class="muted">申込者と受付状態を確認できます。</p>
       {#if rosterAttendees.length === 0}<p>登録者はいません。</p>{:else}<div class="table-scroll"><table><thead><tr><th>氏名</th><th>メール</th><th>チケット</th>{#each rosterFields as field}<th>{field.label}</th>{/each}</tr></thead><tbody>{#each rosterAttendees as attendee}<tr><td>{attendee.name}</td><td>{attendee.email_normalized ?? ""}</td><td>{attendee.ticket_status}</td>{#each rosterFields as field}<td>{answerText(attendee.answers[field.field_key])}</td>{/each}</tr>{/each}</tbody></table></div>{/if}
-    </section>
-  {/if}
-  {#if selectedEventId}
-    <section aria-labelledby="custom-fields"><h2 id="custom-fields">申込フォームのカスタム項目</h2>
+      </section>
+      <section id="settings" aria-labelledby="custom-fields"><h2 id="custom-fields">申込フォーム設定</h2>
       <form onsubmit={(event) => { event.preventDefault(); void createField(); }}>
         <label>項目キー<input bind:value={fieldKey} pattern={fieldKeyPattern} placeholder="company_name" required /></label>
         <label>表示名<input bind:value={fieldLabel} placeholder="所属" required /></label>
@@ -194,15 +249,16 @@
         <label class="inline"><input bind:checked={fieldRequired} type="checkbox" />必須項目</label><button>項目を追加</button>
       </form>
       {#if fieldMessage}<p class="notice" aria-live="polite">{fieldMessage}</p>{/if}
-    </section>
-  {/if}
-  <section aria-labelledby="check-in"><h2 id="check-in">QR 受付</h2>
+      </section>
+      <section aria-labelledby="check-in"><h2 id="check-in">QR 受付</h2>
     <p>チケット QR から読み取ったリンクを貼り付けてください。</p>
     <form onsubmit={(event) => { event.preventDefault(); void checkInTicketLink(); }}>
       <label>チケットリンク<input bind:value={ticketLink} type="url" inputmode="url" required /></label>
       <button>受付する</button>
     </form>
     {#if checkinMessage}<p class="notice" aria-live="polite">{checkinMessage}</p>{/if}
-  </section>
+      </section>
+    {/if}
+  {/if}
 {/if}
 </main>

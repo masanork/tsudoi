@@ -27,6 +27,50 @@ app.use("*", async (c, next) => {
 
 app.get("/api/health", (c) => c.json({ ok: true }));
 
+app.get("/api/setup/status", async (c) => {
+  const organization = await c.env.DB.prepare("SELECT id FROM organizations LIMIT 1").first();
+  return c.json({ initialSetupRequired: !organization });
+});
+
+app.post("/api/setup/initial-admin/options", async (c) => {
+  const body = await jsonBody(c);
+  const organizationName = requiredString(body, "organizationName");
+  if (!organizationName) return badRequest(c, "organizationName is required");
+  if (await c.env.DB.prepare("SELECT id FROM organizations LIMIT 1").first()) return c.json({ error: "initial_setup_complete" }, 409);
+  const options = await generateRegistrationOptions({
+    rpName: c.env.RP_NAME, rpID: c.env.RP_ID, userID: crypto.getRandomValues(new Uint8Array(16)),
+    userName: "initial-admin", userDisplayName: "初期管理者", attestationType: "none",
+    authenticatorSelection: { residentKey: "required", userVerification: "required" },
+  });
+  const challengeId = crypto.randomUUID();
+  await c.env.DB.prepare("INSERT INTO initial_admin_challenges (id, organization_name, challenge, expires_at) VALUES (?, ?, ?, datetime('now', '+5 minutes'))")
+    .bind(challengeId, organizationName, options.challenge).run();
+  return c.json({ challengeId, options });
+});
+
+app.post("/api/setup/initial-admin/verify", async (c) => {
+  const body = await jsonBody(c);
+  const challengeId = requiredString(body, "challengeId");
+  const response = body.response;
+  if (!challengeId || !isRegistrationResponse(response)) return badRequest(c, "invalid registration response");
+  const challenge = await c.env.DB.prepare("SELECT id, organization_name, challenge FROM initial_admin_challenges WHERE id = ? AND consumed_at IS NULL AND expires_at > CURRENT_TIMESTAMP")
+    .bind(challengeId).first<{ id: string; organization_name: string; challenge: string }>();
+  if (!challenge || await c.env.DB.prepare("SELECT id FROM organizations LIMIT 1").first()) return c.json({ error: "initial_setup_unavailable" }, 409);
+  const verification = await verifyRegistrationResponse({ response, expectedChallenge: challenge.challenge, expectedOrigin: c.env.APP_ORIGIN, expectedRPID: c.env.RP_ID, requireUserVerification: true });
+  if (!verification.verified || !verification.registrationInfo) return c.json({ error: "passkey_verification_failed" }, 400);
+  const organizationId = crypto.randomUUID(), userId = crypto.randomUUID(), tokenId = crypto.randomUUID(), rawToken = `tsu_${randomToken()}`;
+  const credential = verification.registrationInfo.credential;
+  await c.env.DB.batch([
+    c.env.DB.prepare("UPDATE initial_admin_challenges SET consumed_at = CURRENT_TIMESTAMP WHERE id = ?").bind(challenge.id),
+    c.env.DB.prepare("INSERT INTO organizations (id, name) VALUES (?, ?)").bind(organizationId, challenge.organization_name),
+    c.env.DB.prepare("INSERT INTO users (id, display_name) VALUES (?, ?)").bind(userId, "初期管理者"),
+    c.env.DB.prepare("INSERT INTO organization_members (organization_id, user_id, role) VALUES (?, ?, 'owner')").bind(organizationId, userId),
+    c.env.DB.prepare("INSERT INTO passkeys (id, user_id, credential_id, public_key, counter, transports_json, prf_capable) VALUES (?, ?, ?, ?, ?, ?, ?)").bind(crypto.randomUUID(), userId, credential.id, credential.publicKey, credential.counter, JSON.stringify(response.response.transports ?? []), hasPrfEnabled(response.clientExtensionResults) ? 1 : 0),
+    c.env.DB.prepare("INSERT INTO api_tokens (id, organization_id, token_hash, scopes, label) VALUES (?, ?, ?, ?, ?)").bind(tokenId, organizationId, await sha256(rawToken), JSON.stringify(["admin"]), "initial administrator token"),
+  ]);
+  return c.json({ organizationId, token: rawToken }, 201);
+});
+
 app.post("/api/bootstrap", async (c) => {
   const body = await jsonBody(c);
   const name = requiredString(body, "organizationName");
