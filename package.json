@@ -5,8 +5,12 @@
   "type": "module",
   "scripts": {
     "dev": "npm run build:web && wrangler dev",
+    "dev:staging": "npm run build:web && wrangler dev --env staging",
     "build:web": "npm --prefix web run build",
     "build": "npm run build:web && tsc --noEmit",
+    "deploy": "npm run build && wrangler deploy",
+    "deploy:staging": "npm run build && wrangler deploy --env staging",
+    "deploy:production": "npm run build && wrangler deploy --env production",
     "typecheck": "tsc --noEmit && npm --prefix web run check",
     "test": "vitest run --passWithNoTests",
     "test:worker": "vitest run --config vitest.worker.config.ts",
@@ -14,8 +18,9 @@
     "test:e2e": "playwright test",
     "stats": "node scripts/health.mjs",
     "stats:save": "node scripts/health.mjs --save",
-    "db:migrate:local": "wrangler d1 migrations apply tsudoi-db --local",
-    "db:migrate:remote": "wrangler d1 migrations apply tsudoi-db --remote",
+    "db:migrate:local": "wrangler d1 migrations apply DB --local",
+    "db:migrate:staging": "wrangler d1 migrations apply DB --remote --env staging",
+    "db:migrate:production": "wrangler d1 migrations apply DB --remote --env production",
     "types": "wrangler types ./src/worker-configuration.d.ts"
   },
   "dependencies": {

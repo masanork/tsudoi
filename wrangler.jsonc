@@ -5,22 +5,22 @@
   "compatibility_date": "2026-09-21",
   "compatibility_flags": ["nodejs_compat"],
   "observability": { "enabled": true, "head_sampling_rate": 1 },
+
+  // The default environment is safe for local development and Deploy to Cloudflare.
+  // Resource IDs are intentionally omitted so Wrangler can provision resources for a fork.
   "assets": {
     "directory": "./web/dist",
     "binding": "ASSETS",
     "not_found_handling": "single-page-application",
     "run_worker_first": ["/api/*", "/public/*"]
   },
-  "d1_databases": [
-    {
-      "binding": "DB",
-      "database_name": "tsudoi-db",
-      "database_id": "00000000-0000-0000-0000-000000000000",
-      "migrations_dir": "./migrations"
-    }
-  ],
+  "d1_databases": [{
+    "binding": "DB",
+    "database_name": "tsudoi-db",
+    "migrations_dir": "./migrations"
+  }],
   "r2_buckets": [{ "binding": "ENCRYPTED_ATTACHMENTS", "bucket_name": "tsudoi-encrypted-attachments" }],
-  "kv_namespaces": [{ "binding": "RATE_LIMITS", "id": "00000000000000000000000000000000" }],
+  "kv_namespaces": [{ "binding": "RATE_LIMITS" }],
   "queues": {
     "producers": [{ "binding": "NOTIFICATION_QUEUE", "queue": "tsudoi-notifications" }],
     "consumers": [{ "queue": "tsudoi-notifications", "max_batch_size": 25, "max_batch_timeout": 5 }]
@@ -31,5 +31,54 @@
     "RP_ID": "localhost",
     "RP_NAME": "tsudoi",
     "EMAIL_FROM": "noreply@example.com"
+  },
+
+  "env": {
+    "staging": {
+      "name": "tsudoi-staging",
+      "assets": {
+        "directory": "./web/dist",
+        "binding": "ASSETS",
+        "not_found_handling": "single-page-application",
+        "run_worker_first": ["/api/*", "/public/*"]
+      },
+      "d1_databases": [{ "binding": "DB", "database_name": "tsudoi-staging-db", "migrations_dir": "./migrations" }],
+      "r2_buckets": [{ "binding": "ENCRYPTED_ATTACHMENTS", "bucket_name": "tsudoi-staging-encrypted-attachments" }],
+      "kv_namespaces": [{ "binding": "RATE_LIMITS" }],
+      "queues": {
+        "producers": [{ "binding": "NOTIFICATION_QUEUE", "queue": "tsudoi-staging-notifications" }],
+        "consumers": [{ "queue": "tsudoi-staging-notifications", "max_batch_size": 25, "max_batch_timeout": 5 }]
+      },
+      "send_email": [{ "name": "EMAIL", "allowed_sender_addresses": ["noreply@example.com"] }],
+      "vars": {
+        "APP_ORIGIN": "https://staging.tsudoi.example.com",
+        "RP_ID": "staging.tsudoi.example.com",
+        "RP_NAME": "tsudoi (staging)",
+        "EMAIL_FROM": "noreply@example.com"
+      }
+    },
+    "production": {
+      "name": "tsudoi-production",
+      "assets": {
+        "directory": "./web/dist",
+        "binding": "ASSETS",
+        "not_found_handling": "single-page-application",
+        "run_worker_first": ["/api/*", "/public/*"]
+      },
+      "d1_databases": [{ "binding": "DB", "database_name": "tsudoi-production-db", "migrations_dir": "./migrations" }],
+      "r2_buckets": [{ "binding": "ENCRYPTED_ATTACHMENTS", "bucket_name": "tsudoi-production-encrypted-attachments" }],
+      "kv_namespaces": [{ "binding": "RATE_LIMITS" }],
+      "queues": {
+        "producers": [{ "binding": "NOTIFICATION_QUEUE", "queue": "tsudoi-production-notifications" }],
+        "consumers": [{ "queue": "tsudoi-production-notifications", "max_batch_size": 25, "max_batch_timeout": 5 }]
+      },
+      "send_email": [{ "name": "EMAIL", "allowed_sender_addresses": ["noreply@example.com"] }],
+      "vars": {
+        "APP_ORIGIN": "https://tsudoi.example.com",
+        "RP_ID": "tsudoi.example.com",
+        "RP_NAME": "tsudoi",
+        "EMAIL_FROM": "noreply@example.com"
+      }
+    }
   }
 }
