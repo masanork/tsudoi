@@ -1,9 +1,9 @@
 # tsudoi codebase snapshot
 
-Commit `9e1ca96` · 2026-09-21
+Commit `cd69d28` · 2026-09-21
 
 | Area | Files | Lines |
 | --- | ---: | ---: |
-| Worker `src/` | 2 | 16329 |
+| Worker `src/` | 2 | 16351 |
 | UI `web/src/` | 3 | 186 |
 | Tests `test/` | 0 | 0 |
