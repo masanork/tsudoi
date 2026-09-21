@@ -8,7 +8,7 @@ import * as QRCode from "qrcode";
 
 type Role = "owner" | "admin" | "staff" | "viewer";
 type TokenAuth = { organizationId: string; scopes: string[]; tokenId: string };
-type AppVariables = { auth: TokenAuth };
+type AppVariables = { auth: TokenAuth; participantAttendeeId: string };
 type JsonRecord = Record<string, unknown>;
 type AppEnv = { Bindings: Cloudflare.Env; Variables: AppVariables };
 type NotificationJob = { type: "ticket_link"; to: string; eventName: string; link: string };
@@ -46,6 +46,7 @@ app.use("/api/organizations/*", requireToken);
 app.use("/api/events/*", requireToken);
 app.use("/api/tickets/*", requireToken);
 app.use("/api/messages/*", requireToken);
+app.use("/api/participant/*", requireParticipant);
 
 app.get("/api/organizations/:organizationId/events", requireScope("roster:read"), async (c) => {
   if (!sameOrganization(c)) return forbidden(c);
@@ -151,6 +152,37 @@ app.post("/api/events/:eventId/attendees/:attendeeId/ticket-link", requireScope(
   const link = `${c.env.APP_ORIGIN}/public/magic-links/${encodeURIComponent(rawToken)}`;
   await c.env.NOTIFICATION_QUEUE.send({ type: "ticket_link", to: attendee.email_normalized, eventName, link } satisfies NotificationJob);
   return c.json({ queued: true }, 202);
+});
+
+app.get("/api/participant/ticket", async (c) => {
+  const ticket = await c.env.DB.prepare(`SELECT t.id, t.status, t.issued_at, t.checked_in_at, e.id AS event_id, e.name AS event_name,
+    e.starts_at, e.ends_at, e.timezone, e.cancellation_closes_at, v.name AS venue_name
+    FROM tickets t JOIN attendees a ON a.id = t.attendee_id JOIN events e ON e.id = t.event_id
+    LEFT JOIN venues v ON v.id = a.venue_id WHERE a.id = ?`).bind(c.get("participantAttendeeId")).first();
+  if (!ticket) return c.json({ error: "ticket_not_found" }, 404);
+  return c.json(ticket);
+});
+
+app.post("/api/participant/ticket/cancel", async (c) => {
+  const attendeeId = c.get("participantAttendeeId");
+  const ticket = await c.env.DB.prepare(`UPDATE tickets SET status = 'cancelled'
+    WHERE attendee_id = ? AND status = 'issued' AND event_id IN
+      (SELECT id FROM events WHERE cancellation_closes_at IS NULL OR cancellation_closes_at > CURRENT_TIMESTAMP)
+    RETURNING id, event_id`).bind(attendeeId).first<{ id: string; event_id: string }>();
+  if (!ticket) return c.json({ error: "cancellation_unavailable" }, 409);
+  await c.env.DB.batch([
+    c.env.DB.prepare("UPDATE attendees SET status = 'cancelled', cancelled_at = CURRENT_TIMESTAMP WHERE id = ?").bind(attendeeId),
+    c.env.DB.prepare("INSERT INTO audit_logs (id, organization_id, action, target_type, target_id, metadata_json) SELECT ?, organization_id, 'ticket.cancelled_by_participant', 'ticket', ?, '{}' FROM attendees WHERE id = ?")
+      .bind(crypto.randomUUID(), ticket.id, attendeeId),
+  ]);
+  return c.json({ cancelled: true });
+});
+
+app.post("/api/participant/logout", async (c) => {
+  const token = cookieValue(c.req.header("cookie"), "tsudoi_participant");
+  if (token) await c.env.DB.prepare("UPDATE participant_sessions SET revoked_at = CURRENT_TIMESTAMP WHERE token_hash = ?").bind(await sha256(token)).run();
+  c.header("Set-Cookie", "tsudoi_participant=; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age=0");
+  return c.body(null, 204);
 });
 
 app.post("/api/tickets/:ticketId/check-in", requireScope("checkin:write"), async (c) => {
@@ -342,6 +374,16 @@ async function requireToken(c: Context<AppEnv>, next: () => Promise<void>) {
   await next();
 }
 
+async function requireParticipant(c: Context<AppEnv>, next: () => Promise<void>) {
+  const token = cookieValue(c.req.header("cookie"), "tsudoi_participant");
+  if (!token) return c.json({ error: "participant_unauthorized" }, 401);
+  const session = await c.env.DB.prepare("SELECT attendee_id FROM participant_sessions WHERE token_hash = ? AND revoked_at IS NULL AND expires_at > CURRENT_TIMESTAMP")
+    .bind(await sha256(token)).first<{ attendee_id: string }>();
+  if (!session) return c.json({ error: "participant_unauthorized" }, 401);
+  c.set("participantAttendeeId", session.attendee_id);
+  await next();
+}
+
 function requireScope(scope: string) {
   return async (c: Context<AppEnv>, next: () => Promise<void>) => {
     const scopes = c.get("auth").scopes;
@@ -382,6 +424,11 @@ function isAuthenticationResponse(value: unknown): value is AuthenticationRespon
   return typeof value.response.clientDataJSON === "string" && typeof value.response.authenticatorData === "string" && typeof value.response.signature === "string";
 }
 function participantCookie(token: string) { return `tsudoi_participant=${token}; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age=43200`; }
+function cookieValue(header: string | undefined, name: string) {
+  if (!header) return undefined;
+  const prefix = `${name}=`;
+  return header.split(";").map((part) => part.trim()).find((part) => part.startsWith(prefix))?.slice(prefix.length);
+}
 function safeEqual(left: string, right: string) {
   if (left.length !== right.length) return false;
   let difference = 0;
