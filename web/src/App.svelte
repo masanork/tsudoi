@@ -13,6 +13,12 @@
   let checkinMessage = "";
   let selectedEventId = "";
   let metrics: { registrations: number; issued: number; cancelled: number; checked_in: number; not_checked_in: number } | null = null;
+  let fieldKey = "";
+  let fieldLabel = "";
+  let fieldType = "text";
+  let fieldRequired = false;
+  let fieldMessage = "";
+  const fieldKeyPattern = "[a-z][a-z0-9_]{0,62}";
   let participantTicket: ParticipantTicket | null = null;
   let participantMessage = "チケットを確認しています。";
   const ticketPage = typeof window !== "undefined" && window.location.pathname === "/ticket";
@@ -63,6 +69,12 @@
     try { selectedEventId = eventId; metrics = await api(`/events/${eventId}/metrics`); }
     catch (error) { message = error instanceof Error ? error.message : "集計を読み込めませんでした。"; }
   }
+  async function createField() {
+    try {
+      await api(`/events/${selectedEventId}/form-fields`, { method: "POST", body: JSON.stringify({ key: fieldKey, label: fieldLabel, type: fieldType, required: fieldRequired }) });
+      fieldKey = ""; fieldLabel = ""; fieldRequired = false; fieldMessage = "項目を追加しました。";
+    } catch (error) { fieldMessage = error instanceof Error ? error.message : "項目を追加できませんでした。"; }
+  }
 </script>
 
 <svelte:head><meta name="description" content="軽量なイベント名簿・受付管理" /></svelte:head>
@@ -99,6 +111,17 @@
   {#if metrics}
     <section aria-labelledby="metrics"><h2 id="metrics">イベント集計</h2><p class="muted">Event ID: {selectedEventId}</p>
       <dl class="metrics"><div><dt>申込</dt><dd>{metrics.registrations ?? 0}</dd></div><div><dt>発券</dt><dd>{metrics.issued ?? 0}</dd></div><div><dt>取消</dt><dd>{metrics.cancelled ?? 0}</dd></div><div><dt>受付済</dt><dd>{metrics.checked_in ?? 0}</dd></div><div><dt>未受付</dt><dd>{metrics.not_checked_in ?? 0}</dd></div></dl>
+    </section>
+  {/if}
+  {#if selectedEventId}
+    <section aria-labelledby="custom-fields"><h2 id="custom-fields">申込フォームのカスタム項目</h2>
+      <form onsubmit={(event) => { event.preventDefault(); void createField(); }}>
+        <label>項目キー<input bind:value={fieldKey} pattern={fieldKeyPattern} placeholder="company_name" required /></label>
+        <label>表示名<input bind:value={fieldLabel} placeholder="所属" required /></label>
+        <label>型<select bind:value={fieldType}><option value="text">短文</option><option value="textarea">長文</option><option value="number">数値</option><option value="date">日付</option><option value="single_select">単一選択</option><option value="multi_select">複数選択</option><option value="checkbox">チェックボックス</option><option value="consent">同意</option></select></label>
+        <label class="inline"><input bind:checked={fieldRequired} type="checkbox" />必須項目</label><button>項目を追加</button>
+      </form>
+      {#if fieldMessage}<p class="notice" aria-live="polite">{fieldMessage}</p>{/if}
     </section>
   {/if}
   <section aria-labelledby="check-in"><h2 id="check-in">QR 受付</h2>
