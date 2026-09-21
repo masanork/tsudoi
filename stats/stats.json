@@ -1,17 +1,17 @@
 {
-  "generatedAt": "2026-09-21T14:16:14.033Z",
-  "commit": "0c5811d",
+  "generatedAt": "2026-09-21T14:19:16.081Z",
+  "commit": "e769ecb",
   "worker": {
     "files": 1,
-    "lines": 630
+    "lines": 632
   },
   "web": {
     "files": 3,
-    "lines": 247
+    "lines": 253
   },
   "tests": {
     "files": 2,
-    "lines": 49
+    "lines": 59
   },
   "coverage": 100
 }
