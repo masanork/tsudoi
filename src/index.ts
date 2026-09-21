@@ -13,7 +13,7 @@ type JsonRecord = Record<string, unknown>;
 type AppEnv = { Bindings: Cloudflare.Env; Variables: AppVariables };
 type NotificationJob = { type: "ticket_link"; to: string; eventName: string; link: string };
 
-const app = new Hono<AppEnv>();
+export const app = new Hono<AppEnv>();
 
 app.use("/api/*", cors({ origin: (origin, c) => origin === c.env.APP_ORIGIN ? origin : c.env.APP_ORIGIN, credentials: true }));
 app.use("*", async (c, next) => {
