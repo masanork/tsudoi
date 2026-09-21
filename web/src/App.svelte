@@ -19,11 +19,16 @@
   let fieldRequired = false;
   let fieldMessage = "";
   const fieldKeyPattern = "[a-z][a-z0-9_]{0,62}";
+  const registerMatch = typeof window !== "undefined" ? window.location.pathname.match(/^\/events\/([^/]+)\/register$/) : null;
+  const registrationEventId = registerMatch?.[1] ?? "";
+  let publicEvent: { name: string; description: string; starts_at: string } | null = null;
+  let publicFields: Array<{ field_key: string; label: string; field_type: string; required: number; options_json: string }> = [];
+  let registrationName = ""; let registrationEmail = ""; let registrationAnswers: Record<string, string> = {}; let registrationMessage = "";
   let participantTicket: ParticipantTicket | null = null;
   let participantMessage = "チケットを確認しています。";
   const ticketPage = typeof window !== "undefined" && window.location.pathname === "/ticket";
 
-  onMount(() => { if (ticketPage) void loadParticipantTicket(); });
+  onMount(() => { if (ticketPage) void loadParticipantTicket(); else if (registrationEventId) void loadRegistration(); });
 
   async function api(path: string, init: RequestInit = {}) {
     const response = await fetch(`/api${path}`, { ...init, headers: { "content-type": "application/json", authorization: `Bearer ${token}`, ...init.headers } });
@@ -75,6 +80,14 @@
       fieldKey = ""; fieldLabel = ""; fieldRequired = false; fieldMessage = "項目を追加しました。";
     } catch (error) { fieldMessage = error instanceof Error ? error.message : "項目を追加できませんでした。"; }
   }
+  async function loadRegistration() {
+    try { const response = await fetch(`/public/events/${registrationEventId}`); const body = await response.json(); if (!response.ok) throw new Error(); publicEvent = body.event; publicFields = body.fields; }
+    catch { registrationMessage = "この申込フォームは利用できません。"; }
+  }
+  async function register() {
+    try { const response = await fetch(`/public/events/${registrationEventId}/register`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ name: registrationName, email: registrationEmail || undefined, answers: registrationAnswers }) }); const body = await response.json(); if (!response.ok) throw new Error(body.message ?? body.error); registrationMessage = "申込を受け付けました。チケットはこの画面から離れる前に保存してください。"; }
+    catch (error) { registrationMessage = error instanceof Error ? error.message : "申込に失敗しました。"; }
+  }
 </script>
 
 <svelte:head><meta name="description" content="軽量なイベント名簿・受付管理" /></svelte:head>
@@ -89,6 +102,10 @@
       {#if participantTicket.status === "issued"}<button onclick={cancelParticipantTicket}>参加をキャンセルする</button>{/if}
     </section>
   {:else}<p class="notice" aria-live="polite">{participantMessage}</p>{/if}
+{:else if registrationEventId}
+  <header><p class="eyebrow">EVENT REGISTRATION</p><h1>tsudoi</h1><p>{publicEvent?.name ?? "申込フォーム"}</p></header>
+  {#if publicEvent}<section><h2>{publicEvent.name}</h2><p>{publicEvent.description}</p><p>{publicEvent.starts_at}</p><form onsubmit={(event) => { event.preventDefault(); void register(); }}><label>氏名<input bind:value={registrationName} required /></label><label>メールアドレス<input bind:value={registrationEmail} type="email" /></label>{#each publicFields as field}<label>{field.label}<input bind:value={registrationAnswers[field.field_key]} required={field.required === 1} type={field.field_type === "number" ? "number" : field.field_type === "date" ? "date" : "text"} /></label>{/each}<button>申し込む</button></form></section>{/if}
+  {#if registrationMessage}<p class="notice" aria-live="polite">{registrationMessage}</p>{/if}
 {:else}
   <header><p class="eyebrow">EVENT ROSTER</p><h1>tsudoi</h1><p>会場の名簿と受付を、静かに確実に。</p></header>
   <p class="notice" aria-live="polite">{message}</p>
