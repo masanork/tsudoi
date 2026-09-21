@@ -231,6 +231,18 @@ app.post("/api/participant/messages/:threadId", async (c) => {
   return c.json({ id }, 201);
 });
 
+app.post("/api/participant/messages/:threadId/key-envelopes", async (c) => {
+  const thread = await participantThread(c);
+  if (!thread) return c.json({ error: "not_found" }, 404);
+  return createKeyEnvelope(c, thread.id);
+});
+
+app.get("/api/participant/messages/:threadId/key-envelopes", async (c) => {
+  const thread = await participantThread(c);
+  if (!thread) return c.json({ error: "not_found" }, 404);
+  return listKeyEnvelopes(c, thread.id);
+});
+
 app.post("/api/tickets/:ticketId/check-in", requireScope("checkin:write"), async (c) => {
   const ticketId = c.req.param("ticketId");
   const body = await jsonBody(c);
@@ -281,6 +293,18 @@ app.post("/api/messages/:threadId", requireScope("messages:write"), async (c) =>
   await c.env.DB.prepare("INSERT INTO encrypted_messages (id, thread_id, sender_kind, ciphertext, algorithm, key_generation) VALUES (?, ?, 'organizer', ?, ?, ?)")
     .bind(id, thread.id, base64ToBytes(ciphertext), algorithm, keyGeneration).run();
   return c.json({ id }, 201);
+});
+
+app.post("/api/messages/:threadId/key-envelopes", requireScope("messages:write"), async (c) => {
+  const thread = await organizerThread(c);
+  if (!thread) return c.json({ error: "not_found" }, 404);
+  return createKeyEnvelope(c, thread.id);
+});
+
+app.get("/api/messages/:threadId/key-envelopes", requireScope("messages:write"), async (c) => {
+  const thread = await organizerThread(c);
+  if (!thread) return c.json({ error: "not_found" }, 404);
+  return listKeyEnvelopes(c, thread.id);
 });
 
 app.get("/public/events/:eventId", async (c) => {
@@ -430,6 +454,32 @@ async function ticketFromPossession(c: Context<AppEnv>) {
   const ticket = await c.env.DB.prepare("SELECT t.id, t.attendee_id, t.token_hash, a.name, a.email_normalized FROM tickets t JOIN attendees a ON a.id = t.attendee_id WHERE t.id = ? AND t.status IN ('issued', 'checked_in')")
     .bind(c.req.param("ticketId")).first<{ id: string; attendee_id: string; token_hash: string; name: string; email_normalized: string | null }>();
   return ticket && safeEqual(ticket.token_hash, await sha256(token)) ? ticket : undefined;
+}
+
+async function organizerThread(c: Context<AppEnv>) {
+  return c.env.DB.prepare("SELECT mt.id FROM message_threads mt JOIN events e ON e.id = mt.event_id WHERE mt.id = ? AND e.organization_id = ?")
+    .bind(c.req.param("threadId"), c.get("auth").organizationId).first<{ id: string }>();
+}
+async function participantThread(c: Context<AppEnv>) {
+  return c.env.DB.prepare("SELECT id FROM message_threads WHERE id = ? AND attendee_id = ?")
+    .bind(c.req.param("threadId"), c.get("participantAttendeeId")).first<{ id: string }>();
+}
+async function createKeyEnvelope(c: Context<AppEnv>, threadId: string) {
+  const body = await jsonBody(c);
+  const recipientKeyId = requiredString(body, "recipientKeyId");
+  const encryptedKey = requiredString(body, "encryptedKey");
+  const algorithm = requiredString(body, "algorithm");
+  if (!recipientKeyId || !encryptedKey || !algorithm) return badRequest(c, "recipientKeyId, encryptedKey, and algorithm are required");
+  const id = crypto.randomUUID();
+  await c.env.DB.prepare("INSERT INTO key_envelopes (id, thread_id, recipient_key_id, encrypted_key, algorithm) VALUES (?, ?, ?, ?, ?)")
+    .bind(id, threadId, recipientKeyId, base64ToBytes(encryptedKey), algorithm).run();
+  return c.json({ id }, 201);
+}
+async function listKeyEnvelopes(c: Context<AppEnv>, threadId: string) {
+  const keyId = c.req.query("recipientKeyId");
+  const rows = await c.env.DB.prepare("SELECT id, recipient_key_id, encrypted_key, algorithm, created_at FROM key_envelopes WHERE thread_id = ? AND (? IS NULL OR recipient_key_id = ?) ORDER BY created_at")
+    .bind(threadId, keyId ?? null, keyId ?? null).all<{ id: string; recipient_key_id: string; encrypted_key: ArrayBuffer; algorithm: string; created_at: string }>();
+  return c.json(rows.results.map((row) => ({ ...row, encrypted_key: bytesToBase64(row.encrypted_key) })));
 }
 
 async function requireToken(c: Context<AppEnv>, next: () => Promise<void>) {
