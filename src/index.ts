@@ -10,6 +10,7 @@ type TokenAuth = { organizationId: string; scopes: string[]; tokenId: string };
 type AppVariables = { auth: TokenAuth };
 type JsonRecord = Record<string, unknown>;
 type AppEnv = { Bindings: Cloudflare.Env; Variables: AppVariables };
+type NotificationJob = { type: "ticket_link"; to: string; eventName: string; link: string };
 
 const app = new Hono<AppEnv>();
 
@@ -136,6 +137,21 @@ app.get("/api/events/:eventId/metrics", requireScope("roster:read"), async (c) =
   return c.json(metrics);
 });
 
+app.post("/api/events/:eventId/attendees/:attendeeId/ticket-link", requireScope("roster:write"), async (c) => {
+  const event = await eventForAuth(c);
+  if (!event) return c.json({ error: "not_found" }, 404);
+  const attendee = await c.env.DB.prepare("SELECT id, email_normalized FROM attendees WHERE id = ? AND event_id = ? AND status = 'active'")
+    .bind(c.req.param("attendeeId"), event.id).first<{ id: string; email_normalized: string | null }>();
+  if (!attendee?.email_normalized) return c.json({ error: "email_not_available" }, 400);
+  const rawToken = randomToken();
+  await c.env.DB.prepare("INSERT INTO magic_links (id, attendee_id, token_hash, purpose, expires_at) VALUES (?, ?, ?, 'ticket', datetime('now', '+24 hours'))")
+    .bind(crypto.randomUUID(), attendee.id, await sha256(rawToken)).run();
+  const eventName = (await c.env.DB.prepare("SELECT name FROM events WHERE id = ?").bind(event.id).first<{ name: string }>())?.name ?? "Your event";
+  const link = `${c.env.APP_ORIGIN}/public/magic-links/${encodeURIComponent(rawToken)}`;
+  await c.env.NOTIFICATION_QUEUE.send({ type: "ticket_link", to: attendee.email_normalized, eventName, link } satisfies NotificationJob);
+  return c.json({ queued: true }, 202);
+});
+
 app.post("/api/tickets/:ticketId/check-in", requireScope("checkin:write"), async (c) => {
   const ticketId = c.req.param("ticketId");
   const body = await jsonBody(c);
@@ -178,6 +194,21 @@ app.post("/public/events/:eventId/register", async (c) => {
   const event = await c.env.DB.prepare("SELECT * FROM events WHERE id = ? AND status = 'published'").bind(c.req.param("eventId")).first<EventRow>();
   if (!event || event.registration_mode === "walk_in") return c.json({ error: "registration_unavailable" }, 404);
   return registerAttendee(c, event, false);
+});
+
+app.get("/public/magic-links/:token", async (c) => {
+  const token = c.req.param("token");
+  const link = await c.env.DB.prepare("SELECT ml.id, ml.attendee_id FROM magic_links ml WHERE ml.token_hash = ? AND ml.purpose = 'ticket' AND ml.consumed_at IS NULL AND ml.expires_at > CURRENT_TIMESTAMP")
+    .bind(await sha256(token)).first<{ id: string; attendee_id: string }>();
+  if (!link) return c.json({ error: "link_expired_or_used" }, 400);
+  const sessionToken = randomToken();
+  await c.env.DB.batch([
+    c.env.DB.prepare("UPDATE magic_links SET consumed_at = CURRENT_TIMESTAMP WHERE id = ?").bind(link.id),
+    c.env.DB.prepare("INSERT INTO participant_sessions (id, attendee_id, token_hash, expires_at) VALUES (?, ?, ?, datetime('now', '+12 hours'))")
+      .bind(crypto.randomUUID(), link.attendee_id, await sha256(sessionToken)),
+  ]);
+  c.header("Set-Cookie", participantCookie(sessionToken));
+  return c.redirect("/ticket");
 });
 
 app.post("/public/tickets/:ticketId/passkeys/options", async (c) => {
@@ -349,6 +380,7 @@ function isAuthenticationResponse(value: unknown): value is AuthenticationRespon
   if (!isRecord(value) || typeof value.id !== "string" || typeof value.rawId !== "string" || value.type !== "public-key" || !isRecord(value.response)) return false;
   return typeof value.response.clientDataJSON === "string" && typeof value.response.authenticatorData === "string" && typeof value.response.signature === "string";
 }
+function participantCookie(token: string) { return `tsudoi_participant=${token}; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age=43200`; }
 function safeEqual(left: string, right: string) {
   if (left.length !== right.length) return false;
   let difference = 0;
@@ -360,4 +392,24 @@ async function audit(db: D1Database, auth: TokenAuth, action: string, targetType
 type EventRow = { id: string; organization_id: string; registration_mode: string };
 type FieldRow = { id: string; field_key: string; field_type: string; required: number; options_json: string };
 
-export default app;
+export default {
+  fetch: app.fetch,
+  async queue(batch: MessageBatch, env: Cloudflare.Env) {
+    for (const message of batch.messages) {
+      const job = message.body;
+      if (!isTicketLinkJob(job)) continue;
+      await env.EMAIL.send({
+        to: job.to,
+        from: { email: env.EMAIL_FROM, name: "tsudoi" },
+        subject: `Your ticket link for ${job.eventName}`,
+        text: `Open your ticket: ${job.link}\n\nThis link expires in 24 hours and can be used once.`,
+        html: `<p>Open your ticket for <strong>${escapeHtml(job.eventName)}</strong>:</p><p><a href="${escapeHtml(job.link)}">Open ticket</a></p><p>This link expires in 24 hours and can be used once.</p>`,
+      });
+    }
+  },
+} satisfies ExportedHandler<Cloudflare.Env>;
+
+function escapeHtml(value: string) { return value.replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;").replaceAll('"', "&quot;"); }
+function isTicketLinkJob(value: unknown): value is NotificationJob {
+  return isRecord(value) && value.type === "ticket_link" && typeof value.to === "string" && typeof value.eventName === "string" && typeof value.link === "string";
+}
