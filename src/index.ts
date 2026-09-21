@@ -2,6 +2,8 @@ import { Hono } from "hono";
 import { cors } from "hono/cors";
 import type { Context, MiddlewareHandler } from "hono";
 import type { ContentfulStatusCode } from "hono/utils/http-status";
+import { generateRegistrationOptions, verifyRegistrationResponse } from "@simplewebauthn/server";
+import type { RegistrationResponseJSON } from "@simplewebauthn/server";
 
 type Role = "owner" | "admin" | "staff" | "viewer";
 type TokenAuth = { organizationId: string; scopes: string[]; tokenId: string };
@@ -178,6 +180,48 @@ app.post("/public/events/:eventId/register", async (c) => {
   return registerAttendee(c, event, false);
 });
 
+app.post("/public/tickets/:ticketId/passkeys/options", async (c) => {
+  const ticket = await ticketFromPossession(c);
+  if (!ticket) return c.json({ error: "not_found" }, 404);
+  const existing = await c.env.DB.prepare("SELECT credential_id, transports_json FROM passkeys WHERE attendee_id = ?").bind(ticket.attendee_id).all<{ credential_id: string; transports_json: string }>();
+  const options = await generateRegistrationOptions({
+    rpName: c.env.RP_NAME,
+    rpID: c.env.RP_ID,
+    userID: new TextEncoder().encode(ticket.attendee_id),
+    userName: ticket.email_normalized ?? ticket.name,
+    userDisplayName: ticket.name,
+    attestationType: "none",
+    authenticatorSelection: { residentKey: "preferred", userVerification: "required" },
+    excludeCredentials: existing.results.map((credential) => ({ id: credential.credential_id, transports: parseAuthenticatorTransports(credential.transports_json) })),
+  });
+  const challengeId = crypto.randomUUID();
+  await c.env.DB.prepare("INSERT INTO webauthn_challenges (id, attendee_id, challenge, purpose, expires_at) VALUES (?, ?, ?, 'registration', datetime('now', '+5 minutes'))")
+    .bind(challengeId, ticket.attendee_id, options.challenge).run();
+  return c.json({ challengeId, options });
+});
+
+app.post("/public/tickets/:ticketId/passkeys/verify", async (c) => {
+  const ticket = await ticketFromPossession(c);
+  if (!ticket) return c.json({ error: "not_found" }, 404);
+  const body = await jsonBody(c);
+  const challengeId = requiredString(body, "challengeId");
+  const response = body.response;
+  if (!challengeId || !isRegistrationResponse(response)) return badRequest(c, "invalid registration response");
+  const challenge = await c.env.DB.prepare("SELECT * FROM webauthn_challenges WHERE id = ? AND attendee_id = ? AND purpose = 'registration' AND consumed_at IS NULL AND expires_at > CURRENT_TIMESTAMP")
+    .bind(challengeId, ticket.attendee_id).first<{ id: string; challenge: string }>();
+  if (!challenge) return c.json({ error: "challenge_expired" }, 400);
+  const verification = await verifyRegistrationResponse({ response, expectedChallenge: challenge.challenge, expectedOrigin: c.env.APP_ORIGIN, expectedRPID: c.env.RP_ID, requireUserVerification: true });
+  if (!verification.verified || !verification.registrationInfo) return c.json({ error: "passkey_verification_failed" }, 400);
+  const credential = verification.registrationInfo.credential;
+  const prfCapable = hasPrfEnabled(response.clientExtensionResults) ? 1 : 0;
+  await c.env.DB.batch([
+    c.env.DB.prepare("UPDATE webauthn_challenges SET consumed_at = CURRENT_TIMESTAMP WHERE id = ?").bind(challenge.id),
+    c.env.DB.prepare("INSERT INTO passkeys (id, attendee_id, credential_id, public_key, counter, transports_json, prf_capable) VALUES (?, ?, ?, ?, ?, ?, ?)")
+      .bind(crypto.randomUUID(), ticket.attendee_id, credential.id, credential.publicKey, credential.counter, JSON.stringify(response.response.transports ?? []), prfCapable),
+  ]);
+  return c.json({ verified: true, prfCapable: prfCapable === 1 }, 201);
+});
+
 async function registerAttendee(c: Context<AppEnv>, event: EventRow, staffRegistration: boolean): Promise<Response> {
   const body = await jsonBody(c);
   const name = requiredString(body, "name");
@@ -201,6 +245,15 @@ async function registerAttendee(c: Context<AppEnv>, event: EventRow, staffRegist
   for (const field of fields.results) if (answers[field.field_key] !== undefined) statements.push(c.env.DB.prepare("INSERT INTO attendee_answers (attendee_id, field_id, value_json) VALUES (?, ?, ?)").bind(attendeeId, field.id, JSON.stringify(answers[field.field_key])));
   await c.env.DB.batch(statements);
   return c.json({ attendeeId, ticketId, ticketToken: staffRegistration ? undefined : ticketToken }, 201);
+}
+
+async function ticketFromPossession(c: Context<AppEnv>) {
+  const body = await jsonBody(c);
+  const token = requiredString(body, "ticketToken");
+  if (!token) return undefined;
+  const ticket = await c.env.DB.prepare("SELECT t.id, t.attendee_id, t.token_hash, a.name, a.email_normalized FROM tickets t JOIN attendees a ON a.id = t.attendee_id WHERE t.id = ? AND t.status IN ('issued', 'checked_in')")
+    .bind(c.req.param("ticketId")).first<{ id: string; attendee_id: string; token_hash: string; name: string; email_normalized: string | null }>();
+  return ticket && safeEqual(ticket.token_hash, await sha256(token)) ? ticket : undefined;
 }
 
 async function requireToken(c: Context<AppEnv>, next: () => Promise<void>) {
@@ -235,6 +288,18 @@ function optionalInteger(value: unknown) { return typeof value === "number" && N
 function randomToken() { const bytes = new Uint8Array(32); crypto.getRandomValues(bytes); return btoa(String.fromCharCode(...bytes)).replaceAll("+", "-").replaceAll("/", "_").replaceAll("=", ""); }
 async function sha256(value: string) { const bytes = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(value)); return [...new Uint8Array(bytes)].map((byte) => byte.toString(16).padStart(2, "0")).join(""); }
 function base64ToBytes(value: string) { const decoded = atob(value); return Uint8Array.from(decoded, (char) => char.charCodeAt(0)); }
+function parseAuthenticatorTransports(value: string) {
+  const allowed = ["ble", "cable", "hybrid", "internal", "nfc", "smart-card", "usb"] as const;
+  const isTransport = (item: unknown): item is typeof allowed[number] => typeof item === "string" && allowed.some((transport) => transport === item);
+  try { const parsed: unknown = JSON.parse(value); return Array.isArray(parsed) ? parsed.filter(isTransport) : []; } catch { return []; }
+}
+function hasPrfEnabled(value: unknown) {
+  return isRecord(value) && isRecord(value.prf) && value.prf.enabled === true;
+}
+function isRegistrationResponse(value: unknown): value is RegistrationResponseJSON {
+  if (!isRecord(value) || typeof value.id !== "string" || typeof value.rawId !== "string" || value.type !== "public-key" || !isRecord(value.response)) return false;
+  return typeof value.response.clientDataJSON === "string" && typeof value.response.attestationObject === "string";
+}
 function safeEqual(left: string, right: string) {
   if (left.length !== right.length) return false;
   let difference = 0;
