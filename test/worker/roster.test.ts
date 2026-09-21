@@ -29,7 +29,8 @@ describe("Worker D1 roster flow", () => {
     const auth = { "content-type": "application/json", authorization: `Bearer ${token}` };
     const eventResponse = await SELF.fetch(`https://tsudoi.test/api/organizations/${organizationId}/events`, { method: "POST", headers: auth, body: JSON.stringify({ name: "Limited event", startsAt: "2026-10-02T09:00:00Z", endsAt: "2026-10-02T10:00:00Z", registrationMode: "hybrid", capacity: 1 }) });
     const { id: eventId } = await eventResponse.json<{ id: string }>();
-    await env.DB.prepare("UPDATE events SET status = 'published' WHERE id = ?").bind(eventId).run();
+    const publish = await SELF.fetch(`https://tsudoi.test/api/events/${eventId}/publish`, { method: "POST", headers: { authorization: `Bearer ${token}` } });
+    expect(publish.status).toBe(200);
 
     const first = await SELF.fetch(`https://tsudoi.test/public/events/${eventId}/register`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ name: "First attendee" }) });
     expect(first.status).toBe(201);
@@ -41,5 +42,17 @@ describe("Worker D1 roster flow", () => {
     const replacement = await SELF.fetch(`https://tsudoi.test/public/events/${eventId}/register`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ name: "Replacement attendee" }) });
     expect(replacement.status).toBe(201);
     await expect(env.DB.prepare("SELECT active_registration_count FROM events WHERE id = ?").bind(eventId).first<{ active_registration_count: number }>()).resolves.toEqual({ active_registration_count: 1 });
+  });
+
+  it("does not accept registrations before the configured opening time", async () => {
+    const bootstrap = await SELF.fetch("https://tsudoi.test/api/bootstrap", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ organizationName: "Scheduled organization" }) });
+    const { organizationId, token } = await bootstrap.json<{ organizationId: string; token: string }>();
+    const auth = { "content-type": "application/json", authorization: `Bearer ${token}` };
+    const eventResponse = await SELF.fetch(`https://tsudoi.test/api/organizations/${organizationId}/events`, { method: "POST", headers: auth, body: JSON.stringify({ name: "Future event", startsAt: "2999-10-02T09:00:00Z", endsAt: "2999-10-02T10:00:00Z", registrationMode: "hybrid", registrationOpensAt: "2999-01-01T00:00:00Z" }) });
+    const { id: eventId } = await eventResponse.json<{ id: string }>();
+    await SELF.fetch(`https://tsudoi.test/api/events/${eventId}/publish`, { method: "POST", headers: { authorization: `Bearer ${token}` } });
+    const registration = await SELF.fetch(`https://tsudoi.test/public/events/${eventId}/register`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ name: "Too early" }) });
+    expect(registration.status).toBe(404);
+    await expect(registration.json()).resolves.toEqual({ error: "registration_unavailable" });
   });
 });

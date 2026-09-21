@@ -62,13 +62,33 @@ app.post("/api/organizations/:organizationId/events", requireScope("admin"), asy
   const startsAt = requiredString(body, "startsAt");
   const endsAt = requiredString(body, "endsAt");
   const registrationMode = requiredString(body, "registrationMode");
+  const registrationOpensAt = optionalString(body.registrationOpensAt);
+  const registrationClosesAt = optionalString(body.registrationClosesAt);
   if (!name || !startsAt || !endsAt || !["advance", "walk_in", "hybrid"].includes(registrationMode ?? "")) return badRequest(c, "invalid event");
   const eventId = crypto.randomUUID();
-  await c.env.DB.prepare(`INSERT INTO events (id, organization_id, name, starts_at, ends_at, registration_mode, capacity, timezone)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?)`)
-    .bind(eventId, c.req.param("organizationId"), name, startsAt, endsAt, registrationMode, optionalInteger(body.capacity), optionalString(body.timezone) ?? "Asia/Tokyo").run();
+  await c.env.DB.prepare(`INSERT INTO events (id, organization_id, name, starts_at, ends_at, registration_mode, registration_opens_at, registration_closes_at, capacity, timezone)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+    .bind(eventId, c.req.param("organizationId"), name, startsAt, endsAt, registrationMode, registrationOpensAt ?? null, registrationClosesAt ?? null, optionalInteger(body.capacity), optionalString(body.timezone) ?? "Asia/Tokyo").run();
   await audit(c.env.DB, c.get("auth"), "event.created", "event", eventId);
   return c.json({ id: eventId }, 201);
+});
+
+app.post("/api/events/:eventId/publish", requireScope("admin"), async (c) => {
+  const event = await eventForAuth(c);
+  if (!event) return c.json({ error: "not_found" }, 404);
+  const updated = await c.env.DB.prepare("UPDATE events SET status = 'published', updated_at = CURRENT_TIMESTAMP WHERE id = ? AND status = 'draft' RETURNING id, status").bind(event.id).first<{ id: string; status: string }>();
+  if (!updated) return c.json({ error: "event_not_publishable" }, 409);
+  await audit(c.env.DB, c.get("auth"), "event.published", "event", event.id);
+  return c.json(updated);
+});
+
+app.post("/api/events/:eventId/close", requireScope("admin"), async (c) => {
+  const event = await eventForAuth(c);
+  if (!event) return c.json({ error: "not_found" }, 404);
+  const updated = await c.env.DB.prepare("UPDATE events SET status = 'closed', updated_at = CURRENT_TIMESTAMP WHERE id = ? AND status = 'published' RETURNING id, status").bind(event.id).first<{ id: string; status: string }>();
+  if (!updated) return c.json({ error: "event_not_closable" }, 409);
+  await audit(c.env.DB, c.get("auth"), "event.closed", "event", event.id);
+  return c.json(updated);
 });
 
 app.post("/api/events/:eventId/venues", requireScope("admin"), async (c) => {
@@ -349,7 +369,9 @@ app.get("/public/events/:eventId", async (c) => {
 });
 
 app.post("/public/events/:eventId/register", async (c) => {
-  const event = await c.env.DB.prepare("SELECT * FROM events WHERE id = ? AND status = 'published'").bind(c.req.param("eventId")).first<EventRow>();
+  const event = await c.env.DB.prepare(`SELECT * FROM events WHERE id = ? AND status = 'published'
+    AND (registration_opens_at IS NULL OR registration_opens_at <= CURRENT_TIMESTAMP)
+    AND (registration_closes_at IS NULL OR registration_closes_at > CURRENT_TIMESTAMP)`).bind(c.req.param("eventId")).first<EventRow>();
   if (!event || event.registration_mode === "walk_in") return c.json({ error: "registration_unavailable" }, 404);
   return registerAttendee(c, event, false);
 });

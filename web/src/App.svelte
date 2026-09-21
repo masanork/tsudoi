@@ -12,6 +12,8 @@
   let startsAt = "";
   let endsAt = "";
   let eventCapacity = "";
+  let registrationOpensAt = "";
+  let registrationClosesAt = "";
   let ticketLink = "";
   let checkinMessage = "";
   let selectedEventId = "";
@@ -51,8 +53,8 @@
   }
   async function createEvent() {
     try {
-      await api(`/organizations/${organizationId}/events`, { method: "POST", body: JSON.stringify({ name: eventName, startsAt, endsAt, registrationMode: "hybrid", capacity: eventCapacity ? Number(eventCapacity) : undefined }) });
-      eventName = ""; eventCapacity = ""; await loadEvents(); message = "イベントを作成しました。";
+      await api(`/organizations/${organizationId}/events`, { method: "POST", body: JSON.stringify({ name: eventName, startsAt, endsAt, registrationMode: "hybrid", capacity: eventCapacity ? Number(eventCapacity) : undefined, registrationOpensAt: registrationOpensAt || undefined, registrationClosesAt: registrationClosesAt || undefined }) });
+      eventName = ""; eventCapacity = ""; registrationOpensAt = ""; registrationClosesAt = ""; await loadEvents(); message = "イベントを作成しました。";
     } catch (error) { message = error instanceof Error ? error.message : "作成に失敗しました。"; }
   }
   async function loadParticipantTicket() {
@@ -89,6 +91,8 @@
     try { const roster = await api(`/events/${eventId}/roster`); rosterFields = roster.fields; rosterAttendees = roster.attendees; }
     catch (error) { message = error instanceof Error ? error.message : "名簿を読み込めませんでした。"; }
   }
+  async function publishEvent(eventId: string) { try { await api(`/events/${eventId}/publish`, { method: "POST" }); await loadEvents(); message = "イベントを公開しました。"; } catch (error) { message = error instanceof Error ? error.message : "イベントを公開できませんでした。"; } }
+  async function closeEvent(eventId: string) { try { await api(`/events/${eventId}/close`, { method: "POST" }); await loadEvents(); message = "イベントを終了しました。"; } catch (error) { message = error instanceof Error ? error.message : "イベントを終了できませんでした。"; } }
   async function selectEvent(eventId: string) { await Promise.all([loadMetrics(eventId), loadRoster(eventId)]); }
   async function createField() {
     try {
@@ -161,12 +165,14 @@
       <label>イベント名<input bind:value={eventName} required /></label>
       <label>開始日時<input bind:value={startsAt} type="datetime-local" required /></label>
       <label>終了日時<input bind:value={endsAt} type="datetime-local" required /></label>
+      <label>受付開始（空欄で即時）<input bind:value={registrationOpensAt} type="datetime-local" /></label>
+      <label>受付終了（空欄でイベント終了まで）<input bind:value={registrationClosesAt} type="datetime-local" /></label>
       <label>定員（空欄で無制限）<input bind:value={eventCapacity} type="number" min="1" /></label>
       <button>作成する</button>
     </form>
   </section>
   <section aria-labelledby="events"><h2 id="events">イベント</h2>
-    {#if events.length === 0}<p>まだイベントがありません。</p>{:else}<ul>{#each events as event}<li><strong>{event.name}</strong><span>{event.starts_at} · {event.status} <button onclick={() => selectEvent(event.id)}>名簿と集計</button></span></li>{/each}</ul>{/if}
+    {#if events.length === 0}<p>まだイベントがありません。</p>{:else}<ul>{#each events as event}<li><strong>{event.name}</strong><span>{event.starts_at} · {event.status} <button onclick={() => selectEvent(event.id)}>名簿と集計</button>{#if event.status === "draft"}<button onclick={() => publishEvent(event.id)}>公開</button>{:else if event.status === "published"}<button onclick={() => closeEvent(event.id)}>終了</button>{/if}</span></li>{/each}</ul>{/if}
   </section>
   {#if metrics}
     <section aria-labelledby="metrics"><h2 id="metrics">イベント集計</h2><p class="muted">Event ID: {selectedEventId}</p>
