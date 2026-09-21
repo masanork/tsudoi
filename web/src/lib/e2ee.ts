@@ -14,6 +14,12 @@ export type KeyEnvelope = {
 const text = new TextEncoder();
 const decoder = new TextDecoder();
 
+/** Derives a non-extractable AES key locally from a WebAuthn PRF result. */
+export async function derivePrfWrappingKey(prfOutput: ArrayBuffer, salt: ArrayBuffer): Promise<CryptoKey> {
+  const material = await crypto.subtle.importKey("raw", prfOutput, "HKDF", false, ["deriveKey"]);
+  return crypto.subtle.deriveKey({ name: "HKDF", hash: "SHA-256", salt, info: text.encode("tsudoi/e2ee/passkey-prf/v1") }, material, { name: "AES-GCM", length: 256 }, false, ["encrypt", "decrypt"]);
+}
+
 export async function createThreadKey(): Promise<CryptoKey> {
   return crypto.subtle.generateKey({ name: "AES-GCM", length: 256 }, true, ["encrypt", "decrypt"]);
 }

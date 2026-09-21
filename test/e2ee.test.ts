@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { createIdentityKeyPair, createThreadKey, decryptMessage, encryptMessage, unwrapThreadKey, wrapThreadKey } from "../web/src/lib/e2ee";
+import { createIdentityKeyPair, createThreadKey, decryptMessage, derivePrfWrappingKey, encryptMessage, unwrapThreadKey, wrapThreadKey } from "../web/src/lib/e2ee";
 
 describe("E2EE browser primitives", () => {
   it("encrypts and decrypts a message only with the same associated data", async () => {
@@ -23,5 +23,15 @@ describe("E2EE browser primitives", () => {
     await expect(decryptMessage(threadKey, { algorithm: "unknown" as "AES-GCM-256", ciphertext: "", iv: "" }, "thread-3")).rejects.toThrow("Unsupported message algorithm");
     const recipient = await createIdentityKeyPair();
     await expect(unwrapThreadKey({ algorithm: "unknown" as "ECDH-P256+AES-GCM-256", ephemeralPublicKey: {}, ciphertext: "", iv: "" }, recipient.privateKey)).rejects.toThrow("Unsupported envelope algorithm");
+  });
+
+  it("derives the same non-extractable wrapping key from a PRF result", async () => {
+    const prfOutput = crypto.getRandomValues(new Uint8Array(32));
+    const salt = crypto.getRandomValues(new Uint8Array(32));
+    const first = await derivePrfWrappingKey(prfOutput.buffer, salt.buffer);
+    const second = await derivePrfWrappingKey(prfOutput.buffer, salt.buffer);
+    expect(first.extractable).toBe(false);
+    const payload = await encryptMessage(first, "device secret", "prf-key-test");
+    await expect(decryptMessage(second, payload, "prf-key-test")).resolves.toBe("device secret");
   });
 });

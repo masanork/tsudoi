@@ -369,6 +369,8 @@ app.post("/public/tickets/:ticketId/passkeys/options", async (c) => {
     userDisplayName: ticket.name,
     attestationType: "none",
     authenticatorSelection: { residentKey: "preferred", userVerification: "required" },
+    // @simplewebauthn's bundled DOM types lag the standard PRF extension.
+    extensions: { prf: {} } as never,
     excludeCredentials: existing.results.map((credential) => ({ id: credential.credential_id, transports: parseAuthenticatorTransports(credential.transports_json) })),
   });
   const challengeId = crypto.randomUUID();
