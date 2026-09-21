@@ -462,10 +462,6 @@ async function registerAttendee(c: Context<AppEnv>, event: EventRow, staffRegist
   const body = await jsonBody(c);
   const name = requiredString(body, "name");
   if (!name) return badRequest(c, "name is required");
-  if (event.capacity !== null) {
-    const registrations = await c.env.DB.prepare("SELECT COUNT(*) AS count FROM attendees WHERE event_id = ? AND status = 'active'").bind(event.id).first<{ count: number }>();
-    if ((registrations?.count ?? 0) >= event.capacity) return c.json({ error: "capacity_reached" }, 409);
-  }
   const email = optionalString(body.email)?.trim().toLowerCase();
   if (email && !email.includes("@")) return badRequest(c, "invalid email");
   const fields = await c.env.DB.prepare("SELECT id, field_key, field_type, required, options_json FROM form_fields WHERE event_id = ? AND retired_at IS NULL").bind(event.id).all<FieldRow>();
@@ -487,7 +483,11 @@ async function registerAttendee(c: Context<AppEnv>, event: EventRow, staffRegist
       .bind(ticketId, attendeeId, event.id, await sha256(ticketToken), "v1"),
   ];
   for (const field of fields.results) if (answers[field.field_key] !== undefined) statements.push(c.env.DB.prepare("INSERT INTO attendee_answers (attendee_id, field_id, value_json) VALUES (?, ?, ?)").bind(attendeeId, field.id, JSON.stringify(answers[field.field_key])));
-  await c.env.DB.batch(statements);
+  try { await c.env.DB.batch(statements); }
+  catch (error) {
+    if (error instanceof Error && error.message.includes("capacity_reached")) return c.json({ error: "capacity_reached" }, 409);
+    throw error;
+  }
   let emailQueued = false;
   if (!staffRegistration && email) {
     const magicToken = randomToken();

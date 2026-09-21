@@ -36,5 +36,10 @@ describe("Worker D1 roster flow", () => {
     const second = await SELF.fetch(`https://tsudoi.test/public/events/${eventId}/register`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ name: "Second attendee" }) });
     expect(second.status).toBe(409);
     await expect(second.json()).resolves.toEqual({ error: "capacity_reached" });
+
+    await env.DB.prepare("UPDATE attendees SET status = 'cancelled' WHERE event_id = ? AND name = 'First attendee'").bind(eventId).run();
+    const replacement = await SELF.fetch(`https://tsudoi.test/public/events/${eventId}/register`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ name: "Replacement attendee" }) });
+    expect(replacement.status).toBe(201);
+    await expect(env.DB.prepare("SELECT active_registration_count FROM events WHERE id = ?").bind(eventId).first<{ active_registration_count: number }>()).resolves.toEqual({ active_registration_count: 1 });
   });
 });
