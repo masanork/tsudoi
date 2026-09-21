@@ -200,6 +200,28 @@ app.post("/api/participant/logout", async (c) => {
   return c.body(null, 204);
 });
 
+app.post("/api/participant/push-subscriptions", async (c) => {
+  const body = await jsonBody(c);
+  const endpoint = requiredString(body, "endpoint");
+  const keys = isRecord(body.keys) ? body.keys : {};
+  const p256dh = requiredString(keys, "p256dh");
+  const auth = requiredString(keys, "auth");
+  if (!endpoint || !endpoint.startsWith("https://") || !p256dh || !auth) return badRequest(c, "invalid push subscription");
+  const id = crypto.randomUUID();
+  await c.env.DB.prepare(`INSERT INTO push_subscriptions (id, attendee_id, endpoint, p256dh, auth)
+    VALUES (?, ?, ?, ?, ?) ON CONFLICT(endpoint) DO UPDATE SET attendee_id = excluded.attendee_id, p256dh = excluded.p256dh, auth = excluded.auth, updated_at = CURRENT_TIMESTAMP`)
+    .bind(id, c.get("participantAttendeeId"), endpoint, p256dh, auth).run();
+  return c.json({ subscribed: true }, 201);
+});
+
+app.delete("/api/participant/push-subscriptions", async (c) => {
+  const body = await jsonBody(c);
+  const endpoint = requiredString(body, "endpoint");
+  if (!endpoint) return badRequest(c, "endpoint is required");
+  await c.env.DB.prepare("DELETE FROM push_subscriptions WHERE attendee_id = ? AND endpoint = ?").bind(c.get("participantAttendeeId"), endpoint).run();
+  return c.body(null, 204);
+});
+
 app.post("/api/participant/events/:eventId/message-thread", async (c) => {
   const attendeeId = c.get("participantAttendeeId");
   const eventId = c.req.param("eventId");
