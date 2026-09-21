@@ -11,7 +11,7 @@
   let isAdministrator = false;
   let screen: "setup" | "home" | "event" | "admin" = "setup";
   let setupMessage = "この tsudoi を使い始めるには、初期管理者の Passkey を登録してください。";
-  let events: Array<{ id: string; name: string; starts_at: string; status: string }> = [];
+  let events: Array<{ id: string; name: string; starts_at: string; ends_at: string; status: string; scheduling_enabled?: number; schedule_status?: string }> = [];
   let message = "API トークンと組織 ID を入力してください。";
   let eventName = "";
   let startsAt = "";
@@ -19,9 +19,14 @@
   let eventCapacity = "";
   let registrationOpensAt = "";
   let registrationClosesAt = "";
+  let schedulingEnabled = false;
   let ticketLink = "";
   let checkinMessage = "";
   let selectedEventId = "";
+  let schedule: { enabled: boolean; status: string; startsAt: string | null; endsAt: string | null; options: Array<{ id: string; starts_at: string; ends_at: string; note: string; yes: number; maybe: number; no: number }> } | null = null;
+  let scheduleStartsAt = "";
+  let scheduleEndsAt = "";
+  let scheduleNote = "";
   let metrics: { registrations: number; issued: number; cancelled: number; checked_in: number; not_checked_in: number } | null = null;
   let rosterFields: Array<{ field_key: string; label: string }> = [];
   let rosterAttendees: Array<{ id: string; name: string; email_normalized: string | null; ticket_status: string; answers: Record<string, unknown> }> = [];
@@ -34,9 +39,16 @@
   const fieldKeyPattern = "[a-z][a-z0-9_]{0,62}";
   const registerMatch = typeof window !== "undefined" ? window.location.pathname.match(/^\/events\/([^/]+)\/register$/) : null;
   const registrationEventId = registerMatch?.[1] ?? "";
+  const scheduleMatch = typeof window !== "undefined" ? window.location.pathname.match(/^\/events\/([^/]+)\/schedule$/) : null;
+  const scheduleEventId = scheduleMatch?.[1] ?? "";
   let publicEvent: { name: string; description: string; starts_at: string } | null = null;
   let publicFields: Array<{ field_key: string; label: string; field_type: string; required: number; options_json: string }> = [];
   let registrationName = ""; let registrationEmail = ""; let registrationAnswers: Record<string, string | string[] | boolean> = {}; let registrationMessage = "";
+  let publicSchedule: { event: { name: string; description: string; timezone: string; schedule_status: string }; options: Array<{ id: string; starts_at: string; ends_at: string; note: string; yes: number; maybe: number; no: number }> } | null = null;
+  let scheduleRespondentName = "";
+  let scheduleRespondentId = "";
+  let scheduleResponseMessage = "";
+  let scheduleResponses: Record<string, string> = {};
   let issuedTicket: { id: string; token: string } | null = null;
   let ticketQr = "";
   let passkeyMessage = "";
@@ -47,6 +59,7 @@
   onMount(() => {
     if (ticketPage) void loadParticipantTicket();
     else if (registrationEventId) void loadRegistration();
+    else if (scheduleEventId) { scheduleRespondentId = localStorage.getItem(`tsudoi-schedule-${scheduleEventId}`) ?? crypto.randomUUID(); localStorage.setItem(`tsudoi-schedule-${scheduleEventId}`, scheduleRespondentId); void loadPublicSchedule(); }
     else {
       const saved = localStorage.getItem("tsudoi-workspace");
       if (saved) {
@@ -71,9 +84,21 @@
   }
   async function createEvent() {
     try {
-      await api(`/organizations/${organizationId}/events`, { method: "POST", body: JSON.stringify({ name: eventName, startsAt, endsAt, registrationMode: "hybrid", capacity: eventCapacity ? Number(eventCapacity) : undefined, registrationOpensAt: registrationOpensAt || undefined, registrationClosesAt: registrationClosesAt || undefined }) });
-      eventName = ""; eventCapacity = ""; registrationOpensAt = ""; registrationClosesAt = ""; await loadEvents(); message = "イベントを作成しました。";
+      await api(`/organizations/${organizationId}/events`, { method: "POST", body: JSON.stringify({ name: eventName, startsAt: schedulingEnabled ? undefined : startsAt, endsAt: schedulingEnabled ? undefined : endsAt, schedulingEnabled, registrationMode: "hybrid", capacity: eventCapacity ? Number(eventCapacity) : undefined, registrationOpensAt: registrationOpensAt || undefined, registrationClosesAt: registrationClosesAt || undefined }) });
+      eventName = ""; eventCapacity = ""; registrationOpensAt = ""; registrationClosesAt = ""; schedulingEnabled = false; await loadEvents(); message = "イベントを作成しました。";
     } catch (error) { message = error instanceof Error ? error.message : "作成に失敗しました。"; }
+  }
+  async function loadSchedule(eventId: string) {
+    try { schedule = await api(`/events/${eventId}/schedule`); }
+    catch (error) { message = error instanceof Error ? error.message : "日程調整を読み込めませんでした。"; }
+  }
+  async function addScheduleOption() {
+    try { await api(`/events/${selectedEventId}/schedule/options`, { method: "POST", body: JSON.stringify({ startsAt: scheduleStartsAt, endsAt: scheduleEndsAt, note: scheduleNote || undefined }) }); scheduleStartsAt = ""; scheduleEndsAt = ""; scheduleNote = ""; await loadSchedule(selectedEventId); }
+    catch (error) { message = error instanceof Error ? error.message : "候補日時を追加できませんでした。"; }
+  }
+  async function confirmSchedule(optionId: string) {
+    try { await api(`/events/${selectedEventId}/schedule/confirm`, { method: "POST", body: JSON.stringify({ optionId }) }); await loadEvents(); await loadSchedule(selectedEventId); message = "日程を確定しました。"; }
+    catch (error) { message = error instanceof Error ? error.message : "日程を確定できませんでした。"; }
   }
   function saveWorkspace() {
     localStorage.setItem("tsudoi-workspace", JSON.stringify({ token, organizationId, isAdministrator }));
@@ -132,7 +157,7 @@
   }
   async function publishEvent(eventId: string) { try { await api(`/events/${eventId}/publish`, { method: "POST" }); await loadEvents(); message = "イベントを公開しました。"; } catch (error) { message = error instanceof Error ? error.message : "イベントを公開できませんでした。"; } }
   async function closeEvent(eventId: string) { try { await api(`/events/${eventId}/close`, { method: "POST" }); await loadEvents(); message = "イベントを終了しました。"; } catch (error) { message = error instanceof Error ? error.message : "イベントを終了できませんでした。"; } }
-  async function selectEvent(eventId: string) { await Promise.all([loadMetrics(eventId), loadRoster(eventId)]); }
+  async function selectEvent(eventId: string) { await Promise.all([loadMetrics(eventId), loadRoster(eventId), loadSchedule(eventId)]); }
   async function createField() {
     try {
       const options = fieldOptions.split(/[\n,]/).map((option) => option.trim()).filter(Boolean);
@@ -143,6 +168,16 @@
   async function loadRegistration() {
     try { const response = await fetch(`/public/events/${registrationEventId}`); const body = await response.json(); if (!response.ok) throw new Error(); publicEvent = body.event; publicFields = body.fields; }
     catch { registrationMessage = "この申込フォームは利用できません。"; }
+  }
+  async function loadPublicSchedule() {
+    try { const response = await fetch(`/public/events/${scheduleEventId}/schedule`); const body = await response.json(); if (!response.ok) throw new Error(body.message ?? body.error); publicSchedule = body; }
+    catch { scheduleResponseMessage = "この日程調整は利用できません。"; }
+  }
+  async function submitScheduleResponse(optionId: string, responseValue: string) {
+    try {
+      const response = await fetch(`/public/events/${scheduleEventId}/schedule/responses`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ optionId, response: responseValue, respondentId: scheduleRespondentId, respondentName: scheduleRespondentName }) });
+      const body = await response.json(); if (!response.ok) throw new Error(body.message ?? body.error); scheduleResponses = { ...scheduleResponses, [optionId]: responseValue }; scheduleResponseMessage = "回答を保存しました。"; await loadPublicSchedule();
+    } catch (error) { scheduleResponseMessage = error instanceof Error ? error.message : "回答を保存できませんでした。"; }
   }
   async function register() {
     try { const response = await fetch(`/public/events/${registrationEventId}/register`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ name: registrationName, email: registrationEmail || undefined, answers: registrationAnswers }) }); const body = await response.json(); if (!response.ok) throw new Error(body.message ?? body.error); issuedTicket = { id: body.ticketId, token: body.ticketToken }; ticketQr = await QRCode.toDataURL(`${window.location.origin}/public/tickets/${body.ticketId}/check-in/${body.ticketToken}`, { errorCorrectionLevel: "M", margin: 1, width: 640 }); registrationMessage = body.emailQueued ? "申込を受け付け、QRチケットをメールで送付しました。" : "申込を受け付けました。チケットはこの画面から離れる前に保存してください。"; }
@@ -185,6 +220,18 @@
       {#if participantTicket.status === "issued"}<button onclick={cancelParticipantTicket}>参加をキャンセルする</button>{/if}
     </section>
   {:else}<p class="notice" aria-live="polite">{participantMessage}</p>{/if}
+{:else if scheduleEventId}
+  <header><p class="eyebrow">SCHEDULE POLL</p><h1>tsudoi</h1><p>{publicSchedule?.event.name ?? "日程調整"}</p></header>
+  {#if publicSchedule}
+    <section><h2>{publicSchedule.event.name} の日程調整</h2><p>{publicSchedule.event.description}</p>
+      {#if publicSchedule.event.schedule_status === "confirmed"}<p class="notice">日程は確定しています。</p>{:else}
+        <label>お名前<input bind:value={scheduleRespondentName} required placeholder="山田太郎" /></label>
+        <p class="muted">候補ごとに参加可否を選んでください。</p>
+        <div class="schedule-list">{#each publicSchedule.options as option}<div class="schedule-option"><div><strong>{option.starts_at} – {option.ends_at}</strong>{#if option.note}<p class="muted">{option.note}</p>{/if}<p class="muted">○ {option.yes ?? 0}　△ {option.maybe ?? 0}　× {option.no ?? 0}</p></div><div class="response-buttons"><button class:chosen={scheduleResponses[option.id] === "yes"} disabled={!scheduleRespondentName.trim()} onclick={() => void submitScheduleResponse(option.id, "yes")}>○ 参加</button><button class:chosen={scheduleResponses[option.id] === "maybe"} disabled={!scheduleRespondentName.trim()} onclick={() => void submitScheduleResponse(option.id, "maybe")}>△ 未定</button><button class:chosen={scheduleResponses[option.id] === "no"} disabled={!scheduleRespondentName.trim()} onclick={() => void submitScheduleResponse(option.id, "no")}>× 不参加</button></div></div>{/each}</div>
+      {/if}
+    </section>
+  {:else}<p class="notice" aria-live="polite">{scheduleResponseMessage}</p>{/if}
+  {#if scheduleResponseMessage}<p class="notice" aria-live="polite">{scheduleResponseMessage}</p>{/if}
 {:else if registrationEventId}
   <header><p class="eyebrow">EVENT REGISTRATION</p><h1>tsudoi</h1><p>{publicEvent?.name ?? "申込フォーム"}</p></header>
   {#if publicEvent}<section><h2>{publicEvent.name}</h2><p>{publicEvent.description}</p><p>{publicEvent.starts_at}</p><form onsubmit={(event) => { event.preventDefault(); void register(); }}><label>氏名<input bind:value={registrationName} required /></label><label>メールアドレス<input bind:value={registrationEmail} type="email" /></label>{#each publicFields as field}{#if field.field_type === "multi_select"}<fieldset><legend>{field.label}{#if field.required === 1}（必須）{/if}</legend>{#each options(field) as option}<label class="inline"><input type="checkbox" checked={selectedAnswer(field.field_key, option)} onchange={(event) => toggleSelectedAnswer(field.field_key, option, event.currentTarget.checked)} />{option}</label>{/each}</fieldset>{:else if field.field_type === "checkbox" || field.field_type === "consent"}<label class="inline"><input type="checkbox" checked={checkedAnswer(field.field_key)} onchange={(event) => setCheckedAnswer(field.field_key, event.currentTarget.checked)} required={field.required === 1} />{field.label}</label>{:else}<label>{field.label}{#if field.field_type === "textarea"}<textarea value={stringAnswer(field.field_key)} oninput={(event) => setStringAnswer(field.field_key, event.currentTarget.value)} required={field.required === 1}></textarea>{:else if field.field_type === "single_select"}<select value={stringAnswer(field.field_key)} onchange={(event) => setStringAnswer(field.field_key, event.currentTarget.value)} required={field.required === 1}><option value="">選択してください</option>{#each options(field) as option}<option value={option}>{option}</option>{/each}</select>{:else}<input value={stringAnswer(field.field_key)} oninput={(event) => setStringAnswer(field.field_key, event.currentTarget.value)} required={field.required === 1} type={field.field_type === "number" ? "number" : field.field_type === "date" ? "date" : "text"} />{/if}</label>{/if}{/each}<button>申し込む</button></form></section>{/if}
@@ -208,16 +255,16 @@
     {#if screen === "home"}
       <p class="notice" aria-live="polite">{message}</p>
       <section class="focus-card" aria-labelledby="new-event"><h2 id="new-event">新しいイベントを作成</h2>
-        <p>イベント名と日時だけで作成できます。詳細はあとから設定できます。</p>
+        <p>イベント名だけで作成できます。日時が決まっていない場合は、日程調整を使えます。</p>
     <form onsubmit={(event) => { event.preventDefault(); void createEvent(); }}>
       <label>イベント名<input bind:value={eventName} required /></label>
-      <label>開始日時<input bind:value={startsAt} type="datetime-local" required /></label>
-      <label>終了日時<input bind:value={endsAt} type="datetime-local" required /></label>
+      <label class="inline"><input bind:checked={schedulingEnabled} type="checkbox" />日程を調整する</label>
+      {#if !schedulingEnabled}<label>開始日時<input bind:value={startsAt} type="datetime-local" required /></label><label>終了日時<input bind:value={endsAt} type="datetime-local" required /></label>{/if}
       <button>作成する</button>
     </form>
       </section>
       <section aria-labelledby="events"><h2 id="events">あなたのイベント</h2>
-        {#if events.length === 0}<p>まだイベントがありません。</p>{:else}<ul>{#each events as event}<li><div><strong>{event.name}</strong><p class="muted">{event.starts_at} · {event.status}</p></div><button onclick={() => openEvent(event.id)}>管理する</button></li>{/each}</ul>{/if}
+        {#if events.length === 0}<p>まだイベントがありません。</p>{:else}<ul>{#each events as event}<li><div><strong>{event.name}</strong><p class="muted">{event.scheduling_enabled === 1 && event.schedule_status !== "confirmed" ? "日程調整中" : `${event.starts_at} · ${event.status}`}</p></div><button onclick={() => openEvent(event.id)}>管理する</button></li>{/each}</ul>{/if}
       </section>
     {:else if screen === "admin"}
       <section aria-labelledby="admin-menu"><h2 id="admin-menu">管理メニュー</h2><p>管理用の接続情報と組織の設定を扱います。</p>
@@ -227,6 +274,15 @@
       </section>
     {:else}
       <section class="event-title"><h2>{events.find((event) => event.id === selectedEventId)?.name ?? "イベント管理"}</h2><p>必要な作業を選んでください。</p></section>
+      {#if schedule?.enabled && schedule.status !== "confirmed"}
+        <section aria-labelledby="schedule-management"><h2 id="schedule-management">日程を調整</h2><p>候補日時を追加して、参加者に回答してもらいます。</p>
+          <p class="muted">共有用URL: <a href={`/events/${selectedEventId}/schedule`} target="_blank" rel="noreferrer">日程調整ページを開く</a></p>
+          <form onsubmit={(event) => { event.preventDefault(); void addScheduleOption(); }} class="schedule-form"><label>候補の開始<input bind:value={scheduleStartsAt} type="datetime-local" required /></label><label>候補の終了<input bind:value={scheduleEndsAt} type="datetime-local" required /></label><label>メモ（任意）<input bind:value={scheduleNote} placeholder="会場の都合など" /></label><button>候補を追加</button></form>
+          {#if schedule.options.length === 0}<p>候補日時を追加してください。</p>{:else}<div class="schedule-list">{#each schedule.options as option}<div class="schedule-option"><div><strong>{option.starts_at} – {option.ends_at}</strong>{#if option.note}<p class="muted">{option.note}</p>{/if}<p class="muted">○ {option.yes ?? 0}　△ {option.maybe ?? 0}　× {option.no ?? 0}</p></div>{#if isAdministrator}<button onclick={() => void confirmSchedule(option.id)}>この日程に確定</button>{/if}</div>{/each}</div>{/if}
+        </section>
+      {:else if schedule?.enabled}
+        <section class="notice"><strong>日程確定済み</strong><p>{schedule.startsAt} – {schedule.endsAt}</p></section>
+      {/if}
       <div class="management-grid"><a href="#roster">名簿を管理</a><a href="#check-in">QR 受付</a><a href="#settings">申込フォーム設定</a></div>
       {#if isAdministrator}
         {@const currentEvent = events.find((event) => event.id === selectedEventId)}

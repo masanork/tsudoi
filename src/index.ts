@@ -106,13 +106,16 @@ app.post("/api/organizations/:organizationId/events", requireScope("admin"), asy
   const startsAt = requiredString(body, "startsAt");
   const endsAt = requiredString(body, "endsAt");
   const registrationMode = requiredString(body, "registrationMode");
+  const schedulingEnabled = body.schedulingEnabled === true;
   const registrationOpensAt = optionalString(body.registrationOpensAt);
   const registrationClosesAt = optionalString(body.registrationClosesAt);
-  if (!name || !startsAt || !endsAt || !["advance", "walk_in", "hybrid"].includes(registrationMode ?? "")) return badRequest(c, "invalid event");
+  if (!name || (!schedulingEnabled && (!startsAt || !endsAt)) || !["advance", "walk_in", "hybrid"].includes(registrationMode ?? "")) return badRequest(c, "invalid event");
   const eventId = crypto.randomUUID();
   await c.env.DB.prepare(`INSERT INTO events (id, organization_id, name, starts_at, ends_at, registration_mode, registration_opens_at, registration_closes_at, capacity, timezone)
     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
-    .bind(eventId, c.req.param("organizationId"), name, startsAt, endsAt, registrationMode, registrationOpensAt ?? null, registrationClosesAt ?? null, optionalInteger(body.capacity), optionalString(body.timezone) ?? "Asia/Tokyo").run();
+    .bind(eventId, c.req.param("organizationId"), name, startsAt ?? "", endsAt ?? "", registrationMode, registrationOpensAt ?? null, registrationClosesAt ?? null, optionalInteger(body.capacity), optionalString(body.timezone) ?? "Asia/Tokyo").run();
+  await c.env.DB.prepare("UPDATE events SET scheduling_enabled = ?, schedule_status = ? WHERE id = ?")
+    .bind(schedulingEnabled ? 1 : 0, schedulingEnabled ? "collecting" : "confirmed", eventId).run();
   await audit(c.env.DB, c.get("auth"), "event.created", "event", eventId);
   return c.json({ id: eventId }, 201);
 });
@@ -133,6 +136,49 @@ app.post("/api/events/:eventId/close", requireScope("admin"), async (c) => {
   if (!updated) return c.json({ error: "event_not_closable" }, 409);
   await audit(c.env.DB, c.get("auth"), "event.closed", "event", event.id);
   return c.json(updated);
+});
+
+app.get("/api/events/:eventId/schedule", requireScope("roster:read"), async (c) => {
+  const event = await eventForAuth(c);
+  if (!event) return c.json({ error: "not_found" }, 404);
+  const options = await c.env.DB.prepare(`SELECT o.id, o.starts_at, o.ends_at, o.note,
+      COUNT(r.id) AS responses,
+      SUM(CASE WHEN r.response = 'yes' THEN 1 ELSE 0 END) AS yes,
+      SUM(CASE WHEN r.response = 'maybe' THEN 1 ELSE 0 END) AS maybe,
+      SUM(CASE WHEN r.response = 'no' THEN 1 ELSE 0 END) AS no
+    FROM schedule_options o LEFT JOIN schedule_responses r ON r.option_id = o.id
+    WHERE o.event_id = ? GROUP BY o.id ORDER BY o.starts_at`).bind(event.id).all();
+  return c.json({ enabled: event.scheduling_enabled === 1, status: event.schedule_status, startsAt: event.starts_at || null, endsAt: event.ends_at || null, options: options.results });
+});
+
+app.post("/api/events/:eventId/schedule/options", requireScope("admin"), async (c) => {
+  const event = await eventForAuth(c);
+  if (!event) return c.json({ error: "not_found" }, 404);
+  if (event.scheduling_enabled !== 1 || event.schedule_status === "confirmed") return c.json({ error: "schedule_not_editable" }, 409);
+  const body = await jsonBody(c);
+  const startsAt = requiredString(body, "startsAt");
+  const endsAt = requiredString(body, "endsAt");
+  if (!startsAt || !endsAt) return badRequest(c, "startsAt and endsAt are required");
+  const id = crypto.randomUUID();
+  try {
+    await c.env.DB.prepare("INSERT INTO schedule_options (id, event_id, starts_at, ends_at, note) VALUES (?, ?, ?, ?, ?)")
+      .bind(id, event.id, startsAt, endsAt, optionalString(body.note) ?? "").run();
+  } catch { return c.json({ error: "schedule_option_exists" }, 409); }
+  return c.json({ id }, 201);
+});
+
+app.post("/api/events/:eventId/schedule/confirm", requireScope("admin"), async (c) => {
+  const event = await eventForAuth(c);
+  if (!event) return c.json({ error: "not_found" }, 404);
+  if (event.scheduling_enabled !== 1 || event.schedule_status === "confirmed") return c.json({ error: "schedule_not_confirmable" }, 409);
+  const body = await jsonBody(c);
+  const optionId = requiredString(body, "optionId");
+  const option = await c.env.DB.prepare("SELECT id, starts_at, ends_at FROM schedule_options WHERE id = ? AND event_id = ?")
+    .bind(optionId, event.id).first<{ id: string; starts_at: string; ends_at: string }>();
+  if (!option) return c.json({ error: "schedule_option_not_found" }, 404);
+  await c.env.DB.prepare("UPDATE events SET starts_at = ?, ends_at = ?, schedule_status = 'confirmed', updated_at = CURRENT_TIMESTAMP WHERE id = ?")
+    .bind(option.starts_at, option.ends_at, event.id).run();
+  return c.json({ confirmed: true, startsAt: option.starts_at, endsAt: option.ends_at });
 });
 
 app.post("/api/events/:eventId/venues", requireScope("admin"), async (c) => {
@@ -410,6 +456,36 @@ app.get("/public/events/:eventId", async (c) => {
   if (!event) return c.json({ error: "not_found" }, 404);
   const fields = await c.env.DB.prepare("SELECT id, field_key, label, field_type, required, options_json FROM form_fields WHERE event_id = ? AND retired_at IS NULL ORDER BY sort_order").bind(c.req.param("eventId")).all();
   return c.json({ event, fields: fields.results });
+});
+
+app.get("/public/events/:eventId/schedule", async (c) => {
+  const event = await c.env.DB.prepare("SELECT id, name, description, timezone, scheduling_enabled, schedule_status FROM events WHERE id = ? AND scheduling_enabled = 1")
+    .bind(c.req.param("eventId")).first();
+  if (!event) return c.json({ error: "not_found" }, 404);
+  const options = await c.env.DB.prepare(`SELECT o.id, o.starts_at, o.ends_at, o.note,
+      SUM(CASE WHEN r.response = 'yes' THEN 1 ELSE 0 END) AS yes,
+      SUM(CASE WHEN r.response = 'maybe' THEN 1 ELSE 0 END) AS maybe,
+      SUM(CASE WHEN r.response = 'no' THEN 1 ELSE 0 END) AS no
+    FROM schedule_options o LEFT JOIN schedule_responses r ON r.option_id = o.id
+    WHERE o.event_id = ? GROUP BY o.id ORDER BY o.starts_at`).bind(c.req.param("eventId")).all();
+  return c.json({ event, options: options.results });
+});
+
+app.post("/public/events/:eventId/schedule/responses", async (c) => {
+  const body = await jsonBody(c);
+  const respondentId = requiredString(body, "respondentId");
+  const respondentName = requiredString(body, "respondentName");
+  const response = requiredString(body, "response");
+  const optionId = requiredString(body, "optionId");
+  if (!respondentId || respondentId.length > 128 || !respondentName || respondentName.length > 200 || !optionId || !["yes", "maybe", "no"].includes(response ?? "")) return badRequest(c, "invalid schedule response");
+  const event = await c.env.DB.prepare("SELECT id FROM events WHERE id = ? AND scheduling_enabled = 1 AND schedule_status != 'confirmed'").bind(c.req.param("eventId")).first();
+  const option = await c.env.DB.prepare("SELECT id FROM schedule_options WHERE id = ? AND event_id = ?").bind(optionId, c.req.param("eventId")).first();
+  if (!event || !option) return c.json({ error: "schedule_not_available" }, 409);
+  await c.env.DB.prepare(`INSERT INTO schedule_responses (id, event_id, option_id, respondent_id, respondent_name, response)
+    VALUES (?, ?, ?, ?, ?, ?)
+    ON CONFLICT(option_id, respondent_id) DO UPDATE SET respondent_name = excluded.respondent_name, response = excluded.response, updated_at = CURRENT_TIMESTAMP`)
+    .bind(crypto.randomUUID(), c.req.param("eventId"), optionId, respondentId, respondentName, response).run();
+  return c.json({ saved: true }, 201);
 });
 
 app.post("/public/events/:eventId/register", async (c) => {
@@ -695,7 +771,7 @@ function safeEqual(left: string, right: string) {
 }
 async function audit(db: D1Database, auth: TokenAuth, action: string, targetType: string, targetId: string) { await db.prepare("INSERT INTO audit_logs (id, organization_id, actor_id, action, target_type, target_id) VALUES (?, ?, ?, ?, ?, ?)").bind(crypto.randomUUID(), auth.organizationId, auth.tokenId, action, targetType, targetId).run(); }
 
-type EventRow = { id: string; organization_id: string; name: string; registration_mode: string; capacity: number | null };
+type EventRow = { id: string; organization_id: string; name: string; registration_mode: string; capacity: number | null; scheduling_enabled?: number; schedule_status?: string; starts_at?: string; ends_at?: string };
 type FieldRow = { id: string; field_key: string; field_type: string; required: number; options_json: string };
 
 export default {

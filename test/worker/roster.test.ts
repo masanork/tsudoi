@@ -55,4 +55,26 @@ describe("Worker D1 roster flow", () => {
     expect(registration.status).toBe(404);
     await expect(registration.json()).resolves.toEqual({ error: "registration_unavailable" });
   });
+
+  it("supports scheduling before confirming an event date", async () => {
+    const bootstrap = await SELF.fetch("https://tsudoi.test/api/bootstrap", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ organizationName: "Scheduling organization" }) });
+    const { organizationId, token } = await bootstrap.json<{ organizationId: string; token: string }>();
+    const auth = { "content-type": "application/json", authorization: `Bearer ${token}` };
+    const eventResponse = await SELF.fetch(`https://tsudoi.test/api/organizations/${organizationId}/events`, { method: "POST", headers: auth, body: JSON.stringify({ name: "Date poll", schedulingEnabled: true, registrationMode: "hybrid" }) });
+    expect(eventResponse.status).toBe(201);
+    const { id: eventId } = await eventResponse.json<{ id: string }>();
+
+    const optionResponse = await SELF.fetch(`https://tsudoi.test/api/events/${eventId}/schedule/options`, { method: "POST", headers: auth, body: JSON.stringify({ startsAt: "2026-11-01T09:00:00Z", endsAt: "2026-11-01T10:00:00Z" }) });
+    expect(optionResponse.status).toBe(201);
+    const { id: optionId } = await optionResponse.json<{ id: string }>();
+    const publicSchedule = await SELF.fetch(`https://tsudoi.test/public/events/${eventId}/schedule`);
+    expect(publicSchedule.status).toBe(200);
+    await expect(publicSchedule.json()).resolves.toMatchObject({ event: { name: "Date poll", schedule_status: "collecting" }, options: [{ id: optionId }] });
+
+    const response = await SELF.fetch(`https://tsudoi.test/public/events/${eventId}/schedule/responses`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ optionId, respondentId: "respondent-1", respondentName: "Ada Lovelace", response: "yes" }) });
+    expect(response.status).toBe(201);
+    const confirm = await SELF.fetch(`https://tsudoi.test/api/events/${eventId}/schedule/confirm`, { method: "POST", headers: auth, body: JSON.stringify({ optionId }) });
+    expect(confirm.status).toBe(200);
+    await expect(env.DB.prepare("SELECT starts_at, ends_at, schedule_status FROM events WHERE id = ?").bind(eventId).first()).resolves.toMatchObject({ starts_at: "2026-11-01T09:00:00Z", schedule_status: "confirmed" });
+  });
 });
