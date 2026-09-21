@@ -9,6 +9,8 @@
   let eventName = "";
   let startsAt = "";
   let endsAt = "";
+  let ticketLink = "";
+  let checkinMessage = "";
   let participantTicket: ParticipantTicket | null = null;
   let participantMessage = "チケットを確認しています。";
   const ticketPage = typeof window !== "undefined" && window.location.pathname === "/ticket";
@@ -47,6 +49,14 @@
       participantMessage = "参加をキャンセルしました。"; await loadParticipantTicket();
     } catch { participantMessage = "このチケットは現在キャンセルできません。"; }
   }
+  async function checkInTicketLink() {
+    try {
+      const linkToken = new URL(ticketLink).pathname.split("/").filter(Boolean).at(-1);
+      if (!linkToken) throw new Error("invalid_ticket_link");
+      const result = await api("/tickets/check-in-link", { method: "POST", body: JSON.stringify({ linkToken }) });
+      checkinMessage = result.outcome === "accepted" ? "受付が完了しました。" : `受付できません: ${result.outcome}`;
+    } catch (error) { checkinMessage = error instanceof Error ? error.message : "受付に失敗しました。"; }
+  }
 </script>
 
 <svelte:head><meta name="description" content="軽量なイベント名簿・受付管理" /></svelte:head>
@@ -79,6 +89,14 @@
   </section>
   <section aria-labelledby="events"><h2 id="events">イベント</h2>
     {#if events.length === 0}<p>まだイベントがありません。</p>{:else}<ul>{#each events as event}<li><strong>{event.name}</strong><span>{event.starts_at} · {event.status}</span></li>{/each}</ul>{/if}
+  </section>
+  <section aria-labelledby="check-in"><h2 id="check-in">QR 受付</h2>
+    <p>チケット QR から読み取ったリンクを貼り付けてください。</p>
+    <form onsubmit={(event) => { event.preventDefault(); void checkInTicketLink(); }}>
+      <label>チケットリンク<input bind:value={ticketLink} type="url" inputmode="url" required /></label>
+      <button>受付する</button>
+    </form>
+    {#if checkinMessage}<p class="notice" aria-live="polite">{checkinMessage}</p>{/if}
   </section>
 {/if}
 </main>
