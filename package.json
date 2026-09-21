@@ -8,7 +8,9 @@
     "build:web": "npm --prefix web run build",
     "build": "npm run build:web && tsc --noEmit",
     "typecheck": "tsc --noEmit && npm --prefix web run check",
-    "test": "vitest run",
+    "test": "vitest run --passWithNoTests",
+    "stats": "node scripts/health.mjs",
+    "stats:save": "node scripts/health.mjs --save",
     "db:migrate:local": "wrangler d1 migrations apply tsudoi-db --local",
     "db:migrate:remote": "wrangler d1 migrations apply tsudoi-db --remote",
     "types": "wrangler types ./src/worker-configuration.d.ts"

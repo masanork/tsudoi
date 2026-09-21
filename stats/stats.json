@@ -1,0 +1,16 @@
+{
+  "generatedAt": "2026-09-21T12:57:10.607Z",
+  "commit": "454eab6",
+  "worker": {
+    "files": 2,
+    "lines": 16107
+  },
+  "web": {
+    "files": 2,
+    "lines": 55
+  },
+  "tests": {
+    "files": 0,
+    "lines": 0
+  }
+}
