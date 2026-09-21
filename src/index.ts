@@ -202,6 +202,27 @@ app.post("/api/tickets/:ticketId/check-in", requireScope("checkin:write"), async
   return c.json({ outcome, ticket: updated ?? { id: ticket.id, status: ticket.status } }, updated ? 200 : 409);
 });
 
+app.post("/api/tickets/check-in-link", requireScope("checkin:write"), async (c) => {
+  const body = await jsonBody(c);
+  const linkToken = requiredString(body, "linkToken");
+  const venueId = optionalString(body.venueId);
+  if (!linkToken) return badRequest(c, "linkToken is required");
+  const record = await c.env.DB.prepare(`SELECT ml.id AS magic_link_id, t.id AS ticket_id, t.status, e.organization_id
+    FROM magic_links ml JOIN attendees a ON a.id = ml.attendee_id JOIN tickets t ON t.attendee_id = a.id
+    JOIN events e ON e.id = t.event_id
+    WHERE ml.token_hash = ? AND ml.purpose = 'ticket' AND ml.consumed_at IS NULL AND ml.expires_at > CURRENT_TIMESTAMP`)
+    .bind(await sha256(linkToken)).first<{ magic_link_id: string; ticket_id: string; status: string; organization_id: string }>();
+  if (!record || record.organization_id !== c.get("auth").organizationId) return c.json({ error: "not_found" }, 404);
+  const updated = await c.env.DB.prepare(`UPDATE tickets SET status = 'checked_in', checked_in_at = CURRENT_TIMESTAMP, checked_in_by = ?, checked_in_venue_id = ?
+    WHERE id = ? AND status = 'issued' RETURNING id, status, checked_in_at`).bind(c.get("auth").tokenId, venueId ?? null, record.ticket_id).first();
+  const outcome = updated ? "accepted" : record.status === "checked_in" ? "duplicate" : "rejected";
+  const statements = [c.env.DB.prepare("INSERT INTO check_ins (id, ticket_id, venue_id, staff_user_id, outcome) VALUES (?, ?, ?, ?, ?)")
+    .bind(crypto.randomUUID(), record.ticket_id, venueId ?? null, c.get("auth").tokenId, outcome)];
+  if (updated) statements.push(c.env.DB.prepare("UPDATE magic_links SET consumed_at = CURRENT_TIMESTAMP WHERE id = ?").bind(record.magic_link_id));
+  await c.env.DB.batch(statements);
+  return c.json({ outcome, ticket: updated ?? { id: record.ticket_id, status: record.status } }, updated ? 200 : 409);
+});
+
 app.post("/api/messages/:threadId", requireScope("messages:write"), async (c) => {
   const body = await jsonBody(c);
   const ciphertext = requiredString(body, "ciphertext");
