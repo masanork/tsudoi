@@ -472,7 +472,16 @@ async function registerAttendee(c: Context<AppEnv>, event: EventRow, staffRegist
   ];
   for (const field of fields.results) if (answers[field.field_key] !== undefined) statements.push(c.env.DB.prepare("INSERT INTO attendee_answers (attendee_id, field_id, value_json) VALUES (?, ?, ?)").bind(attendeeId, field.id, JSON.stringify(answers[field.field_key])));
   await c.env.DB.batch(statements);
-  return c.json({ attendeeId, ticketId, ticketToken: staffRegistration ? undefined : ticketToken }, 201);
+  let emailQueued = false;
+  if (!staffRegistration && email) {
+    const magicToken = randomToken();
+    await c.env.DB.prepare("INSERT INTO magic_links (id, attendee_id, token_hash, purpose, expires_at) VALUES (?, ?, ?, 'ticket', datetime('now', '+24 hours'))")
+      .bind(crypto.randomUUID(), attendeeId, await sha256(magicToken)).run();
+    const link = `${c.env.APP_ORIGIN}/public/magic-links/${encodeURIComponent(magicToken)}`;
+    await c.env.NOTIFICATION_QUEUE.send({ type: "ticket_link", to: email, eventName: event.name, link } satisfies NotificationJob);
+    emailQueued = true;
+  }
+  return c.json({ attendeeId, ticketId, ticketToken: staffRegistration ? undefined : ticketToken, emailQueued }, 201);
 }
 
 async function ticketFromPossession(c: Context<AppEnv>) {
@@ -603,7 +612,7 @@ function safeEqual(left: string, right: string) {
 }
 async function audit(db: D1Database, auth: TokenAuth, action: string, targetType: string, targetId: string) { await db.prepare("INSERT INTO audit_logs (id, organization_id, actor_id, action, target_type, target_id) VALUES (?, ?, ?, ?, ?, ?)").bind(crypto.randomUUID(), auth.organizationId, auth.tokenId, action, targetType, targetId).run(); }
 
-type EventRow = { id: string; organization_id: string; registration_mode: string };
+type EventRow = { id: string; organization_id: string; name: string; registration_mode: string };
 type FieldRow = { id: string; field_key: string; field_type: string; required: number; options_json: string };
 
 export default {
