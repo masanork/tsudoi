@@ -17,4 +17,11 @@ describe("E2EE browser primitives", () => {
     const payload = await encryptMessage(recovered, "readable by recipient", "thread-2");
     await expect(decryptMessage(threadKey, payload, "thread-2")).resolves.toBe("readable by recipient");
   });
+
+  it("rejects unsupported message and key-envelope algorithms", async () => {
+    const threadKey = await createThreadKey();
+    await expect(decryptMessage(threadKey, { algorithm: "unknown" as "AES-GCM-256", ciphertext: "", iv: "" }, "thread-3")).rejects.toThrow("Unsupported message algorithm");
+    const recipient = await createIdentityKeyPair();
+    await expect(unwrapThreadKey({ algorithm: "unknown" as "ECDH-P256+AES-GCM-256", ephemeralPublicKey: {}, ciphertext: "", iv: "" }, recipient.privateKey)).rejects.toThrow("Unsupported envelope algorithm");
+  });
 });
