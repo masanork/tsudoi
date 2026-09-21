@@ -9,6 +9,7 @@
     "build": "npm run build:web && tsc --noEmit",
     "typecheck": "tsc --noEmit && npm --prefix web run check",
     "test": "vitest run --passWithNoTests",
+    "test:worker": "vitest run --config vitest.worker.config.ts",
     "test:coverage": "vitest run --coverage",
     "test:e2e": "playwright test",
     "stats": "node scripts/health.mjs",
@@ -24,12 +25,13 @@
     "qrcode": "^1.5.4"
   },
   "devDependencies": {
+    "@cloudflare/vitest-plugin": "^1.2.0",
     "@playwright/test": "^1.63.0",
     "@types/node": "^22.20.3",
     "@types/qrcode": "^1.5.6",
-    "@vitest/coverage-v8": "^5.0.1",
+    "@vitest/coverage-v8": "^4.1.11",
     "typescript": "^5.7.3",
-    "vitest": "^5.0.1",
+    "vitest": "^4.1.11",
     "wrangler": "^4.135.0"
   }
 }
