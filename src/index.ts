@@ -120,6 +120,21 @@ app.get("/api/events/:eventId/attendees", requireScope("roster:read"), async (c)
   return c.json(rows.results);
 });
 
+app.get("/api/events/:eventId/attendees.csv", requireScope("admin"), async (c) => {
+  const event = await eventForAuth(c);
+  if (!event) return c.json({ error: "not_found" }, 404);
+  const fields = await c.env.DB.prepare("SELECT id, label FROM form_fields WHERE event_id = ? ORDER BY sort_order, created_at").bind(event.id).all<{ id: string; label: string }>();
+  const attendees = await c.env.DB.prepare("SELECT id, name, email_normalized, registration_source, status, created_at FROM attendees WHERE event_id = ? ORDER BY created_at").bind(event.id).all<{ id: string; name: string; email_normalized: string | null; registration_source: string; status: string; created_at: string }>();
+  const answers = await c.env.DB.prepare("SELECT attendee_id, field_id, value_json FROM attendee_answers WHERE attendee_id IN (SELECT id FROM attendees WHERE event_id = ?)").bind(event.id).all<{ attendee_id: string; field_id: string; value_json: string }>();
+  const answerMap = new Map(answers.results.map((answer) => [`${answer.attendee_id}:${answer.field_id}`, csvAnswer(answer.value_json)]));
+  const header = ["Name", "Email", "Registration source", "Status", "Registered at", ...fields.results.map((field) => field.label)];
+  const rows = attendees.results.map((attendee) => [attendee.name, attendee.email_normalized ?? "", attendee.registration_source, attendee.status, attendee.created_at, ...fields.results.map((field) => answerMap.get(`${attendee.id}:${field.id}`) ?? "")]);
+  await audit(c.env.DB, c.get("auth"), "attendees.exported", "event", event.id);
+  c.header("Content-Type", "text/csv; charset=utf-8");
+  c.header("Content-Disposition", `attachment; filename="tsudoi-${event.id}-attendees.csv"`);
+  return c.body(`\uFEFF${[header, ...rows].map((row) => row.map(csvCell).join(",")).join("\r\n")}\r\n`);
+});
+
 app.post("/api/events/:eventId/attendees", requireScope("roster:write"), async (c) => {
   const event = await eventForAuth(c);
   if (!event) return c.json({ error: "not_found" }, 404);
@@ -450,6 +465,8 @@ function cookieValue(header: string | undefined, name: string) {
   const prefix = `${name}=`;
   return header.split(";").map((part) => part.trim()).find((part) => part.startsWith(prefix))?.slice(prefix.length);
 }
+function csvCell(value: string) { return `"${value.replaceAll('"', '""')}"`; }
+function csvAnswer(value: string) { try { const parsed: unknown = JSON.parse(value); return Array.isArray(parsed) ? parsed.join("; ") : typeof parsed === "string" || typeof parsed === "number" || typeof parsed === "boolean" ? String(parsed) : ""; } catch { return ""; } }
 function safeEqual(left: string, right: string) {
   if (left.length !== right.length) return false;
   let difference = 0;
