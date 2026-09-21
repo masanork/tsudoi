@@ -11,6 +11,7 @@
   let eventName = "";
   let startsAt = "";
   let endsAt = "";
+  let eventCapacity = "";
   let ticketLink = "";
   let checkinMessage = "";
   let selectedEventId = "";
@@ -50,8 +51,8 @@
   }
   async function createEvent() {
     try {
-      await api(`/organizations/${organizationId}/events`, { method: "POST", body: JSON.stringify({ name: eventName, startsAt, endsAt, registrationMode: "hybrid" }) });
-      eventName = ""; await loadEvents(); message = "イベントを作成しました。";
+      await api(`/organizations/${organizationId}/events`, { method: "POST", body: JSON.stringify({ name: eventName, startsAt, endsAt, registrationMode: "hybrid", capacity: eventCapacity ? Number(eventCapacity) : undefined }) });
+      eventName = ""; eventCapacity = ""; await loadEvents(); message = "イベントを作成しました。";
     } catch (error) { message = error instanceof Error ? error.message : "作成に失敗しました。"; }
   }
   async function loadParticipantTicket() {
@@ -160,6 +161,7 @@
       <label>イベント名<input bind:value={eventName} required /></label>
       <label>開始日時<input bind:value={startsAt} type="datetime-local" required /></label>
       <label>終了日時<input bind:value={endsAt} type="datetime-local" required /></label>
+      <label>定員（空欄で無制限）<input bind:value={eventCapacity} type="number" min="1" /></label>
       <button>作成する</button>
     </form>
   </section>

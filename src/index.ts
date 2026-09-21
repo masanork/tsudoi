@@ -462,6 +462,10 @@ async function registerAttendee(c: Context<AppEnv>, event: EventRow, staffRegist
   const body = await jsonBody(c);
   const name = requiredString(body, "name");
   if (!name) return badRequest(c, "name is required");
+  if (event.capacity !== null) {
+    const registrations = await c.env.DB.prepare("SELECT COUNT(*) AS count FROM attendees WHERE event_id = ? AND status = 'active'").bind(event.id).first<{ count: number }>();
+    if ((registrations?.count ?? 0) >= event.capacity) return c.json({ error: "capacity_reached" }, 409);
+  }
   const email = optionalString(body.email)?.trim().toLowerCase();
   if (email && !email.includes("@")) return badRequest(c, "invalid email");
   const fields = await c.env.DB.prepare("SELECT id, field_key, field_type, required, options_json FROM form_fields WHERE event_id = ? AND retired_at IS NULL").bind(event.id).all<FieldRow>();
@@ -625,7 +629,7 @@ function safeEqual(left: string, right: string) {
 }
 async function audit(db: D1Database, auth: TokenAuth, action: string, targetType: string, targetId: string) { await db.prepare("INSERT INTO audit_logs (id, organization_id, actor_id, action, target_type, target_id) VALUES (?, ?, ?, ?, ?, ?)").bind(crypto.randomUUID(), auth.organizationId, auth.tokenId, action, targetType, targetId).run(); }
 
-type EventRow = { id: string; organization_id: string; name: string; registration_mode: string };
+type EventRow = { id: string; organization_id: string; name: string; registration_mode: string; capacity: number | null };
 type FieldRow = { id: string; field_key: string; field_type: string; required: number; options_json: string };
 
 export default {

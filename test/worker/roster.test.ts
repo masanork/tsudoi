@@ -1,4 +1,4 @@
-import { SELF } from "cloudflare:test";
+import { env, SELF } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
 
 describe("Worker D1 roster flow", () => {
@@ -21,5 +21,20 @@ describe("Worker D1 roster flow", () => {
     const roster = await SELF.fetch(`https://tsudoi.test/api/events/${eventId}/roster`, { headers: { authorization: `Bearer ${token}` } });
     expect(roster.status).toBe(200);
     await expect(roster.json()).resolves.toMatchObject({ fields: [{ field_key: "company", label: "Company" }], attendees: [{ name: "Ada Lovelace", email_normalized: "ada@example.test", answers: { company: "Analytical Engines" } }] });
+  });
+
+  it("refuses registrations after reaching an event capacity", async () => {
+    const bootstrap = await SELF.fetch("https://tsudoi.test/api/bootstrap", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ organizationName: "Capacity organization" }) });
+    const { organizationId, token } = await bootstrap.json<{ organizationId: string; token: string }>();
+    const auth = { "content-type": "application/json", authorization: `Bearer ${token}` };
+    const eventResponse = await SELF.fetch(`https://tsudoi.test/api/organizations/${organizationId}/events`, { method: "POST", headers: auth, body: JSON.stringify({ name: "Limited event", startsAt: "2026-10-02T09:00:00Z", endsAt: "2026-10-02T10:00:00Z", registrationMode: "hybrid", capacity: 1 }) });
+    const { id: eventId } = await eventResponse.json<{ id: string }>();
+    await env.DB.prepare("UPDATE events SET status = 'published' WHERE id = ?").bind(eventId).run();
+
+    const first = await SELF.fetch(`https://tsudoi.test/public/events/${eventId}/register`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ name: "First attendee" }) });
+    expect(first.status).toBe(201);
+    const second = await SELF.fetch(`https://tsudoi.test/public/events/${eventId}/register`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ name: "Second attendee" }) });
+    expect(second.status).toBe(409);
+    await expect(second.json()).resolves.toEqual({ error: "capacity_reached" });
   });
 });
