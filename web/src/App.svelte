@@ -15,6 +15,8 @@
   let checkinMessage = "";
   let selectedEventId = "";
   let metrics: { registrations: number; issued: number; cancelled: number; checked_in: number; not_checked_in: number } | null = null;
+  let rosterFields: Array<{ field_key: string; label: string }> = [];
+  let rosterAttendees: Array<{ id: string; name: string; email_normalized: string | null; ticket_status: string; answers: Record<string, unknown> }> = [];
   let fieldKey = "";
   let fieldLabel = "";
   let fieldType = "text";
@@ -82,6 +84,11 @@
     try { selectedEventId = eventId; metrics = await api(`/events/${eventId}/metrics`); }
     catch (error) { message = error instanceof Error ? error.message : "集計を読み込めませんでした。"; }
   }
+  async function loadRoster(eventId: string) {
+    try { const roster = await api(`/events/${eventId}/roster`); rosterFields = roster.fields; rosterAttendees = roster.attendees; }
+    catch (error) { message = error instanceof Error ? error.message : "名簿を読み込めませんでした。"; }
+  }
+  async function selectEvent(eventId: string) { await Promise.all([loadMetrics(eventId), loadRoster(eventId)]); }
   async function createField() {
     try {
       const options = fieldOptions.split(/[\n,]/).map((option) => option.trim()).filter(Boolean);
@@ -119,6 +126,7 @@
   function setCheckedAnswer(key: string, checked: boolean) { registrationAnswers = { ...registrationAnswers, [key]: checked }; }
   function selectedAnswer(key: string, option: string) { const value = registrationAnswers[key]; return Array.isArray(value) && value.includes(option); }
   function toggleSelectedAnswer(key: string, option: string, checked: boolean) { const current = registrationAnswers[key]; const values = Array.isArray(current) ? current : []; registrationAnswers = { ...registrationAnswers, [key]: checked ? [...new Set([...values, option])] : values.filter((value) => value !== option) }; }
+  function answerText(value: unknown) { return Array.isArray(value) ? value.join(", ") : value === true ? "Yes" : value === false ? "No" : typeof value === "string" || typeof value === "number" ? String(value) : ""; }
 </script>
 
 <svelte:head><meta name="description" content="軽量なイベント名簿・受付管理" /></svelte:head>
@@ -156,11 +164,16 @@
     </form>
   </section>
   <section aria-labelledby="events"><h2 id="events">イベント</h2>
-    {#if events.length === 0}<p>まだイベントがありません。</p>{:else}<ul>{#each events as event}<li><strong>{event.name}</strong><span>{event.starts_at} · {event.status} <button onclick={() => loadMetrics(event.id)}>集計</button></span></li>{/each}</ul>{/if}
+    {#if events.length === 0}<p>まだイベントがありません。</p>{:else}<ul>{#each events as event}<li><strong>{event.name}</strong><span>{event.starts_at} · {event.status} <button onclick={() => selectEvent(event.id)}>名簿と集計</button></span></li>{/each}</ul>{/if}
   </section>
   {#if metrics}
     <section aria-labelledby="metrics"><h2 id="metrics">イベント集計</h2><p class="muted">Event ID: {selectedEventId}</p>
       <dl class="metrics"><div><dt>申込</dt><dd>{metrics.registrations ?? 0}</dd></div><div><dt>発券</dt><dd>{metrics.issued ?? 0}</dd></div><div><dt>取消</dt><dd>{metrics.cancelled ?? 0}</dd></div><div><dt>受付済</dt><dd>{metrics.checked_in ?? 0}</dd></div><div><dt>未受付</dt><dd>{metrics.not_checked_in ?? 0}</dd></div></dl>
+    </section>
+  {/if}
+  {#if selectedEventId}
+    <section aria-labelledby="roster"><h2 id="roster">名簿</h2><p class="muted">表示中のイベントに追加された項目は、自動的にカラムとして表示されます。</p>
+      {#if rosterAttendees.length === 0}<p>登録者はいません。</p>{:else}<div class="table-scroll"><table><thead><tr><th>氏名</th><th>メール</th><th>チケット</th>{#each rosterFields as field}<th>{field.label}</th>{/each}</tr></thead><tbody>{#each rosterAttendees as attendee}<tr><td>{attendee.name}</td><td>{attendee.email_normalized ?? ""}</td><td>{attendee.ticket_status}</td>{#each rosterFields as field}<td>{answerText(attendee.answers[field.field_key])}</td>{/each}</tr>{/each}</tbody></table></div>{/if}
     </section>
   {/if}
   {#if selectedEventId}

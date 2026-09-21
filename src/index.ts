@@ -107,6 +107,18 @@ app.post("/api/events/:eventId/form-fields", requireScope("admin"), async (c) =>
   return c.json({ id }, 201);
 });
 
+app.get("/api/events/:eventId/roster", requireScope("roster:read"), async (c) => {
+  const event = await eventForAuth(c);
+  if (!event) return c.json({ error: "not_found" }, 404);
+  const fields = await c.env.DB.prepare("SELECT id, field_key, label FROM form_fields WHERE event_id = ? AND retired_at IS NULL ORDER BY sort_order, created_at").bind(event.id).all<{ id: string; field_key: string; label: string }>();
+  const attendees = await c.env.DB.prepare(`SELECT a.id, a.name, a.email_normalized, a.status, a.registration_source, a.created_at,
+      t.status AS ticket_status, t.checked_in_at FROM attendees a JOIN tickets t ON t.attendee_id = a.id
+      WHERE a.event_id = ? ORDER BY a.created_at DESC LIMIT 200`).bind(event.id).all<{ id: string; name: string; email_normalized: string | null; status: string; registration_source: string; created_at: string; ticket_status: string; checked_in_at: string | null }>();
+  const answers = await c.env.DB.prepare("SELECT attendee_id, field_id, value_json FROM attendee_answers WHERE attendee_id IN (SELECT id FROM attendees WHERE event_id = ?)").bind(event.id).all<{ attendee_id: string; field_id: string; value_json: string }>();
+  const answerMap = new Map(answers.results.map((answer) => [`${answer.attendee_id}:${answer.field_id}`, answerValue(answer.value_json)]));
+  return c.json({ fields: fields.results.map(({ field_key, label }) => ({ field_key, label })), attendees: attendees.results.map((attendee) => ({ ...attendee, answers: Object.fromEntries(fields.results.map((field) => [field.field_key, answerMap.get(`${attendee.id}:${field.id}`) ?? null])) })) });
+});
+
 app.get("/api/events/:eventId/attendees", requireScope("roster:read"), async (c) => {
   const event = await eventForAuth(c);
   if (!event) return c.json({ error: "not_found" }, 404);
@@ -559,6 +571,7 @@ function fieldOptions(field: FieldRow): string[] {
   try { const value: unknown = JSON.parse(field.options_json); return Array.isArray(value) ? value.filter((item): item is string => typeof item === "string") : []; }
   catch { return []; }
 }
+function answerValue(value: string): unknown { try { return JSON.parse(value); } catch { return value; } }
 function hasRequiredAnswer(field: FieldRow, answer: unknown): boolean {
   if (field.field_type === "checkbox" || field.field_type === "consent") return answer === true;
   if (field.field_type === "multi_select") return Array.isArray(answer) && answer.length > 0;
