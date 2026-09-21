@@ -11,6 +11,8 @@
   let endsAt = "";
   let ticketLink = "";
   let checkinMessage = "";
+  let selectedEventId = "";
+  let metrics: { registrations: number; issued: number; cancelled: number; checked_in: number; not_checked_in: number } | null = null;
   let participantTicket: ParticipantTicket | null = null;
   let participantMessage = "チケットを確認しています。";
   const ticketPage = typeof window !== "undefined" && window.location.pathname === "/ticket";
@@ -57,6 +59,10 @@
       checkinMessage = result.outcome === "accepted" ? "受付が完了しました。" : `受付できません: ${result.outcome}`;
     } catch (error) { checkinMessage = error instanceof Error ? error.message : "受付に失敗しました。"; }
   }
+  async function loadMetrics(eventId: string) {
+    try { selectedEventId = eventId; metrics = await api(`/events/${eventId}/metrics`); }
+    catch (error) { message = error instanceof Error ? error.message : "集計を読み込めませんでした。"; }
+  }
 </script>
 
 <svelte:head><meta name="description" content="軽量なイベント名簿・受付管理" /></svelte:head>
@@ -88,8 +94,13 @@
     </form>
   </section>
   <section aria-labelledby="events"><h2 id="events">イベント</h2>
-    {#if events.length === 0}<p>まだイベントがありません。</p>{:else}<ul>{#each events as event}<li><strong>{event.name}</strong><span>{event.starts_at} · {event.status}</span></li>{/each}</ul>{/if}
+    {#if events.length === 0}<p>まだイベントがありません。</p>{:else}<ul>{#each events as event}<li><strong>{event.name}</strong><span>{event.starts_at} · {event.status} <button onclick={() => loadMetrics(event.id)}>集計</button></span></li>{/each}</ul>{/if}
   </section>
+  {#if metrics}
+    <section aria-labelledby="metrics"><h2 id="metrics">イベント集計</h2><p class="muted">Event ID: {selectedEventId}</p>
+      <dl class="metrics"><div><dt>申込</dt><dd>{metrics.registrations ?? 0}</dd></div><div><dt>発券</dt><dd>{metrics.issued ?? 0}</dd></div><div><dt>取消</dt><dd>{metrics.cancelled ?? 0}</dd></div><div><dt>受付済</dt><dd>{metrics.checked_in ?? 0}</dd></div><div><dt>未受付</dt><dd>{metrics.not_checked_in ?? 0}</dd></div></dl>
+    </section>
+  {/if}
   <section aria-labelledby="check-in"><h2 id="check-in">QR 受付</h2>
     <p>チケット QR から読み取ったリンクを貼り付けてください。</p>
     <form onsubmit={(event) => { event.preventDefault(); void checkInTicketLink(); }}>
