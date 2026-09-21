@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { app } from "../src/index";
-const env = { APP_ORIGIN: "https://tsudoi.test" } as Cloudflare.Env;
+const env = { APP_ORIGIN: "https://tsudoi.test" } as unknown as Cloudflare.Env;
 
 describe("Worker edge routes", () => {
   it("reports a health check without database access", async () => {
