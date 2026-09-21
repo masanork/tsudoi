@@ -88,6 +88,7 @@
     try { const response = await fetch(`/public/events/${registrationEventId}/register`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ name: registrationName, email: registrationEmail || undefined, answers: registrationAnswers }) }); const body = await response.json(); if (!response.ok) throw new Error(body.message ?? body.error); registrationMessage = "申込を受け付けました。チケットはこの画面から離れる前に保存してください。"; }
     catch (error) { registrationMessage = error instanceof Error ? error.message : "申込に失敗しました。"; }
   }
+  function options(field: { options_json: string }) { try { const value: unknown = JSON.parse(field.options_json); return Array.isArray(value) ? value.filter((item): item is string => typeof item === "string") : []; } catch { return []; } }
 </script>
 
 <svelte:head><meta name="description" content="軽量なイベント名簿・受付管理" /></svelte:head>
@@ -104,7 +105,7 @@
   {:else}<p class="notice" aria-live="polite">{participantMessage}</p>{/if}
 {:else if registrationEventId}
   <header><p class="eyebrow">EVENT REGISTRATION</p><h1>tsudoi</h1><p>{publicEvent?.name ?? "申込フォーム"}</p></header>
-  {#if publicEvent}<section><h2>{publicEvent.name}</h2><p>{publicEvent.description}</p><p>{publicEvent.starts_at}</p><form onsubmit={(event) => { event.preventDefault(); void register(); }}><label>氏名<input bind:value={registrationName} required /></label><label>メールアドレス<input bind:value={registrationEmail} type="email" /></label>{#each publicFields as field}<label>{field.label}<input bind:value={registrationAnswers[field.field_key]} required={field.required === 1} type={field.field_type === "number" ? "number" : field.field_type === "date" ? "date" : "text"} /></label>{/each}<button>申し込む</button></form></section>{/if}
+  {#if publicEvent}<section><h2>{publicEvent.name}</h2><p>{publicEvent.description}</p><p>{publicEvent.starts_at}</p><form onsubmit={(event) => { event.preventDefault(); void register(); }}><label>氏名<input bind:value={registrationName} required /></label><label>メールアドレス<input bind:value={registrationEmail} type="email" /></label>{#each publicFields as field}<label>{field.label}{#if field.field_type === "textarea"}<textarea bind:value={registrationAnswers[field.field_key]} required={field.required === 1}></textarea>{:else if field.field_type === "single_select"}<select bind:value={registrationAnswers[field.field_key]} required={field.required === 1}><option value="">選択してください</option>{#each options(field) as option}<option value={option}>{option}</option>{/each}</select>{:else}<input bind:value={registrationAnswers[field.field_key]} required={field.required === 1} type={field.field_type === "number" ? "number" : field.field_type === "date" ? "date" : "text"} />{/if}</label>{/each}<button>申し込む</button></form></section>{/if}
   {#if registrationMessage}<p class="notice" aria-live="polite">{registrationMessage}</p>{/if}
 {:else}
   <header><p class="eyebrow">EVENT ROSTER</p><h1>tsudoi</h1><p>会場の名簿と受付を、静かに確実に。</p></header>
