@@ -452,7 +452,11 @@ async function registerAttendee(c: Context<AppEnv>, event: EventRow, staffRegist
   if (email && !email.includes("@")) return badRequest(c, "invalid email");
   const fields = await c.env.DB.prepare("SELECT id, field_key, field_type, required, options_json FROM form_fields WHERE event_id = ? AND retired_at IS NULL").bind(event.id).all<FieldRow>();
   const answers = isRecord(body.answers) ? body.answers : {};
-  for (const field of fields.results) if (field.required && (answers[field.field_key] === undefined || answers[field.field_key] === "")) return badRequest(c, `${field.field_key} is required`);
+  for (const field of fields.results) {
+    const answer = answers[field.field_key];
+    if (field.required && !hasRequiredAnswer(field, answer)) return badRequest(c, `${field.field_key} is required`);
+    if (answer !== undefined && !isValidFieldAnswer(field, answer)) return badRequest(c, `${field.field_key} is invalid`);
+  }
   const attendeeId = crypto.randomUUID();
   const ticketId = crypto.randomUUID();
   const ticketToken = randomToken();
@@ -540,6 +544,24 @@ async function eventForAuth(c: Context<AppEnv>) {
 }
 async function jsonBody(c: Context<AppEnv>): Promise<JsonRecord> { try { const body = await c.req.json(); return isRecord(body) ? body : {}; } catch { return {}; } }
 function isRecord(value: unknown): value is JsonRecord { return typeof value === "object" && value !== null && !Array.isArray(value); }
+function fieldOptions(field: FieldRow): string[] {
+  try { const value: unknown = JSON.parse(field.options_json); return Array.isArray(value) ? value.filter((item): item is string => typeof item === "string") : []; }
+  catch { return []; }
+}
+function hasRequiredAnswer(field: FieldRow, answer: unknown): boolean {
+  if (field.field_type === "checkbox" || field.field_type === "consent") return answer === true;
+  if (field.field_type === "multi_select") return Array.isArray(answer) && answer.length > 0;
+  return typeof answer === "string" ? answer.trim().length > 0 : typeof answer === "number";
+}
+function isValidFieldAnswer(field: FieldRow, answer: unknown): boolean {
+  const options = fieldOptions(field);
+  if (field.field_type === "checkbox" || field.field_type === "consent") return typeof answer === "boolean";
+  if (field.field_type === "multi_select") return Array.isArray(answer) && answer.every((item) => typeof item === "string" && options.includes(item));
+  if (field.field_type === "single_select") return typeof answer === "string" && options.includes(answer);
+  if (field.field_type === "number") return typeof answer === "number" || (typeof answer === "string" && answer.trim() !== "" && Number.isFinite(Number(answer)));
+  if (field.field_type === "date") return typeof answer === "string" && /^\d{4}-\d{2}-\d{2}$/.test(answer);
+  return typeof answer === "string";
+}
 function requiredString(body: JsonRecord, key: string) { const value = body[key]; return typeof value === "string" && value.trim() ? value.trim() : undefined; }
 function optionalString(value: unknown) { return typeof value === "string" && value.trim() ? value.trim() : undefined; }
 function optionalInteger(value: unknown) { return typeof value === "number" && Number.isInteger(value) && value >= 0 ? value : null; }

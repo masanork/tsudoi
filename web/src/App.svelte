@@ -16,6 +16,7 @@
   let fieldKey = "";
   let fieldLabel = "";
   let fieldType = "text";
+  let fieldOptions = "";
   let fieldRequired = false;
   let fieldMessage = "";
   const fieldKeyPattern = "[a-z][a-z0-9_]{0,62}";
@@ -23,7 +24,7 @@
   const registrationEventId = registerMatch?.[1] ?? "";
   let publicEvent: { name: string; description: string; starts_at: string } | null = null;
   let publicFields: Array<{ field_key: string; label: string; field_type: string; required: number; options_json: string }> = [];
-  let registrationName = ""; let registrationEmail = ""; let registrationAnswers: Record<string, string> = {}; let registrationMessage = "";
+  let registrationName = ""; let registrationEmail = ""; let registrationAnswers: Record<string, string | string[] | boolean> = {}; let registrationMessage = "";
   let participantTicket: ParticipantTicket | null = null;
   let participantMessage = "チケットを確認しています。";
   const ticketPage = typeof window !== "undefined" && window.location.pathname === "/ticket";
@@ -76,8 +77,9 @@
   }
   async function createField() {
     try {
-      await api(`/events/${selectedEventId}/form-fields`, { method: "POST", body: JSON.stringify({ key: fieldKey, label: fieldLabel, type: fieldType, required: fieldRequired }) });
-      fieldKey = ""; fieldLabel = ""; fieldRequired = false; fieldMessage = "項目を追加しました。";
+      const options = fieldOptions.split(/[\n,]/).map((option) => option.trim()).filter(Boolean);
+      await api(`/events/${selectedEventId}/form-fields`, { method: "POST", body: JSON.stringify({ key: fieldKey, label: fieldLabel, type: fieldType, required: fieldRequired, options }) });
+      fieldKey = ""; fieldLabel = ""; fieldOptions = ""; fieldRequired = false; fieldMessage = "項目を追加しました。";
     } catch (error) { fieldMessage = error instanceof Error ? error.message : "項目を追加できませんでした。"; }
   }
   async function loadRegistration() {
@@ -89,6 +91,12 @@
     catch (error) { registrationMessage = error instanceof Error ? error.message : "申込に失敗しました。"; }
   }
   function options(field: { options_json: string }) { try { const value: unknown = JSON.parse(field.options_json); return Array.isArray(value) ? value.filter((item): item is string => typeof item === "string") : []; } catch { return []; } }
+  function stringAnswer(key: string) { const value = registrationAnswers[key]; return typeof value === "string" ? value : ""; }
+  function setStringAnswer(key: string, value: string) { registrationAnswers = { ...registrationAnswers, [key]: value }; }
+  function checkedAnswer(key: string) { return registrationAnswers[key] === true; }
+  function setCheckedAnswer(key: string, checked: boolean) { registrationAnswers = { ...registrationAnswers, [key]: checked }; }
+  function selectedAnswer(key: string, option: string) { const value = registrationAnswers[key]; return Array.isArray(value) && value.includes(option); }
+  function toggleSelectedAnswer(key: string, option: string, checked: boolean) { const current = registrationAnswers[key]; const values = Array.isArray(current) ? current : []; registrationAnswers = { ...registrationAnswers, [key]: checked ? [...new Set([...values, option])] : values.filter((value) => value !== option) }; }
 </script>
 
 <svelte:head><meta name="description" content="軽量なイベント名簿・受付管理" /></svelte:head>
@@ -105,7 +113,7 @@
   {:else}<p class="notice" aria-live="polite">{participantMessage}</p>{/if}
 {:else if registrationEventId}
   <header><p class="eyebrow">EVENT REGISTRATION</p><h1>tsudoi</h1><p>{publicEvent?.name ?? "申込フォーム"}</p></header>
-  {#if publicEvent}<section><h2>{publicEvent.name}</h2><p>{publicEvent.description}</p><p>{publicEvent.starts_at}</p><form onsubmit={(event) => { event.preventDefault(); void register(); }}><label>氏名<input bind:value={registrationName} required /></label><label>メールアドレス<input bind:value={registrationEmail} type="email" /></label>{#each publicFields as field}<label>{field.label}{#if field.field_type === "textarea"}<textarea bind:value={registrationAnswers[field.field_key]} required={field.required === 1}></textarea>{:else if field.field_type === "single_select"}<select bind:value={registrationAnswers[field.field_key]} required={field.required === 1}><option value="">選択してください</option>{#each options(field) as option}<option value={option}>{option}</option>{/each}</select>{:else}<input bind:value={registrationAnswers[field.field_key]} required={field.required === 1} type={field.field_type === "number" ? "number" : field.field_type === "date" ? "date" : "text"} />{/if}</label>{/each}<button>申し込む</button></form></section>{/if}
+  {#if publicEvent}<section><h2>{publicEvent.name}</h2><p>{publicEvent.description}</p><p>{publicEvent.starts_at}</p><form onsubmit={(event) => { event.preventDefault(); void register(); }}><label>氏名<input bind:value={registrationName} required /></label><label>メールアドレス<input bind:value={registrationEmail} type="email" /></label>{#each publicFields as field}{#if field.field_type === "multi_select"}<fieldset><legend>{field.label}{#if field.required === 1}（必須）{/if}</legend>{#each options(field) as option}<label class="inline"><input type="checkbox" checked={selectedAnswer(field.field_key, option)} onchange={(event) => toggleSelectedAnswer(field.field_key, option, event.currentTarget.checked)} />{option}</label>{/each}</fieldset>{:else if field.field_type === "checkbox" || field.field_type === "consent"}<label class="inline"><input type="checkbox" checked={checkedAnswer(field.field_key)} onchange={(event) => setCheckedAnswer(field.field_key, event.currentTarget.checked)} required={field.required === 1} />{field.label}</label>{:else}<label>{field.label}{#if field.field_type === "textarea"}<textarea value={stringAnswer(field.field_key)} oninput={(event) => setStringAnswer(field.field_key, event.currentTarget.value)} required={field.required === 1}></textarea>{:else if field.field_type === "single_select"}<select value={stringAnswer(field.field_key)} onchange={(event) => setStringAnswer(field.field_key, event.currentTarget.value)} required={field.required === 1}><option value="">選択してください</option>{#each options(field) as option}<option value={option}>{option}</option>{/each}</select>{:else}<input value={stringAnswer(field.field_key)} oninput={(event) => setStringAnswer(field.field_key, event.currentTarget.value)} required={field.required === 1} type={field.field_type === "number" ? "number" : field.field_type === "date" ? "date" : "text"} />{/if}</label>{/if}{/each}<button>申し込む</button></form></section>{/if}
   {#if registrationMessage}<p class="notice" aria-live="polite">{registrationMessage}</p>{/if}
 {:else}
   <header><p class="eyebrow">EVENT ROSTER</p><h1>tsudoi</h1><p>会場の名簿と受付を、静かに確実に。</p></header>
@@ -137,6 +145,7 @@
         <label>項目キー<input bind:value={fieldKey} pattern={fieldKeyPattern} placeholder="company_name" required /></label>
         <label>表示名<input bind:value={fieldLabel} placeholder="所属" required /></label>
         <label>型<select bind:value={fieldType}><option value="text">短文</option><option value="textarea">長文</option><option value="number">数値</option><option value="date">日付</option><option value="single_select">単一選択</option><option value="multi_select">複数選択</option><option value="checkbox">チェックボックス</option><option value="consent">同意</option></select></label>
+        {#if fieldType === "single_select" || fieldType === "multi_select"}<label>選択肢（改行またはカンマ区切り）<textarea bind:value={fieldOptions} required></textarea></label>{/if}
         <label class="inline"><input bind:checked={fieldRequired} type="checkbox" />必須項目</label><button>項目を追加</button>
       </form>
       {#if fieldMessage}<p class="notice" aria-live="polite">{fieldMessage}</p>{/if}
