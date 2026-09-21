@@ -7,3 +7,5 @@ Commit `bceb169` · 2026-09-21
 | Worker `src/` | 2 | 16351 |
 | UI `web/src/` | 3 | 238 |
 | Tests `test/` | 1 | 21 |
+
+- Line coverage: 100%

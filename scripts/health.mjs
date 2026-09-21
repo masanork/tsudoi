@@ -31,6 +31,10 @@ function commit() {
   catch { return "unknown"; }
 }
 function date() { return new Date().toISOString().slice(0, 10); }
+async function coverage() {
+  try { const summary = JSON.parse(await readFile(join(root, "coverage", "coverage-summary.json"), "utf8")); return summary.total?.lines?.pct ?? null; }
+  catch { return null; }
+}
 function escape(value) { return value.replaceAll("&", "&amp;").replaceAll("<", "&lt;"); }
 function chart(entries) {
   const w = 640, h = 250, l = 56, r = 38, t = 38, b = 42;
@@ -49,16 +53,19 @@ function chart(entries) {
 const worker = await count("src");
 const web = await count("web/src");
 const tests = await count("test");
-const snapshot = { generatedAt: new Date().toISOString(), commit: commit(), worker, web, tests };
+const lineCoverage = await coverage();
+const snapshot = { generatedAt: new Date().toISOString(), commit: commit(), worker, web, tests, coverage: lineCoverage };
 await mkdir(statsDir, { recursive: true });
 let history = [];
 try { history = JSON.parse(await readFile(join(statsDir, "growth-data.json"), "utf8")); } catch { /* First snapshot. */ }
-const entry = { date: date(), commit: snapshot.commit, worker: worker.lines, web: web.lines, tests: tests.lines };
+const entry = { date: date(), commit: snapshot.commit, worker: worker.lines, web: web.lines, tests: tests.lines, coverage: lineCoverage };
 history = history.filter((item) => item.date !== entry.date);
 history.push(entry);
 history.sort((a, b) => a.date.localeCompare(b.date));
 await writeFile(join(statsDir, "stats.json"), `${JSON.stringify(snapshot, null, 2)}\n`);
 await writeFile(join(statsDir, "growth-data.json"), `${JSON.stringify(history, null, 2)}\n`);
 await writeFile(join(statsDir, "codebase-growth.svg"), `${chart(history)}\n`);
-await writeFile(join(statsDir, "stats.md"), `# tsudoi codebase snapshot\n\nCommit \`${snapshot.commit}\` · ${date()}\n\n| Area | Files | Lines |\n| --- | ---: | ---: |\n| Worker \`src/\` | ${worker.files} | ${worker.lines} |\n| UI \`web/src/\` | ${web.files} | ${web.lines} |\n| Tests \`test/\` | ${tests.files} | ${tests.lines} |\n`);
+const coverageLabel = lineCoverage === null ? "Coverage unavailable" : `Line coverage: ${lineCoverage}%`;
+await writeFile(join(statsDir, "coverage-trend.svg"), `<?xml version="1.0"?><svg xmlns="http://www.w3.org/2000/svg" width="640" height="120" font-family="system-ui, sans-serif"><rect width="100%" height="100%" fill="#f8fafc"/><text x="32" y="35" font-size="13" font-weight="700" fill="#0f172a">Unit test line coverage</text><text x="32" y="82" font-size="28" font-weight="700" fill="#d97706">${escape(coverageLabel)}</text></svg>\n`);
+await writeFile(join(statsDir, "stats.md"), `# tsudoi codebase snapshot\n\nCommit \`${snapshot.commit}\` · ${date()}\n\n| Area | Files | Lines |\n| --- | ---: | ---: |\n| Worker \`src/\` | ${worker.files} | ${worker.lines} |\n| UI \`web/src/\` | ${web.files} | ${web.lines} |\n| Tests \`test/\` | ${tests.files} | ${tests.lines} |\n\n- ${coverageLabel}\n`);
 if (!process.argv.includes("--save")) process.stdout.write(`${JSON.stringify(snapshot)}\n`);

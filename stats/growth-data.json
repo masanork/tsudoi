@@ -4,6 +4,7 @@
     "commit": "bceb169",
     "worker": 16351,
     "web": 238,
-    "tests": 21
+    "tests": 21,
+    "coverage": 100
   }
 ]

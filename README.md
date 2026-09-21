@@ -9,6 +9,7 @@ tsudoi manages venue-based rosters, advance registration, walk-in check-in, QR t
 CI records Worker, UI, and test line counts on every push to `main`. Dashboard data and charts are committed in [`stats/`](stats/).
 
 ![Codebase size](stats/codebase-growth.svg)
+![Unit test coverage](stats/coverage-trend.svg)
 
 Snapshot: [`stats/stats.md`](stats/stats.md)
 

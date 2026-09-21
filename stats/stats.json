@@ -1,5 +1,5 @@
 {
-  "generatedAt": "2026-09-21T13:56:01.479Z",
+  "generatedAt": "2026-09-21T13:56:20.526Z",
   "commit": "bceb169",
   "worker": {
     "files": 2,
@@ -12,5 +12,6 @@
   "tests": {
     "files": 1,
     "lines": 21
-  }
+  },
+  "coverage": 100
 }
