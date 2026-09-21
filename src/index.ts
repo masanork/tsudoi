@@ -2,8 +2,8 @@ import { Hono } from "hono";
 import { cors } from "hono/cors";
 import type { Context, MiddlewareHandler } from "hono";
 import type { ContentfulStatusCode } from "hono/utils/http-status";
-import { generateRegistrationOptions, verifyRegistrationResponse } from "@simplewebauthn/server";
-import type { RegistrationResponseJSON } from "@simplewebauthn/server";
+import { generateAuthenticationOptions, generateRegistrationOptions, verifyAuthenticationResponse, verifyRegistrationResponse } from "@simplewebauthn/server";
+import type { AuthenticationResponseJSON, RegistrationResponseJSON } from "@simplewebauthn/server";
 
 type Role = "owner" | "admin" | "staff" | "viewer";
 type TokenAuth = { organizationId: string; scopes: string[]; tokenId: string };
@@ -222,6 +222,51 @@ app.post("/public/tickets/:ticketId/passkeys/verify", async (c) => {
   return c.json({ verified: true, prfCapable: prfCapable === 1 }, 201);
 });
 
+app.post("/public/attendees/:attendeeId/passkeys/authentication/options", async (c) => {
+  const attendeeId = c.req.param("attendeeId");
+  const credentials = await c.env.DB.prepare("SELECT credential_id, transports_json FROM passkeys WHERE attendee_id = ?").bind(attendeeId).all<{ credential_id: string; transports_json: string }>();
+  if (credentials.results.length === 0) return c.json({ error: "passkey_not_found" }, 404);
+  const options = await generateAuthenticationOptions({
+    rpID: c.env.RP_ID,
+    userVerification: "required",
+    allowCredentials: credentials.results.map((credential) => ({ id: credential.credential_id, transports: parseAuthenticatorTransports(credential.transports_json) })),
+  });
+  const challengeId = crypto.randomUUID();
+  await c.env.DB.prepare("INSERT INTO webauthn_challenges (id, attendee_id, challenge, purpose, expires_at) VALUES (?, ?, ?, 'authentication', datetime('now', '+5 minutes'))")
+    .bind(challengeId, attendeeId, options.challenge).run();
+  return c.json({ challengeId, options });
+});
+
+app.post("/public/attendees/:attendeeId/passkeys/authentication/verify", async (c) => {
+  const attendeeId = c.req.param("attendeeId");
+  const body = await jsonBody(c);
+  const challengeId = requiredString(body, "challengeId");
+  const response = body.response;
+  if (!challengeId || !isAuthenticationResponse(response)) return badRequest(c, "invalid authentication response");
+  const challenge = await c.env.DB.prepare("SELECT id, challenge FROM webauthn_challenges WHERE id = ? AND attendee_id = ? AND purpose = 'authentication' AND consumed_at IS NULL AND expires_at > CURRENT_TIMESTAMP")
+    .bind(challengeId, attendeeId).first<{ id: string; challenge: string }>();
+  const passkey = await c.env.DB.prepare("SELECT id, credential_id, public_key, counter FROM passkeys WHERE attendee_id = ? AND credential_id = ?").bind(attendeeId, response.id).first<{ id: string; credential_id: string; public_key: ArrayBuffer; counter: number }>();
+  if (!challenge || !passkey) return c.json({ error: "challenge_or_credential_not_found" }, 400);
+  const verification = await verifyAuthenticationResponse({
+    response,
+    expectedChallenge: challenge.challenge,
+    expectedOrigin: c.env.APP_ORIGIN,
+    expectedRPID: c.env.RP_ID,
+    credential: { id: passkey.credential_id, publicKey: new Uint8Array(passkey.public_key), counter: passkey.counter },
+    requireUserVerification: true,
+  });
+  if (!verification.verified) return c.json({ error: "passkey_verification_failed" }, 400);
+  const sessionToken = randomToken();
+  const sessionId = crypto.randomUUID();
+  await c.env.DB.batch([
+    c.env.DB.prepare("UPDATE webauthn_challenges SET consumed_at = CURRENT_TIMESTAMP WHERE id = ?").bind(challenge.id),
+    c.env.DB.prepare("UPDATE passkeys SET counter = ? WHERE id = ?").bind(verification.authenticationInfo.newCounter, passkey.id),
+    c.env.DB.prepare("INSERT INTO participant_sessions (id, attendee_id, token_hash, expires_at) VALUES (?, ?, ?, datetime('now', '+12 hours'))").bind(sessionId, attendeeId, await sha256(sessionToken)),
+  ]);
+  c.header("Set-Cookie", `tsudoi_participant=${sessionToken}; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age=43200`);
+  return c.json({ verified: true });
+});
+
 async function registerAttendee(c: Context<AppEnv>, event: EventRow, staffRegistration: boolean): Promise<Response> {
   const body = await jsonBody(c);
   const name = requiredString(body, "name");
@@ -299,6 +344,10 @@ function hasPrfEnabled(value: unknown) {
 function isRegistrationResponse(value: unknown): value is RegistrationResponseJSON {
   if (!isRecord(value) || typeof value.id !== "string" || typeof value.rawId !== "string" || value.type !== "public-key" || !isRecord(value.response)) return false;
   return typeof value.response.clientDataJSON === "string" && typeof value.response.attestationObject === "string";
+}
+function isAuthenticationResponse(value: unknown): value is AuthenticationResponseJSON {
+  if (!isRecord(value) || typeof value.id !== "string" || typeof value.rawId !== "string" || value.type !== "public-key" || !isRecord(value.response)) return false;
+  return typeof value.response.clientDataJSON === "string" && typeof value.response.authenticatorData === "string" && typeof value.response.signature === "string";
 }
 function safeEqual(left: string, right: string) {
   if (left.length !== right.length) return false;
