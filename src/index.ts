@@ -4,6 +4,7 @@ import type { Context, MiddlewareHandler } from "hono";
 import type { ContentfulStatusCode } from "hono/utils/http-status";
 import { generateAuthenticationOptions, generateRegistrationOptions, verifyAuthenticationResponse, verifyRegistrationResponse } from "@simplewebauthn/server";
 import type { AuthenticationResponseJSON, RegistrationResponseJSON } from "@simplewebauthn/server";
+import * as QRCode from "qrcode";
 
 type Role = "owner" | "admin" | "staff" | "viewer";
 type TokenAuth = { organizationId: string; scopes: string[]; tokenId: string };
@@ -398,12 +399,14 @@ export default {
     for (const message of batch.messages) {
       const job = message.body;
       if (!isTicketLinkJob(job)) continue;
+      const ticketQr = await QRCode.toString(job.link, { type: "svg", errorCorrectionLevel: "M", margin: 1, width: 640 });
       await env.EMAIL.send({
         to: job.to,
         from: { email: env.EMAIL_FROM, name: "tsudoi" },
         subject: `Your ticket link for ${job.eventName}`,
         text: `Open your ticket: ${job.link}\n\nThis link expires in 24 hours and can be used once.`,
         html: `<p>Open your ticket for <strong>${escapeHtml(job.eventName)}</strong>:</p><p><a href="${escapeHtml(job.link)}">Open ticket</a></p><p>This link expires in 24 hours and can be used once.</p>`,
+        attachments: [{ content: ticketQr, filename: "tsudoi-ticket-qr.svg", type: "image/svg+xml", disposition: "attachment" }],
       });
     }
   },
