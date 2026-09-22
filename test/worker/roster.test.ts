@@ -208,6 +208,12 @@ describe("Worker D1 roster flow", () => {
     const { id: eventId } = await created.json<{ id: string }>();
     const organizers = await SELF.fetch(`https://tsudoi.test/api/events/${eventId}/organizers`, { headers });
     await expect(organizers.json()).resolves.toMatchObject({ organizers: [{ user_id: userId, role: "organizer" }] });
+    const profile = await SELF.fetch("https://tsudoi.test/api/profile", { headers });
+    await expect(profile.json()).resolves.toMatchObject({ display_name: "Owner" });
+    const updatedProfile = await SELF.fetch("https://tsudoi.test/api/profile", { method: "PATCH", headers, body: JSON.stringify({ displayName: "Updated owner", email: "owner@example.test" }) });
+    expect(updatedProfile.status).toBe(200);
+    const members = await SELF.fetch(`https://tsudoi.test/api/organizations/${organizationId}/members`, { headers });
+    await expect(members.json()).resolves.toMatchObject({ members: [{ id: userId, display_name: "Updated owner" }] });
     const removal = await SELF.fetch(`https://tsudoi.test/api/events/${eventId}/organizers/${userId}`, { method: "DELETE", headers });
     expect(removal.status).toBe(409);
     const cohostId = crypto.randomUUID();
@@ -233,6 +239,8 @@ describe("Worker D1 roster flow", () => {
     const registration = await SELF.fetch(`https://tsudoi.test/public/events/${eventId}/register`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ name: "Ada", email: "ada@example.test", answers: { diet: "vegetarian" } }) });
     expect(registration.status).toBe(201);
     const { attendeeId, ticketId, ticketToken } = await registration.json<{ attendeeId: string; ticketId: string; ticketToken: string }>();
+    const announcement = await SELF.fetch(`https://tsudoi.test/api/events/${eventId}/announcements`, { method: "POST", headers: auth, body: JSON.stringify({ subject: "Welcome", message: "Please check your event details." }) });
+    await expect(announcement.json()).resolves.toEqual({ queued: 1 });
     const participantToken = await createParticipantSession(attendeeId);
     const participantHeaders = { "content-type": "application/json", cookie: `tsudoi_participant=${participantToken}` };
 

@@ -7,6 +7,11 @@
   let administratorName = "";
   let administratorEmail = "";
   let administratorAvatarUrl = "";
+  let organizationId = "";
+  let profileName = "";
+  let profileEmail = "";
+  let profileAvatarUrl = "";
+  let profileMessage = "";
   let initialSetupRequired = false;
   let workspaceReady = false;
   let isAdministrator = false;
@@ -22,6 +27,8 @@
   let registrationClosesAt = "";
   let schedulingEnabled = false;
   let initialScheduleOptions: Array<{ date: string; note: string }> = [];
+  let scheduleDraftDates: string[] = [];
+  let calendarMonth = new Date(new Date().getFullYear(), new Date().getMonth(), 1);
   let ticketLink = "";
   let checkinMessage = "";
   let selectedEventId = "";
@@ -37,6 +44,12 @@
   let fieldOptions = "";
   let fieldRequired = false;
   let fieldMessage = "";
+  let organizers: Array<{ user_id: string; role: string; display_name: string; email_normalized: string | null }> = [];
+  let organizationMembers: Array<{ id: string; display_name: string; email_normalized: string | null; role: string }> = [];
+  let selectedCohostId = "";
+  let announcementSubject = "";
+  let announcementBody = "";
+  let announcementMessage = "";
   const fieldKeyPattern = "[a-z][a-z0-9_]{0,62}";
   const registerMatch = typeof window !== "undefined" ? window.location.pathname.match(/^\/events\/([^/]+)\/register$/) : null;
   const registrationEventId = registerMatch?.[1] ?? "";
@@ -72,10 +85,26 @@
     }).join("");
     return `data:image/svg+xml,${encodeURIComponent(`<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100"><rect width="100" height="100" rx="20" fill="#e8f2ef"/><g fill="${color}">${squares}</g></svg>`)}`;
   }
+  function isoDate(date: Date) { return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, "0")}-${String(date.getDate()).padStart(2, "0")}`; }
+  function calendarDays(month: Date) {
+    const first = new Date(month.getFullYear(), month.getMonth(), 1), leading = first.getDay();
+    const days = new Date(month.getFullYear(), month.getMonth() + 1, 0).getDate();
+    return Array.from({ length: Math.ceil((leading + days) / 7) * 7 }, (_, index) => index < leading || index >= leading + days ? null : isoDate(new Date(month.getFullYear(), month.getMonth(), index - leading + 1)));
+  }
+  function monthLabel(month: Date) { return new Intl.DateTimeFormat("ja-JP", { year: "numeric", month: "long" }).format(month); }
+  function moveCalendarMonth(offset: number) { calendarMonth = new Date(calendarMonth.getFullYear(), calendarMonth.getMonth() + offset, 1); }
+  function toggleDate(dates: string[], date: string) { return dates.includes(date) ? dates.filter((item) => item !== date) : [...dates, date].sort(); }
+  function toggleInitialDate(date: string) { initialScheduleOptions = toggleDate(initialScheduleOptions.map((option) => option.date), date).map((selectedDate) => initialScheduleOptions.find((option) => option.date === selectedDate) ?? { date: selectedDate, note: "" }); }
+  function toggleScheduleDraftDate(date: string) { scheduleDraftDates = toggleDate(scheduleDraftDates, date); }
   async function selectAdministratorAvatar(file: File | undefined) {
     if (!file) return;
     if (!["image/png", "image/jpeg", "image/webp"].includes(file.type) || file.size > 200_000) { setupMessage = "画像は PNG・JPEG・WebP の200KB以下にしてください。"; return; }
     administratorAvatarUrl = await new Promise<string>((resolve, reject) => { const reader = new FileReader(); reader.onload = () => resolve(String(reader.result)); reader.onerror = () => reject(new Error("画像を読み込めませんでした。")); reader.readAsDataURL(file); });
+  }
+  async function selectProfileAvatar(file: File | undefined) {
+    if (!file) return;
+    if (!["image/png", "image/jpeg", "image/webp"].includes(file.type) || file.size > 200_000) { profileMessage = "画像は PNG・JPEG・WebP の200KB以下にしてください。"; return; }
+    profileAvatarUrl = await new Promise<string>((resolve, reject) => { const reader = new FileReader(); reader.onload = () => resolve(String(reader.result)); reader.onerror = () => reject(new Error("画像を読み込めませんでした。")); reader.readAsDataURL(file); });
   }
 
   onMount(() => {
@@ -108,11 +137,11 @@
     catch (error) { message = error instanceof Error ? error.message : "日程調整を読み込めませんでした。"; }
   }
   async function addScheduleOption() {
-    try { await api(`/events/${selectedEventId}/schedule/options`, { method: "POST", body: JSON.stringify({ date: scheduleDate, note: scheduleNote || undefined }) }); scheduleDate = ""; scheduleNote = ""; await loadSchedule(selectedEventId); }
+    try { await Promise.all(scheduleDraftDates.map((date) => api(`/events/${selectedEventId}/schedule/options`, { method: "POST", body: JSON.stringify({ date, note: scheduleNote || undefined }) }))); scheduleDraftDates = []; scheduleNote = ""; await loadSchedule(selectedEventId); }
     catch (error) { message = error instanceof Error ? error.message : "候補日時を追加できませんでした。"; }
   }
   function addInitialScheduleOption() { initialScheduleOptions = [...initialScheduleOptions, { date: "", note: "" }]; }
-  function setSchedulingEnabled(enabled: boolean) { schedulingEnabled = enabled; if (enabled && initialScheduleOptions.length === 0) initialScheduleOptions = [{ date: "", note: "" }, { date: "", note: "" }]; }
+  function setSchedulingEnabled(enabled: boolean) { schedulingEnabled = enabled; if (enabled && initialScheduleOptions.length === 0) initialScheduleOptions = []; }
   function removeInitialScheduleOption(index: number) { initialScheduleOptions = initialScheduleOptions.filter((_, optionIndex) => optionIndex !== index); }
   function updateInitialScheduleOption(index: number, key: "date" | "note", value: string) {
     initialScheduleOptions = initialScheduleOptions.map((option, optionIndex) => optionIndex === index ? { ...option, [key]: value } : option);
@@ -128,8 +157,8 @@
       const setup = await status.json();
       if (setup.initialSetupRequired) { initialSetupRequired = true; screen = "setup"; return; }
       const session = await api("/session");
-      isAdministrator = session.role === "owner" || session.role === "admin";
-      workspaceReady = true; screen = "home"; await loadEvents();
+      organizationId = session.organizationId; isAdministrator = session.role === "owner" || session.role === "admin";
+      workspaceReady = true; screen = "home"; await Promise.all([loadEvents(), loadProfile()]);
     } catch { screen = "setup"; setupMessage = "Passkey でログインしてください。"; }
   }
   async function registerInitialAdministrator() {
@@ -145,7 +174,7 @@
       const session = await response.json();
       if (!response.ok) throw new Error(session.message ?? session.error ?? "初期設定に失敗しました。");
       isAdministrator = true; workspaceReady = true; screen = "home";
-      await loadEvents(); message = "初期管理者を登録しました。まずはイベントを作成しましょう。";
+      await Promise.all([loadEvents(), loadProfile()]); message = "初期管理者を登録しました。まずはイベントを作成しましょう。";
     } catch (error) { setupMessage = error instanceof Error ? error.message : "Passkey を登録できませんでした。"; }
   }
   function openEvent(eventId: string) { selectedEventId = eventId; screen = "event"; void selectEvent(eventId); }
@@ -160,8 +189,8 @@
       const response = await fetch("/api/session/verify", { method: "POST", credentials: "same-origin", headers: { "content-type": "application/json" }, body: JSON.stringify({ challengeId: optionBody.challengeId, response: credential }) });
       const session = await response.json();
       if (!response.ok) throw new Error(session.message ?? session.error ?? "Passkey を確認できませんでした。");
-      isAdministrator = session.role === "owner" || session.role === "admin";
-      workspaceReady = true; screen = "home"; await loadEvents();
+      organizationId = session.organizationId ?? organizationId; isAdministrator = session.role === "owner" || session.role === "admin";
+      workspaceReady = true; screen = "home"; await Promise.all([loadEvents(), loadProfile()]);
     } catch (error) { setupMessage = error instanceof Error ? error.message : "Passkey でログインできませんでした。"; }
   }
   async function signOut() { await fetch("/api/session/logout", { method: "POST", credentials: "same-origin" }); workspaceReady = false; isAdministrator = false; events = []; screen = "setup"; setupMessage = "Passkey でログインしてください。"; }
@@ -199,6 +228,17 @@
     try { const roster = await api(`/events/${eventId}/roster`); rosterFields = roster.fields; rosterAttendees = roster.attendees; }
     catch (error) { message = error instanceof Error ? error.message : "名簿を読み込めませんでした。"; }
   }
+  async function loadOrganizers(eventId: string) {
+    try {
+      const [eventOrganizers, members] = await Promise.all([api(`/events/${eventId}/organizers`), organizationId ? api(`/organizations/${organizationId}/members`) : Promise.resolve({ members: [] })]);
+      organizers = eventOrganizers.organizers; organizationMembers = members.members;
+    } catch { organizers = []; organizationMembers = []; }
+  }
+  async function addCohost() { try { if (!selectedCohostId) return; await api(`/events/${selectedEventId}/organizers`, { method: "POST", body: JSON.stringify({ userId: selectedCohostId, role: "cohost" }) }); selectedCohostId = ""; await loadOrganizers(selectedEventId); } catch (error) { message = error instanceof Error ? error.message : "共同主催者を追加できませんでした。"; } }
+  async function removeOrganizer(userId: string) { try { await api(`/events/${selectedEventId}/organizers/${userId}`, { method: "DELETE" }); await loadOrganizers(selectedEventId); } catch (error) { message = error instanceof Error ? error.message : "運営メンバーを変更できませんでした。"; } }
+  async function sendAnnouncement() { try { const result = await api(`/events/${selectedEventId}/announcements`, { method: "POST", body: JSON.stringify({ subject: announcementSubject, message: announcementBody }) }); announcementSubject = ""; announcementBody = ""; announcementMessage = `${result.queued} 名へ案内を送信しました。`; } catch (error) { announcementMessage = error instanceof Error ? error.message : "案内を送信できませんでした。"; } }
+  async function loadProfile() { try { const profile = await api("/profile"); profileName = profile.display_name ?? ""; profileEmail = profile.email_normalized ?? ""; profileAvatarUrl = profile.avatar_url ?? ""; } catch { /* no active organizer session */ } }
+  async function saveProfile() { try { await api("/profile", { method: "PATCH", body: JSON.stringify({ displayName: profileName, email: profileEmail || undefined, avatarUrl: profileAvatarUrl || null }) }); profileMessage = "プロフィールを保存しました。"; } catch (error) { profileMessage = error instanceof Error ? error.message : "プロフィールを保存できませんでした。"; } }
   async function publishEvent(eventId: string) { try { await api(`/events/${eventId}/publish`, { method: "POST" }); await loadEvents(); message = "イベントを公開しました。"; } catch (error) { message = error instanceof Error ? error.message : "イベントを公開できませんでした。"; } }
   async function closeEvent(eventId: string) { try { await api(`/events/${eventId}/close`, { method: "POST" }); await loadEvents(); message = "イベントを終了しました。"; } catch (error) { message = error instanceof Error ? error.message : "イベントを終了できませんでした。"; } }
   async function removeEvent(eventId: string, canDelete: boolean) {
@@ -209,7 +249,7 @@
       screen = "home"; selectedEventId = ""; await loadEvents(); message = result.action === "deleted" ? "下書きイベントを削除しました。" : "イベントをアーカイブしました。";
     } catch (error) { message = error instanceof Error ? error.message : "イベントを処理できませんでした。"; }
   }
-  async function selectEvent(eventId: string) { await Promise.all([loadMetrics(eventId), loadRoster(eventId), loadSchedule(eventId)]); }
+  async function selectEvent(eventId: string) { await Promise.all([loadMetrics(eventId), loadRoster(eventId), loadSchedule(eventId), loadOrganizers(eventId)]); }
   async function createField() {
     try {
       const options = fieldOptions.split(/[\n,]/).map((option) => option.trim()).filter(Boolean);
@@ -330,11 +370,10 @@
       <label>イベント名<input bind:value={eventName} required /></label>
       <label class="inline"><input checked={schedulingEnabled} onchange={(event) => setSchedulingEnabled(event.currentTarget.checked)} type="checkbox" />日程を調整する</label>
       {#if schedulingEnabled}
-        <fieldset class="schedule-form"><legend>最初の候補日</legend><p class="muted">参加できる日を選びます。時刻は日程確定後に参加者へ連絡してください。</p>
-          {#each initialScheduleOptions as option, index}
-            <div class="initial-schedule-option"><label>候補日<input value={option.date} onchange={(event) => updateInitialScheduleOption(index, "date", event.currentTarget.value)} type="date" required /></label><label>メモ<input value={option.note} oninput={(event) => updateInitialScheduleOption(index, "note", event.currentTarget.value)} placeholder="会場の都合など" /></label><button type="button" class="quiet" onclick={() => removeInitialScheduleOption(index)}>削除</button></div>
-          {/each}
-          <button type="button" class="quiet" onclick={addInitialScheduleOption}>候補を追加</button>
+        <fieldset class="schedule-form"><legend>最初の候補日</legend><p class="muted">カレンダーから参加できそうな日を選んでください。時刻は日程確定後に連絡します。</p>
+          <div class="calendar-head"><button type="button" class="quiet" aria-label="前月" onclick={() => moveCalendarMonth(-1)}>‹</button><strong>{monthLabel(calendarMonth)}</strong><button type="button" class="quiet" aria-label="翌月" onclick={() => moveCalendarMonth(1)}>›</button></div>
+          <div class="calendar-grid" role="group" aria-label="候補日を選択">{#each ["日", "月", "火", "水", "木", "金", "土"] as weekday}<span class="calendar-weekday">{weekday}</span>{/each}{#each calendarDays(calendarMonth) as date}<div class="calendar-cell">{#if date}<button type="button" class:chosen={initialScheduleOptions.some((option) => option.date === date)} onclick={() => toggleInitialDate(date)}>{Number(date.slice(-2))}</button>{/if}</div>{/each}</div>
+          {#if initialScheduleOptions.length === 0}<p class="muted">候補日を2日以上選ぶと比較しやすくなります。</p>{:else}<div class="selected-dates">{#each initialScheduleOptions as option, index}<div><strong>{scheduleOptionLabel(option)}</strong><label>メモ（任意）<input value={option.note} oninput={(event) => updateInitialScheduleOption(index, "note", event.currentTarget.value)} placeholder="会場の都合など" /></label><button type="button" class="quiet" onclick={() => removeInitialScheduleOption(index)}>外す</button></div>{/each}</div>{/if}
         </fieldset>
       {:else}<label>開始日時<input bind:value={startsAt} type="datetime-local" step="900" required /></label>{/if}
       <button>作成する</button>
@@ -344,26 +383,33 @@
         {#if events.length === 0}<p>まだイベントがありません。</p>{:else}<ul>{#each events as event}<li><div><strong>{event.name}</strong><p class="muted">{event.scheduling_enabled === 1 && event.schedule_status !== "confirmed" ? "日程調整中" : `${event.starts_at} · ${event.status}`}</p></div><button onclick={() => openEvent(event.id)}>管理する</button></li>{/each}</ul>{/if}
       </section>
     {:else if screen === "admin"}
-      <section aria-labelledby="admin-menu"><h2 id="admin-menu">管理メニュー</h2><p>この端末のログイン状態を管理します。API連携用のトークン管理は、外部APIの提供時にここへ追加します。</p>
+      <section aria-labelledby="admin-menu"><h2 id="admin-menu">プロフィール</h2><p>表示名はイベントの運営メンバー表示に使われます。メールアドレスは非公開です。</p>
+        <div class="avatar-setup"><img src={profileAvatarUrl || identiconUrl(profileName)} alt="プロフィール画像のプレビュー" /><div><label>プロフィール画像（任意）<input accept="image/png,image/jpeg,image/webp" onchange={(event) => void selectProfileAvatar(event.currentTarget.files?.[0])} type="file" /></label>{#if profileAvatarUrl}<button type="button" class="quiet" onclick={() => profileAvatarUrl = ""}>画像を外す</button>{/if}</div></div>
+        <label>お名前<input bind:value={profileName} required /></label><label>メールアドレス（任意・非公開）<input bind:value={profileEmail} type="email" /></label><button onclick={saveProfile}>保存する</button>{#if profileMessage}<p class="notice">{profileMessage}</p>{/if}
+      </section>
+      <section aria-labelledby="admin-session"><h2 id="admin-session">ログイン</h2><p>この端末のログイン状態を管理します。</p>
         <button onclick={signOut}>ログアウト</button>
       </section>
     {:else}
       <section class="event-title"><h2>{events.find((event) => event.id === selectedEventId)?.name ?? "イベント管理"}</h2><p>必要な作業を選んでください。</p></section>
       {#if schedule?.enabled && schedule.status !== "confirmed"}
-        <section aria-labelledby="schedule-management"><h2 id="schedule-management">日程を調整</h2><p>候補日時を追加して、参加者に回答してもらいます。</p>
+        <section aria-labelledby="schedule-management"><h2 id="schedule-management">日程を調整</h2><p>候補日を選んで、参加者に回答してもらいます。</p>
           <p class="muted">共有用URL: <a href={`/events/${selectedEventId}/schedule`} target="_blank" rel="noreferrer">日程調整ページを開く</a></p>
-          <form onsubmit={(event) => { event.preventDefault(); void addScheduleOption(); }} class="schedule-form"><label>候補日<input bind:value={scheduleDate} type="date" required /></label><label>メモ（任意）<input bind:value={scheduleNote} placeholder="会場の都合など" /></label><button>候補を追加</button></form>
+          <form onsubmit={(event) => { event.preventDefault(); void addScheduleOption(); }} class="schedule-form"><div class="calendar-head"><button type="button" class="quiet" aria-label="前月" onclick={() => moveCalendarMonth(-1)}>‹</button><strong>{monthLabel(calendarMonth)}</strong><button type="button" class="quiet" aria-label="翌月" onclick={() => moveCalendarMonth(1)}>›</button></div><div class="calendar-grid">{#each ["日", "月", "火", "水", "木", "金", "土"] as weekday}<span class="calendar-weekday">{weekday}</span>{/each}{#each calendarDays(calendarMonth) as date}<div class="calendar-cell">{#if date}<button type="button" class:chosen={scheduleDraftDates.includes(date)} onclick={() => toggleScheduleDraftDate(date)}>{Number(date.slice(-2))}</button>{/if}</div>{/each}</div><label>メモ（任意・選んだ日すべてに付与）<input bind:value={scheduleNote} placeholder="会場の都合など" /></label><button disabled={scheduleDraftDates.length === 0}>選んだ {scheduleDraftDates.length} 日を候補に追加</button></form>
           {#if schedule.options.length === 0}<p>候補日を追加してください。</p>{:else}<div class="schedule-list">{#each schedule.options as option}<div class="schedule-option"><div><strong>{scheduleOptionLabel(option)}</strong>{#if option.note}<p class="muted">{option.note}</p>{/if}<p class="muted">○ {option.yes ?? 0}　△ {option.maybe ?? 0}　× {option.no ?? 0}</p></div>{#if isAdministrator}<button onclick={() => void confirmSchedule(option.id)}>この日に確定</button>{/if}</div>{/each}</div>{/if}
         </section>
       {:else if schedule?.enabled}
         <section class="notice"><strong>日程確定済み</strong><p>{schedule.date ? scheduleOptionLabel({ date: schedule.date }) : ""}</p><p class="muted">時刻は参加者へ別途ご連絡ください。</p></section>
       {/if}
+      {#if schedule?.enabled && schedule.status === "confirmed"}<section aria-labelledby="announcement"><h2 id="announcement">参加者へ案内</h2><p>確定した日程や、時刻・場所の連絡をメールでまとめて送れます。</p><form onsubmit={(event) => { event.preventDefault(); void sendAnnouncement(); }}><label>件名<input bind:value={announcementSubject} placeholder="集合時刻と場所のご案内" required /></label><label>本文<textarea bind:value={announcementBody} placeholder="確定日、集合時刻、場所、持ち物など" required></textarea></label><button>参加者へ送信</button></form>{#if announcementMessage}<p class="notice">{announcementMessage}</p>{/if}</section>{/if}
       <div class="management-grid"><a href="#roster">名簿を管理</a><a href="#check-in">QR 受付</a><a href="#settings">申込フォーム設定</a></div>
       {#if isAdministrator}
         {@const currentEvent = events.find((event) => event.id === selectedEventId)}
         {#if currentEvent?.status === "draft"}<button class="quiet action" onclick={() => publishEvent(selectedEventId)}>イベントを公開する</button>{:else if currentEvent?.status === "published"}<button class="quiet action" onclick={() => closeEvent(selectedEventId)}>イベントを終了する</button>{/if}
         {#if currentEvent}<button class="quiet action" onclick={() => removeEvent(selectedEventId, currentEvent.status === "draft" && (metrics?.registrations ?? 0) === 0)}>{currentEvent.status === "draft" && (metrics?.registrations ?? 0) === 0 ? "下書きを削除する" : "イベントをアーカイブする"}</button>{/if}
       {/if}
+      {#if isAdministrator}<section aria-labelledby="organizers"><h2 id="organizers">運営メンバー</h2><p>主催者と共同主催者を確認・追加できます。</p><ul>{#each organizers as organizer}<li><div><strong>{organizer.display_name || "名称未設定"}</strong><span>{organizer.role === "organizer" ? "主催者" : "共同主催者"}</span></div><button class="quiet" onclick={() => void removeOrganizer(organizer.user_id)}>外す</button></li>{/each}</ul><form onsubmit={(event) => { event.preventDefault(); void addCohost(); }}><label>共同主催者<select bind:value={selectedCohostId}><option value="">選択してください</option>{#each organizationMembers.filter((member) => !organizers.some((organizer) => organizer.user_id === member.id)) as member}<option value={member.id}>{member.display_name || member.email_normalized || member.id}</option>{/each}</select></label><button disabled={!selectedCohostId}>追加する</button></form></section>{/if}
+      {#if isAdministrator}{@const checklistEvent = events.find((event) => event.id === selectedEventId)}<section aria-labelledby="publish-check"><h2 id="publish-check">公開前チェック</h2><ul class="checklist"><li class:complete={Boolean(checklistEvent?.name)}>イベント名</li><li class:complete={!checklistEvent?.scheduling_enabled || schedule?.status === "confirmed"}>日程{checklistEvent?.scheduling_enabled ? "を確定" : "を設定"}</li><li class:complete={rosterFields.length > 0}>申込項目（任意）</li><li class:complete={checklistEvent?.status === "published"}>公開</li></ul></section>{/if}
       {#if metrics}
         <section aria-labelledby="metrics"><h2 id="metrics">受付状況</h2>
       <dl class="metrics"><div><dt>申込</dt><dd>{metrics.registrations ?? 0}</dd></div><div><dt>発券</dt><dd>{metrics.issued ?? 0}</dd></div><div><dt>取消</dt><dd>{metrics.cancelled ?? 0}</dd></div><div><dt>受付済</dt><dd>{metrics.checked_in ?? 0}</dd></div><div><dt>未受付</dt><dd>{metrics.not_checked_in ?? 0}</dd></div></dl>

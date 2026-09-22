@@ -11,7 +11,9 @@ type OrganizerAuth = { organizationId: string; scopes: string[]; actorId: string
 type AppVariables = { auth: OrganizerAuth; participantAttendeeId: string };
 type JsonRecord = Record<string, unknown>;
 type AppEnv = { Bindings: Cloudflare.Env; Variables: AppVariables };
-type NotificationJob = { type: "ticket_link"; to: string; eventName: string; link: string };
+type NotificationJob =
+  | { type: "ticket_link"; to: string; eventName: string; link: string }
+  | { type: "event_announcement"; to: string; eventName: string; subject: string; message: string };
 
 export const app = new Hono<AppEnv>();
 
@@ -35,6 +37,23 @@ app.get("/api/setup/status", async (c) => {
 app.get("/api/session", requireOrganizer, requireSession, (c) => {
   const auth = c.get("auth");
   return c.json({ organizationId: auth.organizationId, role: auth.role, displayName: "" });
+});
+
+app.get("/api/profile", requireOrganizer, requireSession, async (c) => {
+  const auth = c.get("auth");
+  const profile = await c.env.DB.prepare("SELECT display_name, email_normalized, avatar_url FROM users WHERE id = ?").bind(auth.actorId).first();
+  return c.json(profile ?? {});
+});
+
+app.patch("/api/profile", requireOrganizer, requireSession, async (c) => {
+  const body = await jsonBody(c);
+  const displayName = requiredString(body, "displayName");
+  const email = optionalString(body.email)?.toLowerCase();
+  const avatarUrl = optionalAvatarUrl(body.avatarUrl);
+  if (!displayName || displayName.length > 100 || (email && !email.includes("@")) || (body.avatarUrl !== undefined && !avatarUrl && body.avatarUrl !== null)) return badRequest(c, "invalid profile");
+  await c.env.DB.prepare("UPDATE users SET display_name = ?, email_normalized = ?, avatar_url = ? WHERE id = ?")
+    .bind(displayName, email ?? null, avatarUrl ?? null, c.get("auth").actorId).run();
+  return c.json({ updated: true });
 });
 
 app.post("/api/session/logout", requireOrganizer, requireSession, async (c) => {
@@ -140,6 +159,13 @@ app.get("/api/organizations/:organizationId/events", requireScope("roster:read")
   const rows = await c.env.DB.prepare("SELECT * FROM events WHERE organization_id = ? AND archived_at IS NULL ORDER BY starts_at DESC")
     .bind(c.req.param("organizationId")).all();
   return c.json(rows.results);
+});
+
+app.get("/api/organizations/:organizationId/members", requireScope("admin"), async (c) => {
+  if (!sameOrganization(c)) return forbidden(c);
+  const members = await c.env.DB.prepare(`SELECT u.id, u.display_name, u.email_normalized, u.avatar_url, m.role
+    FROM organization_members m JOIN users u ON u.id = m.user_id WHERE m.organization_id = ? ORDER BY u.display_name`).bind(c.req.param("organizationId")).all();
+  return c.json({ members: members.results });
 });
 
 app.get("/api/events", requireScope("roster:read"), async (c) => {
@@ -366,6 +392,18 @@ app.get("/api/events/:eventId/metrics", requireScope("roster:read"), async (c) =
     SUM(CASE WHEN t.status = 'issued' THEN 1 ELSE 0 END) AS not_checked_in
     FROM attendees a JOIN tickets t ON t.attendee_id = a.id WHERE a.event_id = ?`).bind(event.id).first();
   return c.json(metrics);
+});
+
+app.post("/api/events/:eventId/announcements", requireScope("admin"), async (c) => {
+  const event = await eventForAuth(c);
+  if (!event) return c.json({ error: "not_found" }, 404);
+  const body = await jsonBody(c);
+  const subject = requiredString(body, "subject"), message = requiredString(body, "message");
+  if (!subject || subject.length > 160 || !message || message.length > 5000) return badRequest(c, "subject and message are required");
+  const attendees = await c.env.DB.prepare("SELECT DISTINCT email_normalized FROM attendees WHERE event_id = ? AND status = 'active' AND email_normalized IS NOT NULL").bind(event.id).all<{ email_normalized: string }>();
+  await Promise.all(attendees.results.map((attendee) => c.env.NOTIFICATION_QUEUE.send({ type: "event_announcement", to: attendee.email_normalized, eventName: event.name, subject, message } satisfies NotificationJob)));
+  await audit(c.env.DB, c.get("auth"), "event.announcement_sent", "event", event.id);
+  return c.json({ queued: attendees.results.length }, 202);
 });
 
 app.post("/api/events/:eventId/attendees/:attendeeId/ticket-link", requireScope("roster:write"), async (c) => {
@@ -1063,21 +1101,22 @@ export default {
   async queue(batch: MessageBatch, env: Cloudflare.Env) {
     for (const message of batch.messages) {
       const job = message.body;
-      if (!isTicketLinkJob(job)) continue;
-      const ticketQr = await QRCode.toString(job.link, { type: "svg", errorCorrectionLevel: "M", margin: 1, width: 640 });
-      await env.EMAIL.send({
-        to: job.to,
-        from: { email: env.EMAIL_FROM, name: "tsudoi" },
-        subject: `Your ticket link for ${job.eventName}`,
-        text: `Open your ticket: ${job.link}\n\nThis link expires in 24 hours and can be used once.`,
-        html: `<p>Open your ticket for <strong>${escapeHtml(job.eventName)}</strong>:</p><p><a href="${escapeHtml(job.link)}">Open ticket</a></p><p>This link expires in 24 hours and can be used once.</p>`,
-        attachments: [{ content: ticketQr, filename: "tsudoi-ticket-qr.svg", type: "image/svg+xml", disposition: "attachment" }],
-      });
+      if (isTicketLinkJob(job)) {
+        const ticketQr = await QRCode.toString(job.link, { type: "svg", errorCorrectionLevel: "M", margin: 1, width: 640 });
+        await env.EMAIL.send({ to: job.to, from: { email: env.EMAIL_FROM, name: "tsudoi" }, subject: `Your ticket link for ${job.eventName}`,
+          text: `Open your ticket: ${job.link}\n\nThis link expires in 24 hours and can be used once.`, html: `<p>Open your ticket for <strong>${escapeHtml(job.eventName)}</strong>:</p><p><a href="${escapeHtml(job.link)}">Open ticket</a></p><p>This link expires in 24 hours and can be used once.</p>`, attachments: [{ content: ticketQr, filename: "tsudoi-ticket-qr.svg", type: "image/svg+xml", disposition: "attachment" }] });
+      } else if (isEventAnnouncementJob(job)) {
+        await env.EMAIL.send({ to: job.to, from: { email: env.EMAIL_FROM, name: "tsudoi" }, subject: `${job.eventName}: ${job.subject}`,
+          text: job.message, html: `<p>${escapeHtml(job.message).replaceAll("\n", "<br>")}</p>` });
+      }
     }
   },
 } satisfies ExportedHandler<Cloudflare.Env>;
 
 function escapeHtml(value: string) { return value.replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;").replaceAll('"', "&quot;"); }
-function isTicketLinkJob(value: unknown): value is NotificationJob {
+function isTicketLinkJob(value: unknown): value is Extract<NotificationJob, { type: "ticket_link" }> {
   return isRecord(value) && value.type === "ticket_link" && typeof value.to === "string" && typeof value.eventName === "string" && typeof value.link === "string";
+}
+function isEventAnnouncementJob(value: unknown): value is Extract<NotificationJob, { type: "event_announcement" }> {
+  return isRecord(value) && value.type === "event_announcement" && typeof value.to === "string" && typeof value.eventName === "string" && typeof value.subject === "string" && typeof value.message === "string";
 }
