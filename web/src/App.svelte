@@ -262,7 +262,7 @@
     catch { registrationMessage = "この申込フォームは利用できません。"; }
   }
   async function loadPublicSchedule() {
-    try { const response = await fetch(`/public/events/${scheduleEventId}/schedule`); const body = await response.json(); if (!response.ok) throw new Error(body.message ?? body.error); publicSchedule = body; }
+    try { const response = await fetch(`/public/events/${scheduleEventId}/schedule`); const body = await response.json(); if (!response.ok) throw new Error(body.message ?? body.error); publicSchedule = body; if (body.options[0]?.date) { const [year, month] = body.options[0].date.split("-").map(Number); calendarMonth = new Date(year, month - 1, 1); } }
     catch { scheduleResponseMessage = "この日程調整は利用できません。"; }
   }
   async function submitScheduleResponse(optionId: string, responseValue: string) {
@@ -312,6 +312,7 @@
   function selectedAnswer(key: string, option: string) { const value = registrationAnswers[key]; return Array.isArray(value) && value.includes(option); }
   function toggleSelectedAnswer(key: string, option: string, checked: boolean) { const current = registrationAnswers[key]; const values = Array.isArray(current) ? current : []; registrationAnswers = { ...registrationAnswers, [key]: checked ? [...new Set([...values, option])] : values.filter((value) => value !== option) }; }
   function answerText(value: unknown) { return Array.isArray(value) ? value.join(", ") : value === true ? "Yes" : value === false ? "No" : typeof value === "string" || typeof value === "number" ? String(value) : ""; }
+  function publicScheduleOption(date: string) { return publicSchedule?.options.find((option) => option.date === date); }
 </script>
 
 <svelte:head><meta name="description" content="軽量なイベント名簿・受付管理" /></svelte:head>
@@ -332,8 +333,10 @@
     <section><h2>{publicSchedule.event.name} の日程調整</h2><p>{publicSchedule.event.description}</p>
       {#if publicSchedule.event.schedule_status === "confirmed"}<p class="notice">日程は確定しています。</p>{:else}
         <label>お名前<input bind:value={scheduleRespondentName} required placeholder="山田太郎" /></label>
-        <p class="muted">候補ごとに参加可否を選んでください。</p>
-        <div class="schedule-list">{#each publicSchedule.options as option}<div class="schedule-option"><div><strong>{scheduleOptionLabel(option)}</strong>{#if option.note}<p class="muted">{option.note}</p>{/if}<p class="muted">○ {option.yes ?? 0}　△ {option.maybe ?? 0}　× {option.no ?? 0}</p></div><div class="response-buttons"><button class:chosen={scheduleResponses[option.id] === "yes"} disabled={!scheduleRespondentName.trim()} onclick={() => void submitScheduleResponse(option.id, "yes")}>○ 参加</button><button class:chosen={scheduleResponses[option.id] === "maybe"} disabled={!scheduleRespondentName.trim()} onclick={() => void submitScheduleResponse(option.id, "maybe")}>△ 未定</button><button class:chosen={scheduleResponses[option.id] === "no"} disabled={!scheduleRespondentName.trim()} onclick={() => void submitScheduleResponse(option.id, "no")}>× 不参加</button></div></div>{/each}</div>
+        <p class="muted">参加できる候補日をクリックしてください。もう一度クリックすると回答を外せます。</p>
+        <div class="calendar-head"><button type="button" class="quiet" aria-label="前月" onclick={() => moveCalendarMonth(-1)}>‹</button><strong>{monthLabel(calendarMonth)}</strong><button type="button" class="quiet" aria-label="翌月" onclick={() => moveCalendarMonth(1)}>›</button></div>
+        <div class="calendar-grid public-calendar">{#each ["日", "月", "火", "水", "木", "金", "土"] as weekday}<span class="calendar-weekday">{weekday}</span>{/each}{#each calendarDays(calendarMonth) as date}<div class="calendar-cell">{#if date}{@const option = publicScheduleOption(date)}{#if option}<button type="button" class:chosen={scheduleResponses[option.id] === "yes"} disabled={!scheduleRespondentName.trim()} onclick={() => void submitScheduleResponse(option.id, scheduleResponses[option.id] === "yes" ? "no" : "yes")}>{Number(date.slice(-2))}<small>{scheduleResponses[option.id] === "yes" ? "参加" : "候補日"}</small></button>{/if}{/if}</div>{/each}</div>
+        <div class="schedule-list">{#each publicSchedule.options as option}<div class="schedule-option"><div><strong>{scheduleOptionLabel(option)}</strong>{#if option.note}<p class="muted">{option.note}</p>{/if}<p class="muted">○ {option.yes ?? 0}　△ {option.maybe ?? 0}　× {option.no ?? 0}</p></div><div class="response-buttons"><button class:chosen={scheduleResponses[option.id] === "maybe"} disabled={!scheduleRespondentName.trim()} onclick={() => void submitScheduleResponse(option.id, "maybe")}>△ 未定</button><button class:chosen={scheduleResponses[option.id] === "no"} disabled={!scheduleRespondentName.trim()} onclick={() => void submitScheduleResponse(option.id, "no")}>× 不参加</button></div></div>{/each}</div>
         <section class="schedule-form"><h3>AI に日程調整を任せる</h3><p class="muted">カレンダー連携済みのAIに、このイベントの候補確認とあなた自身の可否回答だけを許可します。候補が増えた場合もAIは再確認できます。</p><button disabled={!scheduleRespondentName.trim()} onclick={() => void createAgentConnection()}>AI連携用トークンを発行</button><button class="quiet" disabled={!scheduleRespondentName.trim()} onclick={() => void loadAgentConnections()}>接続を確認</button>{#if agentConnection}<p class="notice">このトークンは一度だけ表示されます。AIのMCP接続設定に登録してください。</p><label>MCP URL<input readonly value={agentConnection.mcpUrl} /></label><label>アクセストークン<input readonly value={agentConnection.token} /></label><p class="muted">有効期限: {agentConnection.expiresInDays} 日。日程確定後は可否の変更が自動で停止します。</p>{/if}{#if agentConnections.length > 0}<h4>AI連携</h4><ul>{#each agentConnections as connection}<li><span>{connection.revoked_at ? "解除済み" : `有効（${connection.expires_at}まで）`}</span>{#if !connection.revoked_at}<button class="quiet" onclick={() => void revokeAgentConnection(connection.id)}>解除</button>{/if}</li>{/each}</ul>{/if}</section>
       {/if}
     </section>
