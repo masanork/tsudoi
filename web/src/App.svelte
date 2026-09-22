@@ -6,6 +6,7 @@
   type ParticipantTicket = { id: string; status: string; event_name: string; starts_at: string; ends_at: string; timezone: string; venue_name: string | null; cancellation_closes_at: string | null };
   let administratorName = "";
   let administratorEmail = "";
+  let administratorAvatarUrl = "";
   let initialSetupRequired = false;
   let workspaceReady = false;
   let isAdministrator = false;
@@ -58,6 +59,25 @@
   let participantTicket: ParticipantTicket | null = null;
   let participantMessage = "チケットを確認しています。";
   const ticketPage = typeof window !== "undefined" && window.location.pathname === "/ticket";
+
+  function identiconUrl(name: string) {
+    const seed = name.trim() || "tsudoi";
+    let hash = 2166136261;
+    for (const character of seed) hash = Math.imul(hash ^ character.charCodeAt(0), 16777619);
+    const color = `hsl(${Math.abs(hash) % 360} 55% 42%)`;
+    const cells = Array.from({ length: 15 }, (_, index) => ((hash >>> (index % 24)) & 1) === 1);
+    const squares = cells.flatMap((filled, index) => {
+      if (!filled) return [];
+      const row = Math.floor(index / 3), column = index % 3;
+      return [`<rect x="${column * 20 + 10}" y="${row * 20 + 10}" width="16" height="16" rx="3"/>`, `<rect x="${(4 - column) * 20 + 10}" y="${row * 20 + 10}" width="16" height="16" rx="3"/>`];
+    }).join("");
+    return `data:image/svg+xml,${encodeURIComponent(`<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100"><rect width="100" height="100" rx="20" fill="#e8f2ef"/><g fill="${color}">${squares}</g></svg>`)}`;
+  }
+  async function selectAdministratorAvatar(file: File | undefined) {
+    if (!file) return;
+    if (!["image/png", "image/jpeg", "image/webp"].includes(file.type) || file.size > 200_000) { setupMessage = "画像は PNG・JPEG・WebP の200KB以下にしてください。"; return; }
+    administratorAvatarUrl = await new Promise<string>((resolve, reject) => { const reader = new FileReader(); reader.onload = () => resolve(String(reader.result)); reader.onerror = () => reject(new Error("画像を読み込めませんでした。")); reader.readAsDataURL(file); });
+  }
 
   onMount(() => {
     if (ticketPage) void loadParticipantTicket();
@@ -118,7 +138,7 @@
       if (!administratorName.trim()) throw new Error("お名前を入力してください。");
       if (!window.PublicKeyCredential) throw new Error("この端末は Passkey に対応していません。");
       setupMessage = "Passkey を登録しています…";
-      const optionsResponse = await fetch("/api/setup/initial-admin/options", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ displayName: administratorName.trim(), email: administratorEmail.trim() || undefined }) });
+      const optionsResponse = await fetch("/api/setup/initial-admin/options", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ displayName: administratorName.trim(), email: administratorEmail.trim() || undefined, avatarUrl: administratorAvatarUrl || undefined }) });
       const optionBody = await optionsResponse.json();
       if (!optionsResponse.ok) throw new Error(optionBody.message ?? optionBody.error ?? "初期設定に失敗しました。");
       const credential = await startRegistration({ optionsJSON: optionBody.options });
@@ -292,6 +312,7 @@
     <section class="focus-card" aria-labelledby="initial-admin"><h2 id="initial-admin">{initialSetupRequired ? "初期管理者の Passkey を登録" : "Passkey でログイン"}</h2>
       {#if initialSetupRequired}<p>この端末の Passkey で管理を始めます。イベントごとに主催者・共同主催者を設定できます。</p>
         <label>お名前<input bind:value={administratorName} autocomplete="name" placeholder="例: 山田 太郎" required /></label>
+        <div class="avatar-setup"><img src={administratorAvatarUrl || identiconUrl(administratorName)} alt="プロフィール画像のプレビュー" /><div><label>プロフィール画像（任意）<input accept="image/png,image/jpeg,image/webp" onchange={(event) => void selectAdministratorAvatar(event.currentTarget.files?.[0])} type="file" /></label><p class="muted">未設定時は名前から作る Identicon を使います。PNG・JPEG・WebP、200KB以下。</p>{#if administratorAvatarUrl}<button type="button" class="quiet" onclick={() => administratorAvatarUrl = ""}>画像を外す</button>{/if}</div></div>
         <label>メールアドレス（任意・非公開）<input bind:value={administratorEmail} autocomplete="email" type="email" placeholder="通知・復旧用" /></label>
         <button onclick={registerInitialAdministrator}>Passkey を登録して始める</button>
       {:else}<p>登録済みの Passkey を使って管理画面を開きます。</p><button onclick={signIn}>Passkey でログイン</button>{/if}

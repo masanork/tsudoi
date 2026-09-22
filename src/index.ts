@@ -86,7 +86,8 @@ app.post("/api/setup/initial-admin/options", async (c) => {
   const organizationName = optionalString(body.organizationName)?.trim() || "既定ワークスペース";
   const displayName = requiredString(body, "displayName");
   const email = optionalString(body.email)?.trim().toLowerCase();
-  if (!displayName || displayName.length > 100 || (email && !email.includes("@"))) return badRequest(c, "displayName is required");
+  const avatarUrl = optionalAvatarUrl(body.avatarUrl);
+  if (!displayName || displayName.length > 100 || (email && !email.includes("@")) || (body.avatarUrl !== undefined && !avatarUrl)) return badRequest(c, "displayName is required");
   if (await c.env.DB.prepare("SELECT id FROM organizations LIMIT 1").first()) return c.json({ error: "initial_setup_complete" }, 409);
   const options = await generateRegistrationOptions({
     rpName: c.env.RP_NAME, rpID: c.env.RP_ID, userID: crypto.getRandomValues(new Uint8Array(16)),
@@ -94,8 +95,8 @@ app.post("/api/setup/initial-admin/options", async (c) => {
     authenticatorSelection: { residentKey: "required", userVerification: "required" },
   });
   const challengeId = crypto.randomUUID();
-  await c.env.DB.prepare("INSERT INTO initial_admin_challenges (id, organization_name, display_name, email_normalized, challenge, expires_at) VALUES (?, ?, ?, ?, ?, datetime('now', '+5 minutes'))")
-    .bind(challengeId, organizationName, displayName, email ?? null, options.challenge).run();
+  await c.env.DB.prepare("INSERT INTO initial_admin_challenges (id, organization_name, display_name, email_normalized, avatar_url, challenge, expires_at) VALUES (?, ?, ?, ?, ?, ?, datetime('now', '+5 minutes'))")
+    .bind(challengeId, organizationName, displayName, email ?? null, avatarUrl ?? null, options.challenge).run();
   return c.json({ challengeId, options });
 });
 
@@ -104,8 +105,8 @@ app.post("/api/setup/initial-admin/verify", async (c) => {
   const challengeId = requiredString(body, "challengeId");
   const response = body.response;
   if (!challengeId || !isRegistrationResponse(response)) return badRequest(c, "invalid registration response");
-  const challenge = await c.env.DB.prepare("SELECT id, organization_name, display_name, email_normalized, challenge FROM initial_admin_challenges WHERE id = ? AND consumed_at IS NULL AND expires_at > CURRENT_TIMESTAMP")
-    .bind(challengeId).first<{ id: string; organization_name: string; display_name: string; email_normalized: string | null; challenge: string }>();
+  const challenge = await c.env.DB.prepare("SELECT id, organization_name, display_name, email_normalized, avatar_url, challenge FROM initial_admin_challenges WHERE id = ? AND consumed_at IS NULL AND expires_at > CURRENT_TIMESTAMP")
+    .bind(challengeId).first<{ id: string; organization_name: string; display_name: string; email_normalized: string | null; avatar_url: string | null; challenge: string }>();
   if (!challenge || await c.env.DB.prepare("SELECT id FROM organizations LIMIT 1").first()) return c.json({ error: "initial_setup_unavailable" }, 409);
   const verification = await verifyRegistrationResponse({ response, expectedChallenge: challenge.challenge, expectedOrigin: c.env.APP_ORIGIN, expectedRPID: c.env.RP_ID, requireUserVerification: true });
   if (!verification.verified || !verification.registrationInfo) return c.json({ error: "passkey_verification_failed" }, 400);
@@ -115,7 +116,7 @@ app.post("/api/setup/initial-admin/verify", async (c) => {
   await c.env.DB.batch([
     c.env.DB.prepare("UPDATE initial_admin_challenges SET consumed_at = CURRENT_TIMESTAMP WHERE id = ?").bind(challenge.id),
     c.env.DB.prepare("INSERT INTO organizations (id, name) VALUES (?, ?)").bind(organizationId, challenge.organization_name),
-    c.env.DB.prepare("INSERT INTO users (id, display_name, email_normalized) VALUES (?, ?, ?)").bind(userId, challenge.display_name, challenge.email_normalized),
+    c.env.DB.prepare("INSERT INTO users (id, display_name, email_normalized, avatar_url) VALUES (?, ?, ?, ?)").bind(userId, challenge.display_name, challenge.email_normalized, challenge.avatar_url),
     c.env.DB.prepare("INSERT INTO organization_members (organization_id, user_id, role) VALUES (?, ?, 'owner')").bind(organizationId, userId),
     c.env.DB.prepare("INSERT INTO passkeys (id, user_id, credential_id, public_key, counter, transports_json, prf_capable) VALUES (?, ?, ?, ?, ?, ?, ?)").bind(crypto.randomUUID(), userId, credential.id, credential.publicKey, credential.counter, JSON.stringify(response.response.transports ?? []), hasPrfEnabled(response.clientExtensionResults) ? 1 : 0),
     c.env.DB.prepare("INSERT INTO organizer_sessions (id, user_id, organization_id, token_hash, expires_at) VALUES (?, ?, ?, ?, datetime('now', '+12 hours'))")
@@ -1021,6 +1022,11 @@ function isValidFieldAnswer(field: FieldRow, answer: unknown): boolean {
 }
 function requiredString(body: JsonRecord, key: string) { const value = body[key]; return typeof value === "string" && value.trim() ? value.trim() : undefined; }
 function optionalString(value: unknown) { return typeof value === "string" && value.trim() ? value.trim() : undefined; }
+function optionalAvatarUrl(value: unknown) {
+  const url = optionalString(value);
+  if (!url || url.length > 280_000) return undefined;
+  return /^data:image\/(?:png|jpeg|webp);base64,[A-Za-z0-9+/=]+$/.test(url) ? url : undefined;
+}
 function optionalInteger(value: unknown) { return typeof value === "number" && Number.isInteger(value) && value >= 0 ? value : null; }
 function randomToken() { const bytes = new Uint8Array(32); crypto.getRandomValues(bytes); return btoa(String.fromCharCode(...bytes)).replaceAll("+", "-").replaceAll("/", "_").replaceAll("=", ""); }
 async function sha256(value: string) { const bytes = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(value)); return [...new Uint8Array(bytes)].map((byte) => byte.toString(16).padStart(2, "0")).join(""); }
