@@ -12,7 +12,7 @@
     "directory": "./web/dist",
     "binding": "ASSETS",
     "not_found_handling": "single-page-application",
-    "run_worker_first": ["/api/*", "/public/*"]
+    "run_worker_first": ["/api/*", "/public/*", "/mcp"]
   },
   "d1_databases": [{
     "binding": "DB",
@@ -40,7 +40,7 @@
         "directory": "./web/dist",
         "binding": "ASSETS",
         "not_found_handling": "single-page-application",
-        "run_worker_first": ["/api/*", "/public/*"]
+        "run_worker_first": ["/api/*", "/public/*", "/mcp"]
       },
       "d1_databases": [{ "binding": "DB", "database_name": "tsudoi-staging-db", "migrations_dir": "./migrations" }],
       "r2_buckets": [{ "binding": "ENCRYPTED_ATTACHMENTS", "bucket_name": "tsudoi-staging-encrypted-attachments" }],
@@ -65,7 +65,7 @@
         "directory": "./web/dist",
         "binding": "ASSETS",
         "not_found_handling": "single-page-application",
-        "run_worker_first": ["/api/*", "/public/*"]
+        "run_worker_first": ["/api/*", "/public/*", "/mcp"]
       },
       "d1_databases": [{ "binding": "DB", "database_name": "tsudoi-production-db", "migrations_dir": "./migrations" }],
       "r2_buckets": [{ "binding": "ENCRYPTED_ATTACHMENTS", "bucket_name": "tsudoi-production-encrypted-attachments" }],

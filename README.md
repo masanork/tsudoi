@@ -17,7 +17,7 @@ Snapshot: [`stats/stats.md`](stats/stats.md)
 
 ## Current implementation
 
-- Multi-tenant organizations, events, venues, and role-scoped API tokens
+- Multi-tenant organizations, events, venues, Passkey organizer sessions, and role-scoped API tokens for future integrations
 - Configurable registration fields and roster data model
 - Individual ticket tokens and atomic duplicate-safe check-in
 - Attendee Passkey registration and session issuance

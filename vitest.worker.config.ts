@@ -9,5 +9,6 @@ export default defineConfig({
   test: {
     include: ["test/worker/**/*.test.ts"],
     setupFiles: ["test/worker/setup.ts"],
+    coverage: { provider: "istanbul", reporter: ["text", "json-summary", "lcov"], include: ["src/index.ts"] },
   },
 });

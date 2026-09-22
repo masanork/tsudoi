@@ -1,18 +1,18 @@
 <script lang="ts">
   import { onMount } from "svelte";
-  import { startRegistration } from "@simplewebauthn/browser";
+  import { startAuthentication, startRegistration } from "@simplewebauthn/browser";
   import QRCode from "qrcode";
 
   type ParticipantTicket = { id: string; status: string; event_name: string; starts_at: string; ends_at: string; timezone: string; venue_name: string | null; cancellation_closes_at: string | null };
-  let token = "";
-  let organizationId = "";
-  let organizationName = "";
+  let administratorName = "";
+  let administratorEmail = "";
+  let initialSetupRequired = false;
   let workspaceReady = false;
   let isAdministrator = false;
   let screen: "setup" | "home" | "event" | "admin" = "setup";
   let setupMessage = "この tsudoi を使い始めるには、初期管理者の Passkey を登録してください。";
   let events: Array<{ id: string; name: string; starts_at: string; ends_at: string; status: string; scheduling_enabled?: number; schedule_status?: string }> = [];
-  let message = "API トークンと組織 ID を入力してください。";
+  let message = "イベントを読み込んでいます。";
   let eventName = "";
   let startsAt = "";
   let endsAt = "";
@@ -20,12 +20,13 @@
   let registrationOpensAt = "";
   let registrationClosesAt = "";
   let schedulingEnabled = false;
+  let scheduleDurationMinutes = "";
+  let initialScheduleOptions: Array<{ startsAt: string; endsAt: string; note: string }> = [];
   let ticketLink = "";
   let checkinMessage = "";
   let selectedEventId = "";
   let schedule: { enabled: boolean; status: string; startsAt: string | null; endsAt: string | null; options: Array<{ id: string; starts_at: string; ends_at: string; note: string; yes: number; maybe: number; no: number }> } | null = null;
   let scheduleStartsAt = "";
-  let scheduleEndsAt = "";
   let scheduleNote = "";
   let metrics: { registrations: number; issued: number; cancelled: number; checked_in: number; not_checked_in: number } | null = null;
   let rosterFields: Array<{ field_key: string; label: string }> = [];
@@ -49,6 +50,8 @@
   let scheduleRespondentId = "";
   let scheduleResponseMessage = "";
   let scheduleResponses: Record<string, string> = {};
+  let agentConnection: { mcpUrl: string; token: string; expiresInDays: number } | null = null;
+  let agentConnections: Array<{ id: string; scope: string; expires_at: string; revoked_at: string | null; created_at: string }> = [];
   let issuedTicket: { id: string; token: string } | null = null;
   let ticketQr = "";
   let passkeyMessage = "";
@@ -61,31 +64,24 @@
     else if (registrationEventId) void loadRegistration();
     else if (scheduleEventId) { scheduleRespondentId = localStorage.getItem(`tsudoi-schedule-${scheduleEventId}`) ?? crypto.randomUUID(); localStorage.setItem(`tsudoi-schedule-${scheduleEventId}`, scheduleRespondentId); void loadPublicSchedule(); }
     else {
-      const saved = localStorage.getItem("tsudoi-workspace");
-      if (saved) {
-        try {
-          const workspace = JSON.parse(saved) as { token: string; organizationId: string; isAdministrator: boolean };
-          token = workspace.token; organizationId = workspace.organizationId; isAdministrator = workspace.isAdministrator;
-          workspaceReady = true; screen = "home"; void loadEvents();
-        } catch { localStorage.removeItem("tsudoi-workspace"); }
-      }
+      void initializeOrganizer();
     }
   });
 
   async function api(path: string, init: RequestInit = {}) {
-    const response = await fetch(`/api${path}`, { ...init, headers: { "content-type": "application/json", authorization: `Bearer ${token}`, ...init.headers } });
+    const response = await fetch(`/api${path}`, { ...init, credentials: "same-origin", headers: { "content-type": "application/json", ...init.headers } });
     const body = await response.json();
     if (!response.ok) throw new Error(body.message ?? body.error ?? "リクエストに失敗しました");
     return body;
   }
   async function loadEvents() {
-    try { events = await api(`/organizations/${organizationId}/events`); message = `${events.length} 件のイベントを読み込みました。`; }
+    try { events = await api("/events"); message = `${events.length} 件のイベントを読み込みました。`; }
     catch (error) { message = error instanceof Error ? error.message : "読み込みに失敗しました。"; }
   }
   async function createEvent() {
     try {
-      await api(`/organizations/${organizationId}/events`, { method: "POST", body: JSON.stringify({ name: eventName, startsAt: schedulingEnabled ? undefined : startsAt, endsAt: schedulingEnabled ? undefined : endsAt, schedulingEnabled, registrationMode: "hybrid", capacity: eventCapacity ? Number(eventCapacity) : undefined, registrationOpensAt: registrationOpensAt || undefined, registrationClosesAt: registrationClosesAt || undefined }) });
-      eventName = ""; eventCapacity = ""; registrationOpensAt = ""; registrationClosesAt = ""; schedulingEnabled = false; await loadEvents(); message = "イベントを作成しました。";
+      await api("/events", { method: "POST", body: JSON.stringify({ name: eventName, startsAt: schedulingEnabled ? undefined : startsAt, endsAt: schedulingEnabled ? undefined : endsAt, schedulingEnabled, scheduleDurationMinutes: schedulingEnabled && scheduleDurationMinutes ? Number(scheduleDurationMinutes) : undefined, initialScheduleOptions: schedulingEnabled ? initialScheduleOptions : undefined, registrationMode: "hybrid", capacity: eventCapacity ? Number(eventCapacity) : undefined, registrationOpensAt: registrationOpensAt || undefined, registrationClosesAt: registrationClosesAt || undefined }) });
+      eventName = ""; eventCapacity = ""; registrationOpensAt = ""; registrationClosesAt = ""; scheduleDurationMinutes = ""; schedulingEnabled = false; initialScheduleOptions = []; await loadEvents(); message = "イベントを作成しました。";
     } catch (error) { message = error instanceof Error ? error.message : "作成に失敗しました。"; }
   }
   async function loadSchedule(eventId: string) {
@@ -93,34 +89,63 @@
     catch (error) { message = error instanceof Error ? error.message : "日程調整を読み込めませんでした。"; }
   }
   async function addScheduleOption() {
-    try { await api(`/events/${selectedEventId}/schedule/options`, { method: "POST", body: JSON.stringify({ startsAt: scheduleStartsAt, endsAt: scheduleEndsAt, note: scheduleNote || undefined }) }); scheduleStartsAt = ""; scheduleEndsAt = ""; scheduleNote = ""; await loadSchedule(selectedEventId); }
+    try { await api(`/events/${selectedEventId}/schedule/options`, { method: "POST", body: JSON.stringify({ startsAt: scheduleStartsAt, note: scheduleNote || undefined }) }); scheduleStartsAt = ""; scheduleNote = ""; await loadSchedule(selectedEventId); }
     catch (error) { message = error instanceof Error ? error.message : "候補日時を追加できませんでした。"; }
   }
+  function addInitialScheduleOption() { initialScheduleOptions = [...initialScheduleOptions, { startsAt: "", endsAt: "", note: "" }]; }
+  function setSchedulingEnabled(enabled: boolean) { schedulingEnabled = enabled; if (enabled && initialScheduleOptions.length === 0) initialScheduleOptions = [{ startsAt: "", endsAt: "", note: "" }, { startsAt: "", endsAt: "", note: "" }]; }
+  function removeInitialScheduleOption(index: number) { initialScheduleOptions = initialScheduleOptions.filter((_, optionIndex) => optionIndex !== index); }
+  function updateInitialScheduleOption(index: number, key: "startsAt" | "note", value: string) {
+    initialScheduleOptions = initialScheduleOptions.map((option, optionIndex) => optionIndex === index ? { ...option, [key]: value } : option);
+  }
+  function scheduleOptionLabel(option: { starts_at: string; ends_at: string }) { return option.ends_at && option.ends_at !== option.starts_at ? `${option.starts_at} – ${option.ends_at}` : option.starts_at; }
   async function confirmSchedule(optionId: string) {
     try { await api(`/events/${selectedEventId}/schedule/confirm`, { method: "POST", body: JSON.stringify({ optionId }) }); await loadEvents(); await loadSchedule(selectedEventId); message = "日程を確定しました。"; }
     catch (error) { message = error instanceof Error ? error.message : "日程を確定できませんでした。"; }
   }
-  function saveWorkspace() {
-    localStorage.setItem("tsudoi-workspace", JSON.stringify({ token, organizationId, isAdministrator }));
+  async function initializeOrganizer() {
+    try {
+      const status = await fetch("/api/setup/status", { credentials: "same-origin" });
+      const setup = await status.json();
+      if (setup.initialSetupRequired) { initialSetupRequired = true; screen = "setup"; return; }
+      const session = await api("/session");
+      isAdministrator = session.role === "owner" || session.role === "admin";
+      workspaceReady = true; screen = "home"; await loadEvents();
+    } catch { screen = "setup"; setupMessage = "Passkey でログインしてください。"; }
   }
   async function registerInitialAdministrator() {
     try {
-      if (!organizationName.trim()) throw new Error("組織名を入力してください。");
+      if (!administratorName.trim()) throw new Error("お名前を入力してください。");
       if (!window.PublicKeyCredential) throw new Error("この端末は Passkey に対応していません。");
       setupMessage = "Passkey を登録しています…";
-      const optionsResponse = await fetch("/api/setup/initial-admin/options", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ organizationName: organizationName.trim() }) });
+      const optionsResponse = await fetch("/api/setup/initial-admin/options", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ displayName: administratorName.trim(), email: administratorEmail.trim() || undefined }) });
       const optionBody = await optionsResponse.json();
       if (!optionsResponse.ok) throw new Error(optionBody.message ?? optionBody.error ?? "初期設定に失敗しました。");
       const credential = await startRegistration({ optionsJSON: optionBody.options });
       const response = await fetch("/api/setup/initial-admin/verify", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ challengeId: optionBody.challengeId, response: credential }) });
-      const workspace = await response.json();
-      if (!response.ok) throw new Error(workspace.message ?? workspace.error ?? "初期設定に失敗しました。");
-      token = workspace.token; organizationId = workspace.organizationId; isAdministrator = true; workspaceReady = true; screen = "home"; saveWorkspace();
+      const session = await response.json();
+      if (!response.ok) throw new Error(session.message ?? session.error ?? "初期設定に失敗しました。");
+      isAdministrator = true; workspaceReady = true; screen = "home";
       await loadEvents(); message = "初期管理者を登録しました。まずはイベントを作成しましょう。";
     } catch (error) { setupMessage = error instanceof Error ? error.message : "Passkey を登録できませんでした。"; }
   }
   function openEvent(eventId: string) { selectedEventId = eventId; screen = "event"; void selectEvent(eventId); }
-  function reconnectWorkspace() { saveWorkspace(); screen = "home"; void loadEvents(); }
+  async function signIn() {
+    try {
+      if (!window.PublicKeyCredential) throw new Error("この端末は Passkey に対応していません。");
+      setupMessage = "Passkey を確認しています…";
+      const optionsResponse = await fetch("/api/session/options", { method: "POST", credentials: "same-origin" });
+      const optionBody = await optionsResponse.json();
+      if (!optionsResponse.ok) throw new Error(optionBody.message ?? optionBody.error ?? "ログインを開始できません。");
+      const credential = await startAuthentication({ optionsJSON: optionBody.options });
+      const response = await fetch("/api/session/verify", { method: "POST", credentials: "same-origin", headers: { "content-type": "application/json" }, body: JSON.stringify({ challengeId: optionBody.challengeId, response: credential }) });
+      const session = await response.json();
+      if (!response.ok) throw new Error(session.message ?? session.error ?? "Passkey を確認できませんでした。");
+      isAdministrator = session.role === "owner" || session.role === "admin";
+      workspaceReady = true; screen = "home"; await loadEvents();
+    } catch (error) { setupMessage = error instanceof Error ? error.message : "Passkey でログインできませんでした。"; }
+  }
+  async function signOut() { await fetch("/api/session/logout", { method: "POST", credentials: "same-origin" }); workspaceReady = false; isAdministrator = false; events = []; screen = "setup"; setupMessage = "Passkey でログインしてください。"; }
   async function loadParticipantTicket() {
     try {
       const response = await fetch("/api/participant/ticket", { credentials: "same-origin" });
@@ -157,6 +182,14 @@
   }
   async function publishEvent(eventId: string) { try { await api(`/events/${eventId}/publish`, { method: "POST" }); await loadEvents(); message = "イベントを公開しました。"; } catch (error) { message = error instanceof Error ? error.message : "イベントを公開できませんでした。"; } }
   async function closeEvent(eventId: string) { try { await api(`/events/${eventId}/close`, { method: "POST" }); await loadEvents(); message = "イベントを終了しました。"; } catch (error) { message = error instanceof Error ? error.message : "イベントを終了できませんでした。"; } }
+  async function removeEvent(eventId: string, canDelete: boolean) {
+    const action = canDelete ? "この下書きイベントを完全に削除します。日程候補やフォーム設定も元に戻せません。" : "このイベントをアーカイブします。申込・受付を停止し、通常の一覧から非表示にします。";
+    if (!window.confirm(action)) return;
+    try {
+      const result = await api(`/events/${eventId}`, { method: "DELETE" });
+      screen = "home"; selectedEventId = ""; await loadEvents(); message = result.action === "deleted" ? "下書きイベントを削除しました。" : "イベントをアーカイブしました。";
+    } catch (error) { message = error instanceof Error ? error.message : "イベントを処理できませんでした。"; }
+  }
   async function selectEvent(eventId: string) { await Promise.all([loadMetrics(eventId), loadRoster(eventId), loadSchedule(eventId)]); }
   async function createField() {
     try {
@@ -178,6 +211,20 @@
       const response = await fetch(`/public/events/${scheduleEventId}/schedule/responses`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ optionId, response: responseValue, respondentId: scheduleRespondentId, respondentName: scheduleRespondentName }) });
       const body = await response.json(); if (!response.ok) throw new Error(body.message ?? body.error); scheduleResponses = { ...scheduleResponses, [optionId]: responseValue }; scheduleResponseMessage = "回答を保存しました。"; await loadPublicSchedule();
     } catch (error) { scheduleResponseMessage = error instanceof Error ? error.message : "回答を保存できませんでした。"; }
+  }
+  async function createAgentConnection() {
+    try {
+      const response = await fetch(`/public/events/${scheduleEventId}/schedule/agent-connections`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ respondentId: scheduleRespondentId, respondentName: scheduleRespondentName }) });
+      const body = await response.json(); if (!response.ok) throw new Error(body.message ?? body.error); agentConnection = body; await loadAgentConnections(); scheduleResponseMessage = "AI 連携用トークンを発行しました。";
+    } catch (error) { scheduleResponseMessage = error instanceof Error ? error.message : "AI 連携を開始できませんでした。"; }
+  }
+  async function loadAgentConnections() {
+    try { const response = await fetch(`/public/events/${scheduleEventId}/schedule/agent-connections?respondentId=${encodeURIComponent(scheduleRespondentId)}`); const body = await response.json(); if (!response.ok) throw new Error(body.message ?? body.error); agentConnections = body.connections; }
+    catch (error) { scheduleResponseMessage = error instanceof Error ? error.message : "AI 連携の状態を取得できませんでした。"; }
+  }
+  async function revokeAgentConnection(connectionId: string) {
+    try { const response = await fetch(`/public/events/${scheduleEventId}/schedule/agent-connections/${connectionId}`, { method: "DELETE", headers: { "content-type": "application/json" }, body: JSON.stringify({ respondentId: scheduleRespondentId }) }); const body = await response.json(); if (!response.ok) throw new Error(body.message ?? body.error); await loadAgentConnections(); scheduleResponseMessage = "AI 連携を解除しました。"; }
+    catch (error) { scheduleResponseMessage = error instanceof Error ? error.message : "AI 連携を解除できませんでした。"; }
   }
   async function register() {
     try { const response = await fetch(`/public/events/${registrationEventId}/register`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ name: registrationName, email: registrationEmail || undefined, answers: registrationAnswers }) }); const body = await response.json(); if (!response.ok) throw new Error(body.message ?? body.error); issuedTicket = { id: body.ticketId, token: body.ticketToken }; ticketQr = await QRCode.toDataURL(`${window.location.origin}/public/tickets/${body.ticketId}/check-in/${body.ticketToken}`, { errorCorrectionLevel: "M", margin: 1, width: 640 }); registrationMessage = body.emailQueued ? "申込を受け付け、QRチケットをメールで送付しました。" : "申込を受け付けました。チケットはこの画面から離れる前に保存してください。"; }
@@ -227,7 +274,8 @@
       {#if publicSchedule.event.schedule_status === "confirmed"}<p class="notice">日程は確定しています。</p>{:else}
         <label>お名前<input bind:value={scheduleRespondentName} required placeholder="山田太郎" /></label>
         <p class="muted">候補ごとに参加可否を選んでください。</p>
-        <div class="schedule-list">{#each publicSchedule.options as option}<div class="schedule-option"><div><strong>{option.starts_at} – {option.ends_at}</strong>{#if option.note}<p class="muted">{option.note}</p>{/if}<p class="muted">○ {option.yes ?? 0}　△ {option.maybe ?? 0}　× {option.no ?? 0}</p></div><div class="response-buttons"><button class:chosen={scheduleResponses[option.id] === "yes"} disabled={!scheduleRespondentName.trim()} onclick={() => void submitScheduleResponse(option.id, "yes")}>○ 参加</button><button class:chosen={scheduleResponses[option.id] === "maybe"} disabled={!scheduleRespondentName.trim()} onclick={() => void submitScheduleResponse(option.id, "maybe")}>△ 未定</button><button class:chosen={scheduleResponses[option.id] === "no"} disabled={!scheduleRespondentName.trim()} onclick={() => void submitScheduleResponse(option.id, "no")}>× 不参加</button></div></div>{/each}</div>
+        <div class="schedule-list">{#each publicSchedule.options as option}<div class="schedule-option"><div><strong>{scheduleOptionLabel(option)}</strong>{#if option.note}<p class="muted">{option.note}</p>{/if}<p class="muted">○ {option.yes ?? 0}　△ {option.maybe ?? 0}　× {option.no ?? 0}</p></div><div class="response-buttons"><button class:chosen={scheduleResponses[option.id] === "yes"} disabled={!scheduleRespondentName.trim()} onclick={() => void submitScheduleResponse(option.id, "yes")}>○ 参加</button><button class:chosen={scheduleResponses[option.id] === "maybe"} disabled={!scheduleRespondentName.trim()} onclick={() => void submitScheduleResponse(option.id, "maybe")}>△ 未定</button><button class:chosen={scheduleResponses[option.id] === "no"} disabled={!scheduleRespondentName.trim()} onclick={() => void submitScheduleResponse(option.id, "no")}>× 不参加</button></div></div>{/each}</div>
+        <section class="schedule-form"><h3>AI に日程調整を任せる</h3><p class="muted">カレンダー連携済みのAIに、このイベントの候補確認とあなた自身の可否回答だけを許可します。候補が増えた場合もAIは再確認できます。</p><button disabled={!scheduleRespondentName.trim()} onclick={() => void createAgentConnection()}>AI連携用トークンを発行</button><button class="quiet" disabled={!scheduleRespondentName.trim()} onclick={() => void loadAgentConnections()}>接続を確認</button>{#if agentConnection}<p class="notice">このトークンは一度だけ表示されます。AIのMCP接続設定に登録してください。</p><label>MCP URL<input readonly value={agentConnection.mcpUrl} /></label><label>アクセストークン<input readonly value={agentConnection.token} /></label><p class="muted">有効期限: {agentConnection.expiresInDays} 日。日程確定後は可否の変更が自動で停止します。</p>{/if}{#if agentConnections.length > 0}<h4>AI連携</h4><ul>{#each agentConnections as connection}<li><span>{connection.revoked_at ? "解除済み" : `有効（${connection.expires_at}まで）`}</span>{#if !connection.revoked_at}<button class="quiet" onclick={() => void revokeAgentConnection(connection.id)}>解除</button>{/if}</li>{/each}</ul>{/if}</section>
       {/if}
     </section>
   {:else}<p class="notice" aria-live="polite">{scheduleResponseMessage}</p>{/if}
@@ -240,11 +288,13 @@
   {#if issuedTicket}<section aria-labelledby="passkey-registration"><h2 id="passkey-registration">Passkey を登録する</h2><p>この端末でチケットを安全に再表示できるようにします。PRF対応Passkeyでは、E2EE鍵の保護にも使用します。</p><button onclick={registerPasskey}>Passkey を登録</button>{#if passkeyMessage}<p class="notice" aria-live="polite">{passkeyMessage}</p>{/if}</section>{/if}
 {:else}
   {#if !workspaceReady || screen === "setup"}
-    <header><p class="eyebrow">WELCOME TO TSUDOI</p><h1>tsudoi</h1><p>最初に、初期管理者を登録します。</p></header>
-    <section class="focus-card" aria-labelledby="initial-admin"><h2 id="initial-admin">初期管理者の Passkey を登録</h2>
-      <p>この端末の Passkey で管理を始めます。登録後はイベントの作成画面だけが表示されます。</p>
-      <label>組織名<input bind:value={organizationName} autocomplete="organization" placeholder="例: つどい実行委員会" required /></label>
-      <button onclick={registerInitialAdministrator}>Passkey を登録して始める</button>
+    <header><p class="eyebrow">WELCOME TO TSUDOI</p><h1>tsudoi</h1><p>{initialSetupRequired ? "最初に、初期管理者を登録します。" : "Passkey でログインします。"}</p></header>
+    <section class="focus-card" aria-labelledby="initial-admin"><h2 id="initial-admin">{initialSetupRequired ? "初期管理者の Passkey を登録" : "Passkey でログイン"}</h2>
+      {#if initialSetupRequired}<p>この端末の Passkey で管理を始めます。イベントごとに主催者・共同主催者を設定できます。</p>
+        <label>お名前<input bind:value={administratorName} autocomplete="name" placeholder="例: 山田 太郎" required /></label>
+        <label>メールアドレス（任意・非公開）<input bind:value={administratorEmail} autocomplete="email" type="email" placeholder="通知・復旧用" /></label>
+        <button onclick={registerInitialAdministrator}>Passkey を登録して始める</button>
+      {:else}<p>登録済みの Passkey を使って管理画面を開きます。</p><button onclick={signIn}>Passkey でログイン</button>{/if}
       <p class="notice" aria-live="polite">{setupMessage}</p>
     </section>
   {:else}
@@ -258,8 +308,16 @@
         <p>イベント名だけで作成できます。日時が決まっていない場合は、日程調整を使えます。</p>
     <form onsubmit={(event) => { event.preventDefault(); void createEvent(); }}>
       <label>イベント名<input bind:value={eventName} required /></label>
-      <label class="inline"><input bind:checked={schedulingEnabled} type="checkbox" />日程を調整する</label>
-      {#if !schedulingEnabled}<label>開始日時<input bind:value={startsAt} type="datetime-local" required /></label><label>終了日時<input bind:value={endsAt} type="datetime-local" required /></label>{/if}
+      <label class="inline"><input checked={schedulingEnabled} onchange={(event) => setSchedulingEnabled(event.currentTarget.checked)} type="checkbox" />日程を調整する</label>
+      {#if schedulingEnabled}
+        <label>所要時間（任意）<select bind:value={scheduleDurationMinutes}><option value="">指定しない</option><option value="15">15分</option><option value="30">30分</option><option value="45">45分</option><option value="60">1時間</option><option value="90">1時間30分</option><option value="120">2時間</option><option value="180">3時間</option><option value="240">4時間</option></select></label>
+        <fieldset class="schedule-form"><legend>最初の候補日時</legend><p class="muted">開始日時だけを入力してください。候補は追加できます。</p>
+          {#each initialScheduleOptions as option, index}
+            <div class="initial-schedule-option"><label>候補日時<input value={option.startsAt} onchange={(event) => updateInitialScheduleOption(index, "startsAt", event.currentTarget.value)} type="datetime-local" step="900" required /></label><label>メモ<input value={option.note} oninput={(event) => updateInitialScheduleOption(index, "note", event.currentTarget.value)} placeholder="会場の都合など" /></label><button type="button" class="quiet" onclick={() => removeInitialScheduleOption(index)}>削除</button></div>
+          {/each}
+          <button type="button" class="quiet" onclick={addInitialScheduleOption}>候補を追加</button>
+        </fieldset>
+      {:else}<label>開始日時<input bind:value={startsAt} type="datetime-local" step="900" required /></label>{/if}
       <button>作成する</button>
     </form>
       </section>
@@ -267,18 +325,16 @@
         {#if events.length === 0}<p>まだイベントがありません。</p>{:else}<ul>{#each events as event}<li><div><strong>{event.name}</strong><p class="muted">{event.scheduling_enabled === 1 && event.schedule_status !== "confirmed" ? "日程調整中" : `${event.starts_at} · ${event.status}`}</p></div><button onclick={() => openEvent(event.id)}>管理する</button></li>{/each}</ul>{/if}
       </section>
     {:else if screen === "admin"}
-      <section aria-labelledby="admin-menu"><h2 id="admin-menu">管理メニュー</h2><p>管理用の接続情報と組織の設定を扱います。</p>
-        <label>API トークン<input bind:value={token} type="password" autocomplete="off" /></label>
-        <label>組織 ID<input bind:value={organizationId} /></label>
-        <button onclick={reconnectWorkspace}>保存して再接続</button>
+      <section aria-labelledby="admin-menu"><h2 id="admin-menu">管理メニュー</h2><p>この端末のログイン状態を管理します。API連携用のトークン管理は、外部APIの提供時にここへ追加します。</p>
+        <button onclick={signOut}>ログアウト</button>
       </section>
     {:else}
       <section class="event-title"><h2>{events.find((event) => event.id === selectedEventId)?.name ?? "イベント管理"}</h2><p>必要な作業を選んでください。</p></section>
       {#if schedule?.enabled && schedule.status !== "confirmed"}
         <section aria-labelledby="schedule-management"><h2 id="schedule-management">日程を調整</h2><p>候補日時を追加して、参加者に回答してもらいます。</p>
           <p class="muted">共有用URL: <a href={`/events/${selectedEventId}/schedule`} target="_blank" rel="noreferrer">日程調整ページを開く</a></p>
-          <form onsubmit={(event) => { event.preventDefault(); void addScheduleOption(); }} class="schedule-form"><label>候補の開始<input bind:value={scheduleStartsAt} type="datetime-local" required /></label><label>候補の終了<input bind:value={scheduleEndsAt} type="datetime-local" required /></label><label>メモ（任意）<input bind:value={scheduleNote} placeholder="会場の都合など" /></label><button>候補を追加</button></form>
-          {#if schedule.options.length === 0}<p>候補日時を追加してください。</p>{:else}<div class="schedule-list">{#each schedule.options as option}<div class="schedule-option"><div><strong>{option.starts_at} – {option.ends_at}</strong>{#if option.note}<p class="muted">{option.note}</p>{/if}<p class="muted">○ {option.yes ?? 0}　△ {option.maybe ?? 0}　× {option.no ?? 0}</p></div>{#if isAdministrator}<button onclick={() => void confirmSchedule(option.id)}>この日程に確定</button>{/if}</div>{/each}</div>{/if}
+          <form onsubmit={(event) => { event.preventDefault(); void addScheduleOption(); }} class="schedule-form"><label>候補日時<input bind:value={scheduleStartsAt} type="datetime-local" step="900" required /></label><label>メモ（任意）<input bind:value={scheduleNote} placeholder="会場の都合など" /></label><button>候補を追加</button></form>
+          {#if schedule.options.length === 0}<p>候補日時を追加してください。</p>{:else}<div class="schedule-list">{#each schedule.options as option}<div class="schedule-option"><div><strong>{scheduleOptionLabel(option)}</strong>{#if option.note}<p class="muted">{option.note}</p>{/if}<p class="muted">○ {option.yes ?? 0}　△ {option.maybe ?? 0}　× {option.no ?? 0}</p></div>{#if isAdministrator}<button onclick={() => void confirmSchedule(option.id)}>この日程に確定</button>{/if}</div>{/each}</div>{/if}
         </section>
       {:else if schedule?.enabled}
         <section class="notice"><strong>日程確定済み</strong><p>{schedule.startsAt} – {schedule.endsAt}</p></section>
@@ -287,6 +343,7 @@
       {#if isAdministrator}
         {@const currentEvent = events.find((event) => event.id === selectedEventId)}
         {#if currentEvent?.status === "draft"}<button class="quiet action" onclick={() => publishEvent(selectedEventId)}>イベントを公開する</button>{:else if currentEvent?.status === "published"}<button class="quiet action" onclick={() => closeEvent(selectedEventId)}>イベントを終了する</button>{/if}
+        {#if currentEvent}<button class="quiet action" onclick={() => removeEvent(selectedEventId, currentEvent.status === "draft" && (metrics?.registrations ?? 0) === 0)}>{currentEvent.status === "draft" && (metrics?.registrations ?? 0) === 0 ? "下書きを削除する" : "イベントをアーカイブする"}</button>{/if}
       {/if}
       {#if metrics}
         <section aria-labelledby="metrics"><h2 id="metrics">受付状況</h2>
