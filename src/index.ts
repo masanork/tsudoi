@@ -240,8 +240,8 @@ app.get("/api/events/:eventId/schedule", requireScope("roster:read"), async (c) 
       SUM(CASE WHEN r.response = 'maybe' THEN 1 ELSE 0 END) AS maybe,
       SUM(CASE WHEN r.response = 'no' THEN 1 ELSE 0 END) AS no
     FROM schedule_options o LEFT JOIN schedule_responses r ON r.option_id = o.id
-    WHERE o.event_id = ? GROUP BY o.id ORDER BY o.starts_at`).bind(event.id).all();
-  return c.json({ enabled: event.scheduling_enabled === 1, status: event.schedule_status, startsAt: event.starts_at || null, endsAt: event.ends_at || null, options: options.results });
+    WHERE o.event_id = ? GROUP BY o.id ORDER BY o.starts_at`).bind(event.id).all<{ id: string; starts_at: string; ends_at: string; note: string; responses: number; yes: number; maybe: number; no: number }>();
+  return c.json({ enabled: event.scheduling_enabled === 1, status: event.schedule_status, date: event.starts_at || null, options: options.results.map(scheduleOptionForClient) });
 });
 
 app.post("/api/events/:eventId/schedule/options", requireScope("admin"), async (c) => {
@@ -249,13 +249,12 @@ app.post("/api/events/:eventId/schedule/options", requireScope("admin"), async (
   if (!event) return c.json({ error: "not_found" }, 404);
   if (event.scheduling_enabled !== 1 || event.schedule_status === "confirmed") return c.json({ error: "schedule_not_editable" }, 409);
   const body = await jsonBody(c);
-  const startsAt = requiredString(body, "startsAt");
-  const endsAt = scheduleOptionEndsAt(startsAt, event.schedule_duration_minutes, requiredString(body, "endsAt"));
-  if (!isValidScheduleOption(startsAt, endsAt)) return badRequest(c, "a valid start and end time are required");
+  const date = requiredScheduleDate(body, "date");
+  if (!date) return badRequest(c, "a valid date is required");
   const id = crypto.randomUUID();
   try {
     await c.env.DB.prepare("INSERT INTO schedule_options (id, event_id, starts_at, ends_at, note) VALUES (?, ?, ?, ?, ?)")
-      .bind(id, event.id, startsAt, endsAt, optionalString(body.note) ?? "").run();
+      .bind(id, event.id, date, date, optionalString(body.note) ?? "").run();
   } catch { return c.json({ error: "schedule_option_exists" }, 409); }
   return c.json({ id }, 201);
 });
@@ -271,7 +270,7 @@ app.post("/api/events/:eventId/schedule/confirm", requireScope("admin"), async (
   if (!option) return c.json({ error: "schedule_option_not_found" }, 404);
   await c.env.DB.prepare("UPDATE events SET starts_at = ?, ends_at = ?, schedule_status = 'confirmed', updated_at = CURRENT_TIMESTAMP WHERE id = ?")
     .bind(option.starts_at, option.ends_at, event.id).run();
-  return c.json({ confirmed: true, startsAt: option.starts_at, endsAt: option.ends_at });
+  return c.json({ confirmed: true, date: option.starts_at });
 });
 
 app.post("/api/events/:eventId/venues", requireScope("admin"), async (c) => {
@@ -560,8 +559,8 @@ app.get("/public/events/:eventId/schedule", async (c) => {
       SUM(CASE WHEN r.response = 'maybe' THEN 1 ELSE 0 END) AS maybe,
       SUM(CASE WHEN r.response = 'no' THEN 1 ELSE 0 END) AS no
     FROM schedule_options o LEFT JOIN schedule_responses r ON r.option_id = o.id
-    WHERE o.event_id = ? GROUP BY o.id ORDER BY o.starts_at`).bind(c.req.param("eventId")).all();
-  return c.json({ event, options: options.results });
+    WHERE o.event_id = ? GROUP BY o.id ORDER BY o.starts_at`).bind(c.req.param("eventId")).all<{ id: string; starts_at: string; ends_at: string; note: string; yes: number; maybe: number; no: number }>();
+  return c.json({ event, options: options.results.map(scheduleOptionForClient) });
 });
 
 app.post("/public/events/:eventId/schedule/responses", async (c) => {
@@ -952,49 +951,40 @@ async function createEvent(c: Context<AppEnv>, organizationId: string, body: Jso
   const endsAt = requiredString(body, "endsAt") || startsAt;
   const registrationMode = requiredString(body, "registrationMode");
   const schedulingEnabled = body.schedulingEnabled === true;
-  const scheduleDurationMinutes = optionalScheduleDuration(body.scheduleDurationMinutes);
   const initialScheduleOptions = scheduleOptions(body.initialScheduleOptions);
   const registrationOpensAt = optionalString(body.registrationOpensAt);
   const registrationClosesAt = optionalString(body.registrationClosesAt);
-  if (!name || (!schedulingEnabled && !startsAt) || !["advance", "walk_in", "hybrid"].includes(registrationMode ?? "") || (!schedulingEnabled && initialScheduleOptions.length > 0) || (body.scheduleDurationMinutes !== undefined && scheduleDurationMinutes === undefined) || initialScheduleOptions.some((option) => !isValidScheduleOption(option.startsAt, scheduleOptionEndsAt(option.startsAt, scheduleDurationMinutes, option.endsAt)))) return badRequest(c, "invalid event");
-  const optionKeys = new Set(initialScheduleOptions.map((option) => `${option.startsAt}\u0000${option.endsAt}`));
+  if (!name || (!schedulingEnabled && !startsAt) || !["advance", "walk_in", "hybrid"].includes(registrationMode ?? "") || (!schedulingEnabled && initialScheduleOptions.length > 0)) return badRequest(c, "invalid event");
+  const optionKeys = new Set(initialScheduleOptions.map((option) => option.date));
   if (optionKeys.size !== initialScheduleOptions.length) return badRequest(c, "duplicate schedule options");
   const eventId = crypto.randomUUID();
   await c.env.DB.batch([
     c.env.DB.prepare(`INSERT INTO events (id, organization_id, name, starts_at, ends_at, registration_mode, registration_opens_at, registration_closes_at, capacity, timezone, scheduling_enabled, schedule_status, schedule_duration_minutes)
       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
-      .bind(eventId, organizationId, name, startsAt ?? "", endsAt ?? "", registrationMode, registrationOpensAt ?? null, registrationClosesAt ?? null, optionalInteger(body.capacity), optionalString(body.timezone) ?? "Asia/Tokyo", schedulingEnabled ? 1 : 0, schedulingEnabled ? "collecting" : "confirmed", scheduleDurationMinutes ?? null),
+      .bind(eventId, organizationId, name, startsAt ?? "", endsAt ?? "", registrationMode, registrationOpensAt ?? null, registrationClosesAt ?? null, optionalInteger(body.capacity), optionalString(body.timezone) ?? "Asia/Tokyo", schedulingEnabled ? 1 : 0, schedulingEnabled ? "collecting" : "confirmed", null),
     ...initialScheduleOptions.map((option) => c.env.DB.prepare("INSERT INTO schedule_options (id, event_id, starts_at, ends_at, note) VALUES (?, ?, ?, ?, ?)")
-      .bind(crypto.randomUUID(), eventId, option.startsAt, scheduleOptionEndsAt(option.startsAt, scheduleDurationMinutes, option.endsAt), option.note)),
+      .bind(crypto.randomUUID(), eventId, option.date, option.date, option.note)),
   ]);
   if (c.get("auth").kind === "session") await c.env.DB.prepare("INSERT INTO event_organizers (event_id, user_id, role) VALUES (?, ?, 'organizer')")
     .bind(eventId, c.get("auth").actorId).run();
   await audit(c.env.DB, c.get("auth"), "event.created", "event", eventId);
   return c.json({ id: eventId }, 201);
 }
-type ScheduleOptionInput = { startsAt: string; endsAt?: string; note: string };
+type ScheduleOptionInput = { date: string; note: string };
 function scheduleOptions(value: unknown): ScheduleOptionInput[] {
   if (!Array.isArray(value) || value.length > 20) return [];
   return value.flatMap((option) => {
     if (!isRecord(option)) return [];
-    const startsAt = requiredString(option, "startsAt");
-    const endsAt = requiredString(option, "endsAt") || undefined;
+    const date = requiredScheduleDate(option, "date");
     const note = optionalString(option.note) ?? "";
-    return startsAt && note.length <= 500 ? [{ startsAt, endsAt, note }] : [];
+    return date && note.length <= 500 ? [{ date, note }] : [];
   });
 }
-function optionalScheduleDuration(value: unknown) {
-  return typeof value === "number" && Number.isInteger(value) && value >= 1 && value <= 1440 ? value : undefined;
+function requiredScheduleDate(body: JsonRecord, key: string) {
+  const value = requiredString(body, key);
+  return value && /^\d{4}-\d{2}-\d{2}$/.test(value) && new Date(`${value}T00:00:00Z`).toISOString().startsWith(value) ? value : undefined;
 }
-function scheduleOptionEndsAt(startsAt: string | undefined, durationMinutes: number | null | undefined, fallbackEndsAt?: string) {
-  if (!startsAt) return undefined;
-  if (!durationMinutes) return fallbackEndsAt ?? startsAt;
-  const start = new Date(startsAt);
-  return Number.isNaN(start.getTime()) ? undefined : new Date(start.getTime() + durationMinutes * 60_000).toISOString();
-}
-function isValidScheduleOption(startsAt: string | undefined, endsAt: string | undefined) {
-  return Boolean(startsAt && endsAt && !Number.isNaN(Date.parse(startsAt)) && !Number.isNaN(Date.parse(endsAt)) && Date.parse(endsAt) >= Date.parse(startsAt));
-}
+function scheduleOptionForClient(option: { id: string; starts_at: string; ends_at: string; note: string; [key: string]: unknown }) { return { ...option, date: option.starts_at }; }
 async function eventForAuth(c: Context<AppEnv>) {
   const event = await c.env.DB.prepare("SELECT * FROM events WHERE id = ? AND organization_id = ?").bind(c.req.param("eventId"), c.get("auth").organizationId).first<EventRow>();
   return event;

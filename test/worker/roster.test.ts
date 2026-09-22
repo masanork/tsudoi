@@ -120,7 +120,7 @@ describe("Worker D1 roster flow", () => {
     expect(eventResponse.status).toBe(201);
     const { id: eventId } = await eventResponse.json<{ id: string }>();
 
-    const optionResponse = await SELF.fetch(`https://tsudoi.test/api/events/${eventId}/schedule/options`, { method: "POST", headers: auth, body: JSON.stringify({ startsAt: "2026-11-01T09:00:00Z", endsAt: "2026-11-01T10:00:00Z" }) });
+    const optionResponse = await SELF.fetch(`https://tsudoi.test/api/events/${eventId}/schedule/options`, { method: "POST", headers: auth, body: JSON.stringify({ date: "2026-11-01" }) });
     expect(optionResponse.status).toBe(201);
     const { id: optionId } = await optionResponse.json<{ id: string }>();
     const publicSchedule = await SELF.fetch(`https://tsudoi.test/public/events/${eventId}/schedule`);
@@ -131,17 +131,17 @@ describe("Worker D1 roster flow", () => {
     expect(response.status).toBe(201);
     const confirm = await SELF.fetch(`https://tsudoi.test/api/events/${eventId}/schedule/confirm`, { method: "POST", headers: auth, body: JSON.stringify({ optionId }) });
     expect(confirm.status).toBe(200);
-    await expect(env.DB.prepare("SELECT starts_at, ends_at, schedule_status FROM events WHERE id = ?").bind(eventId).first()).resolves.toMatchObject({ starts_at: "2026-11-01T09:00:00Z", schedule_status: "confirmed" });
+    await expect(env.DB.prepare("SELECT starts_at, ends_at, schedule_status FROM events WHERE id = ?").bind(eventId).first()).resolves.toMatchObject({ starts_at: "2026-11-01", ends_at: "2026-11-01", schedule_status: "confirmed" });
   });
 
-  it("creates a schedule poll with its initial options", async () => {
+  it("creates a date-only schedule poll with its initial options", async () => {
     const { organizationId, token } = await createApiOrganization("Initial schedule options");
     const auth = { "content-type": "application/json", authorization: `Bearer ${token}` };
-    const eventResponse = await SELF.fetch(`https://tsudoi.test/api/organizations/${organizationId}/events`, { method: "POST", headers: auth, body: JSON.stringify({ name: "Date poll", schedulingEnabled: true, scheduleDurationMinutes: 60, registrationMode: "hybrid", initialScheduleOptions: [{ startsAt: "2026-11-01T09:00:00Z", note: "会議室 A" }, { startsAt: "2026-11-02T09:00:00Z" }] }) });
+    const eventResponse = await SELF.fetch(`https://tsudoi.test/api/organizations/${organizationId}/events`, { method: "POST", headers: auth, body: JSON.stringify({ name: "Date poll", schedulingEnabled: true, registrationMode: "hybrid", initialScheduleOptions: [{ date: "2026-11-01", note: "会議室 A" }, { date: "2026-11-02" }] }) });
     expect(eventResponse.status).toBe(201);
     const { id: eventId } = await eventResponse.json<{ id: string }>();
     const schedule = await SELF.fetch(`https://tsudoi.test/public/events/${eventId}/schedule`);
-    await expect(schedule.json()).resolves.toMatchObject({ options: [{ starts_at: "2026-11-01T09:00:00Z", ends_at: "2026-11-01T10:00:00.000Z", note: "会議室 A" }, { starts_at: "2026-11-02T09:00:00Z", ends_at: "2026-11-02T10:00:00.000Z" }] });
+    await expect(schedule.json()).resolves.toMatchObject({ options: [{ date: "2026-11-01", note: "会議室 A" }, { date: "2026-11-02" }] });
   });
 
   it("allows a fixed-date event to omit its end time", async () => {
@@ -155,7 +155,7 @@ describe("Worker D1 roster flow", () => {
   it("lets a participant agent read and answer only its linked schedule", async () => {
     const { organizationId, token } = await createApiOrganization("Agent scheduling");
     const auth = { "content-type": "application/json", authorization: `Bearer ${token}` };
-    const created = await SELF.fetch(`https://tsudoi.test/api/organizations/${organizationId}/events`, { method: "POST", headers: auth, body: JSON.stringify({ name: "Agent poll", schedulingEnabled: true, registrationMode: "hybrid", initialScheduleOptions: [{ startsAt: "2026-11-01T09:00:00Z" }] }) });
+    const created = await SELF.fetch(`https://tsudoi.test/api/organizations/${organizationId}/events`, { method: "POST", headers: auth, body: JSON.stringify({ name: "Agent poll", schedulingEnabled: true, registrationMode: "hybrid", initialScheduleOptions: [{ date: "2026-11-01" }] }) });
     const { id: eventId } = await created.json<{ id: string }>();
     const options = await SELF.fetch(`https://tsudoi.test/public/events/${eventId}/schedule`);
     const { options: [option] } = await options.json<{ options: Array<{ id: string }> }>();
@@ -182,7 +182,7 @@ describe("Worker D1 roster flow", () => {
   it("revokes an agent connection and closes agent writes once a schedule is confirmed", async () => {
     const { organizationId, token } = await createApiOrganization("Agent revocation");
     const auth = { "content-type": "application/json", authorization: `Bearer ${token}` };
-    const created = await SELF.fetch(`https://tsudoi.test/api/organizations/${organizationId}/events`, { method: "POST", headers: auth, body: JSON.stringify({ name: "Revocable poll", schedulingEnabled: true, registrationMode: "hybrid", initialScheduleOptions: [{ startsAt: "2026-12-01T09:00:00Z" }] }) });
+    const created = await SELF.fetch(`https://tsudoi.test/api/organizations/${organizationId}/events`, { method: "POST", headers: auth, body: JSON.stringify({ name: "Revocable poll", schedulingEnabled: true, registrationMode: "hybrid", initialScheduleOptions: [{ date: "2026-12-01" }] }) });
     const { id: eventId } = await created.json<{ id: string }>();
     const schedule = await SELF.fetch(`https://tsudoi.test/public/events/${eventId}/schedule`);
     const { options: [option] } = await schedule.json<{ options: Array<{ id: string }> }>();

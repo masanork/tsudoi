@@ -21,13 +21,12 @@
   let registrationOpensAt = "";
   let registrationClosesAt = "";
   let schedulingEnabled = false;
-  let scheduleDurationMinutes = "";
-  let initialScheduleOptions: Array<{ startsAt: string; endsAt: string; note: string }> = [];
+  let initialScheduleOptions: Array<{ date: string; note: string }> = [];
   let ticketLink = "";
   let checkinMessage = "";
   let selectedEventId = "";
-  let schedule: { enabled: boolean; status: string; startsAt: string | null; endsAt: string | null; options: Array<{ id: string; starts_at: string; ends_at: string; note: string; yes: number; maybe: number; no: number }> } | null = null;
-  let scheduleStartsAt = "";
+  let schedule: { enabled: boolean; status: string; date: string | null; options: Array<{ id: string; date: string; note: string; yes: number; maybe: number; no: number }> } | null = null;
+  let scheduleDate = "";
   let scheduleNote = "";
   let metrics: { registrations: number; issued: number; cancelled: number; checked_in: number; not_checked_in: number } | null = null;
   let rosterFields: Array<{ field_key: string; label: string }> = [];
@@ -46,7 +45,7 @@
   let publicEvent: { name: string; description: string; starts_at: string } | null = null;
   let publicFields: Array<{ field_key: string; label: string; field_type: string; required: number; options_json: string }> = [];
   let registrationName = ""; let registrationEmail = ""; let registrationAnswers: Record<string, string | string[] | boolean> = {}; let registrationMessage = "";
-  let publicSchedule: { event: { name: string; description: string; timezone: string; schedule_status: string }; options: Array<{ id: string; starts_at: string; ends_at: string; note: string; yes: number; maybe: number; no: number }> } | null = null;
+  let publicSchedule: { event: { name: string; description: string; timezone: string; schedule_status: string }; options: Array<{ id: string; date: string; note: string; yes: number; maybe: number; no: number }> } | null = null;
   let scheduleRespondentName = "";
   let scheduleRespondentId = "";
   let scheduleResponseMessage = "";
@@ -100,8 +99,8 @@
   }
   async function createEvent() {
     try {
-      await api("/events", { method: "POST", body: JSON.stringify({ name: eventName, startsAt: schedulingEnabled ? undefined : startsAt, endsAt: schedulingEnabled ? undefined : endsAt, schedulingEnabled, scheduleDurationMinutes: schedulingEnabled && scheduleDurationMinutes ? Number(scheduleDurationMinutes) : undefined, initialScheduleOptions: schedulingEnabled ? initialScheduleOptions : undefined, registrationMode: "hybrid", capacity: eventCapacity ? Number(eventCapacity) : undefined, registrationOpensAt: registrationOpensAt || undefined, registrationClosesAt: registrationClosesAt || undefined }) });
-      eventName = ""; eventCapacity = ""; registrationOpensAt = ""; registrationClosesAt = ""; scheduleDurationMinutes = ""; schedulingEnabled = false; initialScheduleOptions = []; await loadEvents(); message = "イベントを作成しました。";
+      await api("/events", { method: "POST", body: JSON.stringify({ name: eventName, startsAt: schedulingEnabled ? undefined : startsAt, endsAt: schedulingEnabled ? undefined : endsAt, schedulingEnabled, initialScheduleOptions: schedulingEnabled ? initialScheduleOptions : undefined, registrationMode: "hybrid", capacity: eventCapacity ? Number(eventCapacity) : undefined, registrationOpensAt: registrationOpensAt || undefined, registrationClosesAt: registrationClosesAt || undefined }) });
+      eventName = ""; eventCapacity = ""; registrationOpensAt = ""; registrationClosesAt = ""; schedulingEnabled = false; initialScheduleOptions = []; await loadEvents(); message = "イベントを作成しました。";
     } catch (error) { message = error instanceof Error ? error.message : "作成に失敗しました。"; }
   }
   async function loadSchedule(eventId: string) {
@@ -109,16 +108,16 @@
     catch (error) { message = error instanceof Error ? error.message : "日程調整を読み込めませんでした。"; }
   }
   async function addScheduleOption() {
-    try { await api(`/events/${selectedEventId}/schedule/options`, { method: "POST", body: JSON.stringify({ startsAt: scheduleStartsAt, note: scheduleNote || undefined }) }); scheduleStartsAt = ""; scheduleNote = ""; await loadSchedule(selectedEventId); }
+    try { await api(`/events/${selectedEventId}/schedule/options`, { method: "POST", body: JSON.stringify({ date: scheduleDate, note: scheduleNote || undefined }) }); scheduleDate = ""; scheduleNote = ""; await loadSchedule(selectedEventId); }
     catch (error) { message = error instanceof Error ? error.message : "候補日時を追加できませんでした。"; }
   }
-  function addInitialScheduleOption() { initialScheduleOptions = [...initialScheduleOptions, { startsAt: "", endsAt: "", note: "" }]; }
-  function setSchedulingEnabled(enabled: boolean) { schedulingEnabled = enabled; if (enabled && initialScheduleOptions.length === 0) initialScheduleOptions = [{ startsAt: "", endsAt: "", note: "" }, { startsAt: "", endsAt: "", note: "" }]; }
+  function addInitialScheduleOption() { initialScheduleOptions = [...initialScheduleOptions, { date: "", note: "" }]; }
+  function setSchedulingEnabled(enabled: boolean) { schedulingEnabled = enabled; if (enabled && initialScheduleOptions.length === 0) initialScheduleOptions = [{ date: "", note: "" }, { date: "", note: "" }]; }
   function removeInitialScheduleOption(index: number) { initialScheduleOptions = initialScheduleOptions.filter((_, optionIndex) => optionIndex !== index); }
-  function updateInitialScheduleOption(index: number, key: "startsAt" | "note", value: string) {
+  function updateInitialScheduleOption(index: number, key: "date" | "note", value: string) {
     initialScheduleOptions = initialScheduleOptions.map((option, optionIndex) => optionIndex === index ? { ...option, [key]: value } : option);
   }
-  function scheduleOptionLabel(option: { starts_at: string; ends_at: string }) { return option.ends_at && option.ends_at !== option.starts_at ? `${option.starts_at} – ${option.ends_at}` : option.starts_at; }
+  function scheduleOptionLabel(option: { date: string }) { return new Intl.DateTimeFormat("ja-JP", { dateStyle: "full" }).format(new Date(`${option.date}T00:00:00`)); }
   async function confirmSchedule(optionId: string) {
     try { await api(`/events/${selectedEventId}/schedule/confirm`, { method: "POST", body: JSON.stringify({ optionId }) }); await loadEvents(); await loadSchedule(selectedEventId); message = "日程を確定しました。"; }
     catch (error) { message = error instanceof Error ? error.message : "日程を確定できませんでした。"; }
@@ -331,10 +330,9 @@
       <label>イベント名<input bind:value={eventName} required /></label>
       <label class="inline"><input checked={schedulingEnabled} onchange={(event) => setSchedulingEnabled(event.currentTarget.checked)} type="checkbox" />日程を調整する</label>
       {#if schedulingEnabled}
-        <label>所要時間（任意）<select bind:value={scheduleDurationMinutes}><option value="">指定しない</option><option value="15">15分</option><option value="30">30分</option><option value="45">45分</option><option value="60">1時間</option><option value="90">1時間30分</option><option value="120">2時間</option><option value="180">3時間</option><option value="240">4時間</option></select></label>
-        <fieldset class="schedule-form"><legend>最初の候補日時</legend><p class="muted">開始日時だけを入力してください。候補は追加できます。</p>
+        <fieldset class="schedule-form"><legend>最初の候補日</legend><p class="muted">参加できる日を選びます。時刻は日程確定後に参加者へ連絡してください。</p>
           {#each initialScheduleOptions as option, index}
-            <div class="initial-schedule-option"><label>候補日時<input value={option.startsAt} onchange={(event) => updateInitialScheduleOption(index, "startsAt", event.currentTarget.value)} type="datetime-local" step="900" required /></label><label>メモ<input value={option.note} oninput={(event) => updateInitialScheduleOption(index, "note", event.currentTarget.value)} placeholder="会場の都合など" /></label><button type="button" class="quiet" onclick={() => removeInitialScheduleOption(index)}>削除</button></div>
+            <div class="initial-schedule-option"><label>候補日<input value={option.date} onchange={(event) => updateInitialScheduleOption(index, "date", event.currentTarget.value)} type="date" required /></label><label>メモ<input value={option.note} oninput={(event) => updateInitialScheduleOption(index, "note", event.currentTarget.value)} placeholder="会場の都合など" /></label><button type="button" class="quiet" onclick={() => removeInitialScheduleOption(index)}>削除</button></div>
           {/each}
           <button type="button" class="quiet" onclick={addInitialScheduleOption}>候補を追加</button>
         </fieldset>
@@ -354,11 +352,11 @@
       {#if schedule?.enabled && schedule.status !== "confirmed"}
         <section aria-labelledby="schedule-management"><h2 id="schedule-management">日程を調整</h2><p>候補日時を追加して、参加者に回答してもらいます。</p>
           <p class="muted">共有用URL: <a href={`/events/${selectedEventId}/schedule`} target="_blank" rel="noreferrer">日程調整ページを開く</a></p>
-          <form onsubmit={(event) => { event.preventDefault(); void addScheduleOption(); }} class="schedule-form"><label>候補日時<input bind:value={scheduleStartsAt} type="datetime-local" step="900" required /></label><label>メモ（任意）<input bind:value={scheduleNote} placeholder="会場の都合など" /></label><button>候補を追加</button></form>
-          {#if schedule.options.length === 0}<p>候補日時を追加してください。</p>{:else}<div class="schedule-list">{#each schedule.options as option}<div class="schedule-option"><div><strong>{scheduleOptionLabel(option)}</strong>{#if option.note}<p class="muted">{option.note}</p>{/if}<p class="muted">○ {option.yes ?? 0}　△ {option.maybe ?? 0}　× {option.no ?? 0}</p></div>{#if isAdministrator}<button onclick={() => void confirmSchedule(option.id)}>この日程に確定</button>{/if}</div>{/each}</div>{/if}
+          <form onsubmit={(event) => { event.preventDefault(); void addScheduleOption(); }} class="schedule-form"><label>候補日<input bind:value={scheduleDate} type="date" required /></label><label>メモ（任意）<input bind:value={scheduleNote} placeholder="会場の都合など" /></label><button>候補を追加</button></form>
+          {#if schedule.options.length === 0}<p>候補日を追加してください。</p>{:else}<div class="schedule-list">{#each schedule.options as option}<div class="schedule-option"><div><strong>{scheduleOptionLabel(option)}</strong>{#if option.note}<p class="muted">{option.note}</p>{/if}<p class="muted">○ {option.yes ?? 0}　△ {option.maybe ?? 0}　× {option.no ?? 0}</p></div>{#if isAdministrator}<button onclick={() => void confirmSchedule(option.id)}>この日に確定</button>{/if}</div>{/each}</div>{/if}
         </section>
       {:else if schedule?.enabled}
-        <section class="notice"><strong>日程確定済み</strong><p>{schedule.startsAt} – {schedule.endsAt}</p></section>
+        <section class="notice"><strong>日程確定済み</strong><p>{schedule.date ? scheduleOptionLabel({ date: schedule.date }) : ""}</p><p class="muted">時刻は参加者へ別途ご連絡ください。</p></section>
       {/if}
       <div class="management-grid"><a href="#roster">名簿を管理</a><a href="#check-in">QR 受付</a><a href="#settings">申込フォーム設定</a></div>
       {#if isAdministrator}
