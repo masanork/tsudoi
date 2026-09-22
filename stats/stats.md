@@ -1,11 +1,11 @@
 # tsudoi codebase snapshot
 
-Commit `de0f052` · 2026-09-22
+Commit `54277a6` · 2026-09-22
 
 | Area | Files | Lines |
 | --- | ---: | ---: |
-| Worker `src/` | 1 | 1084 |
-| UI `web/src/` | 3 | 486 |
-| Tests `test/` | 5 | 455 |
+| Worker `src/` | 1 | 1123 |
+| UI `web/src/` | 3 | 532 |
+| Tests `test/` | 5 | 463 |
 
 - Line coverage: 100%
