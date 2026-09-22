@@ -281,7 +281,7 @@ app.post("/api/events/:eventId/venues", requireScope("admin"), async (c) => {
   if (!name) return badRequest(c, "name is required");
   const id = crypto.randomUUID();
   await c.env.DB.prepare("INSERT INTO venues (id, event_id, name, address, opens_at, capacity) VALUES (?, ?, ?, ?, ?, ?)")
-    .bind(id, event.id, name, optionalString(body.address) ?? "", optionalString(body.opensAt), optionalInteger(body.capacity)).run();
+    .bind(id, event.id, name, optionalString(body.address) ?? "", optionalString(body.opensAt) ?? null, optionalInteger(body.capacity)).run();
   return c.json({ id }, 201);
 });
 
