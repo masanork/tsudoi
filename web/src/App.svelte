@@ -20,8 +20,7 @@
   let events: Array<{ id: string; name: string; starts_at: string; ends_at: string; status: string; scheduling_enabled?: number; schedule_status?: string }> = [];
   let message = "イベントを読み込んでいます。";
   let eventName = "";
-  let startsAt = "";
-  let endsAt = "";
+  let eventDate = "";
   let eventCapacity = "";
   let registrationOpensAt = "";
   let registrationClosesAt = "";
@@ -128,8 +127,8 @@
   }
   async function createEvent() {
     try {
-      await api("/events", { method: "POST", body: JSON.stringify({ name: eventName, startsAt: schedulingEnabled ? undefined : startsAt, endsAt: schedulingEnabled ? undefined : endsAt, schedulingEnabled, initialScheduleOptions: schedulingEnabled ? initialScheduleOptions : undefined, registrationMode: "hybrid", capacity: eventCapacity ? Number(eventCapacity) : undefined, registrationOpensAt: registrationOpensAt || undefined, registrationClosesAt: registrationClosesAt || undefined }) });
-      eventName = ""; eventCapacity = ""; registrationOpensAt = ""; registrationClosesAt = ""; schedulingEnabled = false; initialScheduleOptions = []; await loadEvents(); message = "イベントを作成しました。";
+      await api("/events", { method: "POST", body: JSON.stringify({ name: eventName, startsAt: schedulingEnabled ? undefined : eventDate, schedulingEnabled, initialScheduleOptions: schedulingEnabled ? initialScheduleOptions : undefined, registrationMode: "hybrid", capacity: eventCapacity ? Number(eventCapacity) : undefined, registrationOpensAt: registrationOpensAt || undefined, registrationClosesAt: registrationClosesAt || undefined }) });
+      eventName = ""; eventDate = ""; eventCapacity = ""; registrationOpensAt = ""; registrationClosesAt = ""; schedulingEnabled = false; initialScheduleOptions = []; await loadEvents(); message = "イベントを作成しました。";
     } catch (error) { message = error instanceof Error ? error.message : "作成に失敗しました。"; }
   }
   async function loadSchedule(eventId: string) {
@@ -378,7 +377,7 @@
           <div class="calendar-grid" role="group" aria-label="候補日を選択">{#each ["日", "月", "火", "水", "木", "金", "土"] as weekday}<span class="calendar-weekday">{weekday}</span>{/each}{#each calendarDays(calendarMonth) as date}<div class="calendar-cell">{#if date}<button type="button" class:chosen={initialScheduleOptions.some((option) => option.date === date)} onclick={() => toggleInitialDate(date)}>{Number(date.slice(-2))}</button>{/if}</div>{/each}</div>
           {#if initialScheduleOptions.length === 0}<p class="muted">候補日を2日以上選ぶと比較しやすくなります。</p>{:else}<div class="selected-dates">{#each initialScheduleOptions as option, index}<div><strong>{scheduleOptionLabel(option)}</strong><label>メモ（任意）<input value={option.note} oninput={(event) => updateInitialScheduleOption(index, "note", event.currentTarget.value)} placeholder="会場の都合など" /></label><button type="button" class="quiet" onclick={() => removeInitialScheduleOption(index)}>外す</button></div>{/each}</div>{/if}
         </fieldset>
-      {:else}<label>開始日時<input bind:value={startsAt} type="datetime-local" step="900" required /></label>{/if}
+      {:else}<label>開催日<input bind:value={eventDate} type="date" required /></label>{/if}
       <button>作成する</button>
     </form>
       </section>

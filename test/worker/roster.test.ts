@@ -144,12 +144,12 @@ describe("Worker D1 roster flow", () => {
     await expect(schedule.json()).resolves.toMatchObject({ options: [{ date: "2026-11-01", note: "会議室 A" }, { date: "2026-11-02" }] });
   });
 
-  it("allows a fixed-date event to omit its end time", async () => {
+  it("allows a fixed-date event to use a date without a time", async () => {
     const { organizationId, token } = await createApiOrganization("Start time only");
-    const response = await SELF.fetch(`https://tsudoi.test/api/organizations/${organizationId}/events`, { method: "POST", headers: { "content-type": "application/json", authorization: `Bearer ${token}` }, body: JSON.stringify({ name: "Short event", startsAt: "2026-11-01T09:00:00Z", registrationMode: "hybrid" }) });
+    const response = await SELF.fetch(`https://tsudoi.test/api/organizations/${organizationId}/events`, { method: "POST", headers: { "content-type": "application/json", authorization: `Bearer ${token}` }, body: JSON.stringify({ name: "Short event", startsAt: "2026-11-01", registrationMode: "hybrid" }) });
     expect(response.status).toBe(201);
     const { id } = await response.json<{ id: string }>();
-    await expect(env.DB.prepare("SELECT starts_at, ends_at FROM events WHERE id = ?").bind(id).first()).resolves.toEqual({ starts_at: "2026-11-01T09:00:00Z", ends_at: "2026-11-01T09:00:00Z" });
+    await expect(env.DB.prepare("SELECT starts_at, ends_at FROM events WHERE id = ?").bind(id).first()).resolves.toEqual({ starts_at: "2026-11-01", ends_at: "2026-11-01" });
   });
 
   it("lets a participant agent read and answer only its linked schedule", async () => {
