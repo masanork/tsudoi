@@ -163,6 +163,8 @@ describe("Worker D1 roster flow", () => {
     expect(connection.status).toBe(201);
     const { token: agentToken } = await connection.json<{ token: string }>();
     const mcpHeaders = { "content-type": "application/json", authorization: `Bearer ${agentToken}` };
+    const initialize = await SELF.fetch("https://tsudoi.test/mcp", { method: "POST", headers: mcpHeaders, body: JSON.stringify({ jsonrpc: "2.0", id: 0, method: "initialize", params: { protocolVersion: "2025-06-18" } }) });
+    await expect(initialize.json()).resolves.toMatchObject({ result: { protocolVersion: "2025-06-18", serverInfo: { name: "tsudoi-scheduling" } } });
     const tools = await SELF.fetch("https://tsudoi.test/mcp", { method: "POST", headers: mcpHeaders, body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/list" }) });
     await expect(tools.json()).resolves.toMatchObject({ result: { tools: expect.arrayContaining([expect.objectContaining({ name: "submit_schedule_availability" })]) } });
     const answer = await SELF.fetch("https://tsudoi.test/mcp", { method: "POST", headers: mcpHeaders, body: JSON.stringify({ jsonrpc: "2.0", id: 2, method: "tools/call", params: { name: "submit_schedule_availability", arguments: { optionId: option.id, response: "yes" } } }) });
@@ -171,6 +173,10 @@ describe("Worker D1 roster flow", () => {
     const preferences = await SELF.fetch("https://tsudoi.test/mcp", { method: "POST", headers: mcpHeaders, body: JSON.stringify({ jsonrpc: "2.0", id: 3, method: "tools/call", params: { name: "update_scheduling_preferences", arguments: { availabilityText: "Weekday evenings preferred", constraints: { maxDurationMinutes: 90, unavailableWeekdays: ["monday"] } } } }) });
     await expect(preferences.json()).resolves.toMatchObject({ result: { content: [{ type: "text" }] } });
     await expect(env.DB.prepare("SELECT availability_text, constraints_json FROM scheduling_preferences WHERE event_id = ? AND respondent_id = ?").bind(eventId, "agent-owner").first<{ availability_text: string; constraints_json: string }>()).resolves.toMatchObject({ availability_text: "Weekday evenings preferred", constraints_json: expect.stringContaining("maxDurationMinutes") });
+    const savedPreferences = await SELF.fetch("https://tsudoi.test/mcp", { method: "POST", headers: mcpHeaders, body: JSON.stringify({ jsonrpc: "2.0", id: 4, method: "tools/call", params: { name: "get_scheduling_preferences", arguments: {} } }) });
+    await expect(savedPreferences.json()).resolves.toMatchObject({ result: { content: [{ text: expect.stringContaining("Weekday evenings preferred") }] } });
+    const scheduleStatus = await SELF.fetch("https://tsudoi.test/mcp", { method: "POST", headers: mcpHeaders, body: JSON.stringify({ jsonrpc: "2.0", id: 5, method: "tools/call", params: { name: "get_schedule_status", arguments: {} } }) });
+    await expect(scheduleStatus.json()).resolves.toMatchObject({ result: { content: [{ text: expect.stringContaining("collecting") }] } });
   });
 
   it("revokes an agent connection and closes agent writes once a schedule is confirmed", async () => {
@@ -326,5 +332,25 @@ describe("Worker D1 roster flow", () => {
     const logout = await SELF.fetch("https://tsudoi.test/api/session/logout", { method: "POST", headers: { cookie: `tsudoi_organizer=${sessionToken}` } });
     expect(logout.status).toBe(204);
     expect((await SELF.fetch("https://tsudoi.test/api/session", { headers: { cookie: `tsudoi_organizer=${sessionToken}` } })).status).toBe(401);
+  });
+
+  it("issues ticket links and consumes a check-in link exactly once", async () => {
+    const { organizationId, token } = await createApiOrganization("Ticket link operations");
+    const auth = { "content-type": "application/json", authorization: `Bearer ${token}` };
+    const created = await SELF.fetch(`https://tsudoi.test/api/organizations/${organizationId}/events`, { method: "POST", headers: auth, body: JSON.stringify({ name: "Ticket link event", startsAt: "2026-12-14T09:00:00Z", registrationMode: "hybrid" }) });
+    const { id: eventId } = await created.json<{ id: string }>();
+    await SELF.fetch(`https://tsudoi.test/api/events/${eventId}/publish`, { method: "POST", headers: { authorization: `Bearer ${token}` } });
+    const registration = await SELF.fetch(`https://tsudoi.test/public/events/${eventId}/register`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ name: "Margaret", email: "margaret@example.test" }) });
+    const { attendeeId, ticketId } = await registration.json<{ attendeeId: string; ticketId: string }>();
+    const resend = await SELF.fetch(`https://tsudoi.test/api/events/${eventId}/attendees/${attendeeId}/ticket-link`, { method: "POST", headers: auth });
+    expect(resend.status).toBe(202);
+    const linkToken = `checkin_${crypto.randomUUID()}`;
+    const hash = [...new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(linkToken)))].map((byte) => byte.toString(16).padStart(2, "0")).join("");
+    await env.DB.prepare("INSERT INTO magic_links (id, attendee_id, token_hash, purpose, expires_at) VALUES (?, ?, ?, 'ticket', datetime('now', '+1 hour'))")
+      .bind(crypto.randomUUID(), attendeeId, hash).run();
+    const checkIn = await SELF.fetch("https://tsudoi.test/api/tickets/check-in-link", { method: "POST", headers: auth, body: JSON.stringify({ linkToken }) });
+    await expect(checkIn.json()).resolves.toMatchObject({ outcome: "accepted", ticket: { id: ticketId, status: "checked_in" } });
+    const duplicate = await SELF.fetch("https://tsudoi.test/api/tickets/check-in-link", { method: "POST", headers: auth, body: JSON.stringify({ linkToken }) });
+    expect(duplicate.status).toBe(404);
   });
 });
