@@ -959,9 +959,9 @@ async function createEvent(c: Context<AppEnv>, organizationId: string, body: Jso
   if (optionKeys.size !== initialScheduleOptions.length) return badRequest(c, "duplicate schedule options");
   const eventId = crypto.randomUUID();
   await c.env.DB.batch([
-    c.env.DB.prepare(`INSERT INTO events (id, organization_id, name, starts_at, ends_at, registration_mode, registration_opens_at, registration_closes_at, capacity, timezone, scheduling_enabled, schedule_status, schedule_duration_minutes)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
-      .bind(eventId, organizationId, name, startsAt ?? "", endsAt ?? "", registrationMode, registrationOpensAt ?? null, registrationClosesAt ?? null, optionalInteger(body.capacity), optionalString(body.timezone) ?? "Asia/Tokyo", schedulingEnabled ? 1 : 0, schedulingEnabled ? "collecting" : "confirmed", null),
+    c.env.DB.prepare(`INSERT INTO events (id, organization_id, name, starts_at, ends_at, registration_mode, registration_opens_at, registration_closes_at, capacity, timezone, scheduling_enabled, schedule_status)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+      .bind(eventId, organizationId, name, startsAt ?? "", endsAt ?? "", registrationMode, registrationOpensAt ?? null, registrationClosesAt ?? null, optionalInteger(body.capacity), optionalString(body.timezone) ?? "Asia/Tokyo", schedulingEnabled ? 1 : 0, schedulingEnabled ? "collecting" : "confirmed"),
     ...initialScheduleOptions.map((option) => c.env.DB.prepare("INSERT INTO schedule_options (id, event_id, starts_at, ends_at, note) VALUES (?, ?, ?, ?, ?)")
       .bind(crypto.randomUUID(), eventId, option.date, option.date, option.note)),
   ]);
@@ -1055,7 +1055,7 @@ function safeEqual(left: string, right: string) {
 }
 async function audit(db: D1Database, auth: OrganizerAuth, action: string, targetType: string, targetId: string) { await db.prepare("INSERT INTO audit_logs (id, organization_id, actor_id, action, target_type, target_id) VALUES (?, ?, ?, ?, ?, ?)").bind(crypto.randomUUID(), auth.organizationId, auth.actorId, action, targetType, targetId).run(); }
 
-type EventRow = { id: string; organization_id: string; name: string; status: string; archived_at?: string | null; registration_mode: string; capacity: number | null; scheduling_enabled?: number; schedule_status?: string; schedule_duration_minutes?: number | null; starts_at?: string; ends_at?: string };
+type EventRow = { id: string; organization_id: string; name: string; status: string; archived_at?: string | null; registration_mode: string; capacity: number | null; scheduling_enabled?: number; schedule_status?: string; starts_at?: string; ends_at?: string };
 type FieldRow = { id: string; field_key: string; field_type: string; required: number; options_json: string };
 
 export default {
