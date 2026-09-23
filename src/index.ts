@@ -5,7 +5,6 @@ import type { ContentfulStatusCode } from "hono/utils/http-status";
 import { generateAuthenticationOptions, generateRegistrationOptions, verifyAuthenticationResponse, verifyRegistrationResponse } from "@simplewebauthn/server";
 import type { AuthenticationResponseJSON, RegistrationResponseJSON } from "@simplewebauthn/server";
 import * as QRCode from "qrcode";
-import { checkSession, discover, exchangeCode, oidcConfig, oidcConfigured, pkceChallenge, verifyIdToken } from "./oidc";
 
 type Role = "owner" | "admin" | "staff" | "viewer";
 type OrganizerAuth = { organizationId: string; scopes: string[]; actorId: string; role: Role | "api_token"; kind: "session" | "api_token" };
@@ -57,105 +56,94 @@ app.patch("/api/profile", requireOrganizer, requireSession, async (c) => {
   return c.json({ updated: true });
 });
 
-app.post("/api/session/logout", async (c) => {
-  if (c.req.header("origin") && c.req.header("origin") !== c.env.APP_ORIGIN) return c.json({ error: "invalid_origin" }, 403);
+app.post("/api/session/logout", requireOrganizer, requireSession, async (c) => {
   const token = cookieValue(c.req.header("cookie"), "tsudoi_organizer");
   if (token) await c.env.DB.prepare("UPDATE organizer_sessions SET revoked_at = CURRENT_TIMESTAMP WHERE token_hash = ?").bind(await sha256(token)).run();
   c.header("Set-Cookie", organizerCookie("", 0));
   return c.body(null, 204);
 });
 
-app.get("/api/oidc/status", (c) => c.json({ enabled: oidcConfigured(c.env) }));
-
-app.post("/api/oidc/login/start", async (c) => startOidc(c));
-
-app.get("/api/oidc/callback", async (c) => {
-  if (!oidcConfigured(c.env)) return c.json({ error: "oidc_not_configured" }, 503);
-  const config = oidcConfig(c.env);
-  const state = c.req.query("state");
-  const browser = cookieValue(c.req.header("cookie"), "tsudoi_oidc_browser");
-  if (!state || !browser || c.req.query("iss") !== config.issuer) return c.json({ error: "invalid_oidc_callback" }, 400);
-  const transaction = await c.env.DB.prepare(`SELECT id, browser_hash, nonce, code_verifier, return_path, bootstrap_allowed
-    FROM oidc_login_transactions WHERE state_hash = ? AND status = 'pending' AND expires_at > CURRENT_TIMESTAMP`)
-    .bind(await sha256(state)).first<{ id: string; browser_hash: string; nonce: string; code_verifier: string; return_path: string; bootstrap_allowed: number }>();
-  if (!transaction || !safeEqual(transaction.browser_hash, await sha256(browser))) return c.json({ error: "invalid_oidc_transaction" }, 400);
-  const claimed = await c.env.DB.prepare("UPDATE oidc_login_transactions SET status = 'processing' WHERE id = ? AND status = 'pending'").bind(transaction.id).run();
-  if (claimed.meta.changes !== 1) return c.json({ error: "oidc_transaction_already_used" }, 409);
-  if (c.req.query("error")) return c.redirect("/?oidc=failed", 303);
-  const code = c.req.query("code");
-  if (!code) return c.redirect("/?oidc=failed", 303);
-  try {
-    const discovery = await discover(config);
-    const idToken = await exchangeCode(config, discovery, code, transaction.code_verifier);
-    const identity = await verifyIdToken(config, discovery, idToken, transaction.nonce);
-    const checked = await checkSession(config, identity.sid, identity.sub, identity.authTime);
-    if (!checked) return c.redirect("/?oidc=inactive", 303);
-    const linked = await c.env.DB.prepare(`SELECT i.user_id, m.organization_id FROM oidc_identities i
-      JOIN organization_members m ON m.user_id = i.user_id WHERE i.issuer = ? AND i.subject = ? ORDER BY m.created_at LIMIT 1`)
-      .bind(config.issuer, identity.sub).first<{ user_id: string; organization_id: string }>();
-    const existingOrganization = linked ? null : await c.env.DB.prepare("SELECT id FROM organizations LIMIT 1").first<{ id: string }>();
-    if (!linked && (existingOrganization || transaction.bootstrap_allowed !== 1)) return c.redirect("/?oidc=unlinked", 303);
-    const organizationId = linked?.organization_id ?? crypto.randomUUID();
-    const userId = linked?.user_id ?? crypto.randomUUID();
-    const sessionToken = randomToken();
-    const now = Math.floor(Date.now() / 1000);
-    const expiresAt = Math.min(checked.parentExpiresAt, now + checked.idleTimeout);
-    if (expiresAt <= now) return c.json({ error: "oidc_session_expired" }, 401);
-    const previousToken = cookieValue(c.req.header("cookie"), "tsudoi_organizer");
-    await c.env.DB.batch([
-      ...(!linked ? [
-        c.env.DB.prepare("INSERT INTO oidc_bootstrap_lock (id) VALUES (1)"),
-        c.env.DB.prepare("INSERT INTO organizations (id, name) VALUES (?, ?)").bind(organizationId, "既定ワークスペース"),
-        c.env.DB.prepare("INSERT INTO users (id, display_name) VALUES (?, ?)").bind(userId, "管理者"),
-        c.env.DB.prepare("INSERT INTO organization_members (organization_id, user_id, role) VALUES (?, ?, 'owner')").bind(organizationId, userId),
-        c.env.DB.prepare("INSERT INTO oidc_identities (issuer, subject, user_id) VALUES (?, ?, ?)").bind(config.issuer, identity.sub, userId),
-      ] : []),
-      ...(previousToken ? [c.env.DB.prepare("UPDATE organizer_sessions SET revoked_at = CURRENT_TIMESTAMP WHERE token_hash = ? AND revoked_at IS NULL").bind(await sha256(previousToken))] : []),
-      c.env.DB.prepare(`INSERT INTO organizer_sessions
-        (id, user_id, organization_id, token_hash, expires_at, oidc_sid, oidc_sub, oidc_auth_time, oidc_lease_expires_at, oidc_parent_expires_at, oidc_idle_timeout)
-        VALUES (?, ?, ?, ?, datetime(?, 'unixepoch'), ?, ?, ?, ?, ?, ?)`)
-        .bind(crypto.randomUUID(), userId, organizationId, await sha256(sessionToken), expiresAt, identity.sid, identity.sub, identity.authTime, checked.leaseExpiresAt, checked.parentExpiresAt, checked.idleTimeout),
-      c.env.DB.prepare("UPDATE oidc_login_transactions SET status = 'complete' WHERE id = ? AND status = 'processing'").bind(transaction.id),
-    ]);
-    c.header("Set-Cookie", organizerCookie(sessionToken, Math.max(0, expiresAt - now)));
-    return c.redirect(transaction.return_path, 303);
-  } catch (error) {
-    console.error("oidc_callback_failed", error instanceof Error ? error.message : "unknown");
-    return c.redirect("/?oidc=failed", 303);
-  }
+app.post("/api/session/options", async (c) => {
+  const options = await generateAuthenticationOptions({ rpID: c.env.RP_ID, userVerification: "required" });
+  const challengeId = crypto.randomUUID();
+  await c.env.DB.prepare("INSERT INTO organizer_webauthn_challenges (id, challenge, expires_at) VALUES (?, ?, datetime('now', '+5 minutes'))")
+    .bind(challengeId, options.challenge).run();
+  return c.json({ challengeId, options });
 });
 
-async function startOidc(c: Context<AppEnv>) {
-  if (!oidcConfigured(c.env)) return c.json({ error: "oidc_not_configured" }, 503);
-  if (c.req.header("origin") !== c.env.APP_ORIGIN) return c.json({ error: "invalid_origin" }, 403);
-  const config = oidcConfig(c.env);
-  const state = randomToken(), nonce = randomToken(), verifier = randomToken();
-  const browser = cookieValue(c.req.header("cookie"), "tsudoi_oidc_browser") ?? randomToken();
-  try {
-    const organization = await c.env.DB.prepare("SELECT id FROM organizations LIMIT 1").first();
-    let bootstrapAllowed = 0;
-    if (!organization) {
-      const secret = (c.env as Cloudflare.Env & { OIDC_BOOTSTRAP_TOKEN?: string }).OIDC_BOOTSTRAP_TOKEN;
-      const body = await jsonBody(c);
-      const supplied = requiredString(body, "bootstrapToken");
-      if (!secret || !supplied || !safeEqual(supplied, secret)) return c.json({ error: "invalid_bootstrap_token" }, 403);
-      bootstrapAllowed = 1;
-    }
-    const discovery = await discover(config);
-    await c.env.DB.prepare(`INSERT INTO oidc_login_transactions
-      (id, state_hash, browser_hash, nonce, code_verifier, return_path, bootstrap_allowed, expires_at)
-      VALUES (?, ?, ?, ?, ?, '/', ?, datetime('now', '+10 minutes'))`)
-      .bind(crypto.randomUUID(), await sha256(state), await sha256(browser), nonce, verifier, bootstrapAllowed).run();
-    const url = new URL(discovery.authorization_endpoint);
-    url.search = new URLSearchParams({ client_id: config.clientId, redirect_uri: config.redirectUri, response_type: "code", scope: "openid", state, nonce,
-      code_challenge: await pkceChallenge(verifier), code_challenge_method: "S256" }).toString();
-    c.header("Set-Cookie", `tsudoi_oidc_browser=${browser}; HttpOnly; Secure; SameSite=Lax; Path=/api/oidc; Max-Age=600`);
-    return c.json({ authorizationUrl: url.toString() });
-  } catch (error) {
-    console.error("oidc_start_failed", error instanceof Error ? error.message : "unknown");
-    return c.json({ error: "oidc_start_failed" }, 502);
-  }
-}
+app.post("/api/session/verify", async (c) => {
+  const body = await jsonBody(c);
+  const challengeId = requiredString(body, "challengeId");
+  const response = body.response;
+  if (!challengeId || !isAuthenticationResponse(response)) return badRequest(c, "invalid authentication response");
+  const challenge = await c.env.DB.prepare("SELECT id, challenge FROM organizer_webauthn_challenges WHERE id = ? AND consumed_at IS NULL AND expires_at > CURRENT_TIMESTAMP")
+    .bind(challengeId).first<{ id: string; challenge: string }>();
+  const passkey = await c.env.DB.prepare("SELECT id, user_id, credential_id, public_key, counter, transports_json FROM passkeys WHERE credential_id = ? AND user_id IS NOT NULL")
+    .bind(response.id).first<{ id: string; user_id: string; credential_id: string; public_key: ArrayBuffer; counter: number; transports_json: string }>();
+  if (!challenge || !passkey) return c.json({ error: "challenge_or_credential_not_found" }, 400);
+  const verification = await verifyAuthenticationResponse({
+    response, expectedChallenge: challenge.challenge, expectedOrigin: c.env.APP_ORIGIN, expectedRPID: c.env.RP_ID, requireUserVerification: true,
+    credential: { id: passkey.credential_id, publicKey: new Uint8Array(passkey.public_key), counter: passkey.counter, transports: parseAuthenticatorTransports(passkey.transports_json) },
+  });
+  if (!verification.verified) return c.json({ error: "passkey_verification_failed" }, 400);
+  const membership = await c.env.DB.prepare("SELECT organization_id, role FROM organization_members WHERE user_id = ? ORDER BY created_at LIMIT 1")
+    .bind(passkey.user_id).first<{ organization_id: string; role: Role }>();
+  if (!membership) return c.json({ error: "organization_membership_not_found" }, 403);
+  const sessionToken = randomToken();
+  await c.env.DB.batch([
+    c.env.DB.prepare("UPDATE organizer_webauthn_challenges SET consumed_at = CURRENT_TIMESTAMP WHERE id = ?").bind(challenge.id),
+    c.env.DB.prepare("UPDATE passkeys SET counter = ? WHERE id = ?").bind(verification.authenticationInfo.newCounter, passkey.id),
+    c.env.DB.prepare("INSERT INTO organizer_sessions (id, user_id, organization_id, token_hash, expires_at) VALUES (?, ?, ?, ?, datetime('now', '+12 hours'))")
+      .bind(crypto.randomUUID(), passkey.user_id, membership.organization_id, await sha256(sessionToken)),
+  ]);
+  c.header("Set-Cookie", organizerCookie(sessionToken));
+  return c.json({ role: membership.role });
+});
+
+app.post("/api/setup/initial-admin/options", async (c) => {
+  const body = await jsonBody(c);
+  const organizationName = optionalString(body.organizationName)?.trim() || "既定ワークスペース";
+  const displayName = requiredString(body, "displayName");
+  const email = optionalString(body.email)?.trim().toLowerCase();
+  const avatarUrl = optionalAvatarUrl(body.avatarUrl);
+  if (!displayName || displayName.length > 100 || (email && !email.includes("@")) || (body.avatarUrl !== undefined && !avatarUrl)) return badRequest(c, "displayName is required");
+  if (await c.env.DB.prepare("SELECT id FROM organizations LIMIT 1").first()) return c.json({ error: "initial_setup_complete" }, 409);
+  const options = await generateRegistrationOptions({
+    rpName: c.env.RP_NAME, rpID: c.env.RP_ID, userID: crypto.getRandomValues(new Uint8Array(16)),
+    userName: email ?? displayName, userDisplayName: displayName, attestationType: "none",
+    authenticatorSelection: { residentKey: "required", userVerification: "required" },
+  });
+  const challengeId = crypto.randomUUID();
+  await c.env.DB.prepare("INSERT INTO initial_admin_challenges (id, organization_name, display_name, email_normalized, avatar_url, challenge, expires_at) VALUES (?, ?, ?, ?, ?, ?, datetime('now', '+5 minutes'))")
+    .bind(challengeId, organizationName, displayName, email ?? null, avatarUrl ?? null, options.challenge).run();
+  return c.json({ challengeId, options });
+});
+
+app.post("/api/setup/initial-admin/verify", async (c) => {
+  const body = await jsonBody(c);
+  const challengeId = requiredString(body, "challengeId");
+  const response = body.response;
+  if (!challengeId || !isRegistrationResponse(response)) return badRequest(c, "invalid registration response");
+  const challenge = await c.env.DB.prepare("SELECT id, organization_name, display_name, email_normalized, avatar_url, challenge FROM initial_admin_challenges WHERE id = ? AND consumed_at IS NULL AND expires_at > CURRENT_TIMESTAMP")
+    .bind(challengeId).first<{ id: string; organization_name: string; display_name: string; email_normalized: string | null; avatar_url: string | null; challenge: string }>();
+  if (!challenge || await c.env.DB.prepare("SELECT id FROM organizations LIMIT 1").first()) return c.json({ error: "initial_setup_unavailable" }, 409);
+  const verification = await verifyRegistrationResponse({ response, expectedChallenge: challenge.challenge, expectedOrigin: c.env.APP_ORIGIN, expectedRPID: c.env.RP_ID, requireUserVerification: true });
+  if (!verification.verified || !verification.registrationInfo) return c.json({ error: "passkey_verification_failed" }, 400);
+  const organizationId = crypto.randomUUID(), userId = crypto.randomUUID();
+  const credential = verification.registrationInfo.credential;
+  const sessionToken = randomToken();
+  await c.env.DB.batch([
+    c.env.DB.prepare("UPDATE initial_admin_challenges SET consumed_at = CURRENT_TIMESTAMP WHERE id = ?").bind(challenge.id),
+    c.env.DB.prepare("INSERT INTO organizations (id, name) VALUES (?, ?)").bind(organizationId, challenge.organization_name),
+    c.env.DB.prepare("INSERT INTO users (id, display_name, email_normalized, avatar_url) VALUES (?, ?, ?, ?)").bind(userId, challenge.display_name, challenge.email_normalized, challenge.avatar_url),
+    c.env.DB.prepare("INSERT INTO organization_members (organization_id, user_id, role) VALUES (?, ?, 'owner')").bind(organizationId, userId),
+    c.env.DB.prepare("INSERT INTO passkeys (id, user_id, credential_id, public_key, counter, transports_json, prf_capable) VALUES (?, ?, ?, ?, ?, ?, ?)").bind(crypto.randomUUID(), userId, credential.id, credential.publicKey, credential.counter, JSON.stringify(response.response.transports ?? []), hasPrfEnabled(response.clientExtensionResults) ? 1 : 0),
+    c.env.DB.prepare("INSERT INTO organizer_sessions (id, user_id, organization_id, token_hash, expires_at) VALUES (?, ?, ?, ?, datetime('now', '+12 hours'))")
+      .bind(crypto.randomUUID(), userId, organizationId, await sha256(sessionToken)),
+  ]);
+  c.header("Set-Cookie", organizerCookie(sessionToken));
+  return c.json({ role: "owner" }, 201);
+});
 
 app.use("/api/organizations/*", requireOrganizer);
 app.use("/api/events", requireOrganizer);
@@ -959,48 +947,11 @@ async function requireOrganizer(c: Context<AppEnv>, next: () => Promise<void>) {
   }
   const sessionToken = cookieValue(c.req.header("cookie"), "tsudoi_organizer");
   if (!sessionToken) return c.json({ error: "unauthorized" }, 401);
-  const session = await c.env.DB.prepare(`SELECT s.id, s.user_id, s.organization_id, m.role,
-      s.oidc_sid, s.oidc_sub, s.oidc_auth_time, s.oidc_lease_expires_at, s.oidc_parent_expires_at, s.oidc_idle_timeout
+  const session = await c.env.DB.prepare(`SELECT s.user_id, s.organization_id, m.role
     FROM organizer_sessions s JOIN organization_members m ON m.organization_id = s.organization_id AND m.user_id = s.user_id
     WHERE s.token_hash = ? AND s.revoked_at IS NULL AND s.expires_at > CURRENT_TIMESTAMP`)
-    .bind(await sha256(sessionToken)).first<{ id: string; user_id: string; organization_id: string; role: Role;
-      oidc_sid: string | null; oidc_sub: string | null; oidc_auth_time: number | null; oidc_lease_expires_at: number | null; oidc_parent_expires_at: number | null; oidc_idle_timeout: number | null }>();
+    .bind(await sha256(sessionToken)).first<{ user_id: string; organization_id: string; role: Role }>();
   if (!session) return c.json({ error: "unauthorized" }, 401);
-  if (!session.oidc_sid && oidcConfigured(c.env)) return c.json({ error: "unauthorized" }, 401);
-  if (session.oidc_sid) {
-    if (!oidcConfigured(c.env) || !session.oidc_sub || session.oidc_auth_time === null || session.oidc_lease_expires_at === null || session.oidc_parent_expires_at === null || session.oidc_idle_timeout === null) return c.json({ error: "oidc_session_unavailable" }, 503);
-    const now = Math.floor(Date.now() / 1000);
-    if (now >= session.oidc_parent_expires_at) return c.json({ error: "oidc_session_expired" }, 401);
-    let leaseExpiry = session.oidc_lease_expires_at;
-    let parentExpiry = session.oidc_parent_expires_at;
-    let idleTimeout = session.oidc_idle_timeout;
-    if (now >= leaseExpiry) {
-      try {
-        const checked = await checkSession(oidcConfig(c.env), session.oidc_sid, session.oidc_sub, session.oidc_auth_time);
-        if (!checked) {
-          await c.env.DB.prepare("UPDATE organizer_sessions SET revoked_at = CURRENT_TIMESTAMP WHERE oidc_sid = ? AND revoked_at IS NULL").bind(session.oidc_sid).run();
-          return c.json({ error: "oidc_session_inactive" }, 401);
-        }
-        const updated = await c.env.DB.prepare("UPDATE organizer_sessions SET oidc_lease_expires_at = ?, oidc_parent_expires_at = ?, oidc_idle_timeout = ? WHERE id = ? AND revoked_at IS NULL AND oidc_lease_expires_at = ?")
-          .bind(checked.leaseExpiresAt, checked.parentExpiresAt, checked.idleTimeout, session.id, session.oidc_lease_expires_at).run();
-        if (updated.meta.changes !== 1) {
-          const latest = await c.env.DB.prepare("SELECT revoked_at, oidc_lease_expires_at, oidc_parent_expires_at, oidc_idle_timeout FROM organizer_sessions WHERE id = ?").bind(session.id).first<{ revoked_at: string | null; oidc_lease_expires_at: number; oidc_parent_expires_at: number; oidc_idle_timeout: number }>();
-          if (!latest || latest.revoked_at || latest.oidc_lease_expires_at <= now) return c.json({ error: "oidc_session_unavailable" }, 503);
-          leaseExpiry = latest.oidc_lease_expires_at;
-          parentExpiry = latest.oidc_parent_expires_at;
-          idleTimeout = latest.oidc_idle_timeout;
-        } else { leaseExpiry = checked.leaseExpiresAt; parentExpiry = checked.parentExpiresAt; idleTimeout = checked.idleTimeout; }
-      } catch {
-        return c.json({ error: "oidc_session_unavailable" }, 503);
-      }
-    }
-    if (leaseExpiry <= Math.floor(Date.now() / 1000)) return c.json({ error: "oidc_session_unavailable" }, 503);
-    const idleExpiry = Math.min(parentExpiry, now + idleTimeout);
-    const refreshed = await c.env.DB.prepare("UPDATE organizer_sessions SET expires_at = datetime(?, 'unixepoch') WHERE id = ? AND revoked_at IS NULL AND oidc_lease_expires_at > ?")
-      .bind(idleExpiry, session.id, now).run();
-    if (refreshed.meta.changes !== 1) return c.json({ error: "oidc_session_unavailable" }, 503);
-    c.header("Set-Cookie", organizerCookie(sessionToken, Math.max(0, idleExpiry - now)));
-  }
   const scopes = session.role === "owner" || session.role === "admin" ? ["admin"] : session.role === "staff" ? ["roster:read", "checkin:write"] : [];
   c.set("auth", { actorId: session.user_id, organizationId: session.organization_id, scopes, role: session.role, kind: "session" });
   await next();

@@ -17,7 +17,7 @@ Snapshot: [`stats/stats.md`](stats/stats.md)
 
 ## Current implementation
 
-- Multi-tenant organizations, events, venues, mikaki OIDC organizer sessions, and role-scoped API tokens for future integrations
+- Multi-tenant organizations, events, venues, Passkey organizer sessions, and role-scoped API tokens for future integrations
 - Configurable registration fields and roster data model
 - Individual ticket tokens and atomic duplicate-safe check-in
 - Attendee Passkey registration and session issuance
@@ -46,8 +46,6 @@ npm run db:migrate:production
 ```
 
 Apply the remote migration after the first deployment has provisioned the selected D1 database. The Deploy to Cloudflare button continues to use the public template; environment-specific deploys use the local wrapper.
-
-For optional organizer sign-in through mikaki OIDC, see [mikaki OIDC 接続](docs/mikaki-oidc.md). Apply the OIDC migration before deploying a Worker that uses OIDC sessions.
 
 ## Local development
 
