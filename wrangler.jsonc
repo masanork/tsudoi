@@ -30,6 +30,9 @@
     "APP_ORIGIN": "http://localhost:8787",
     "RP_ID": "localhost",
     "RP_NAME": "tsudoi",
+    "OIDC_ISSUER": "",
+    "OIDC_CLIENT_ID": "",
+    "OIDC_KEY_ID": "",
     "EMAIL_FROM": "noreply@example.com"
   },
 
@@ -54,6 +57,9 @@
         "APP_ORIGIN": "https://staging.tsudoi.example.com",
         "RP_ID": "staging.tsudoi.example.com",
         "RP_NAME": "tsudoi (staging)",
+        "OIDC_ISSUER": "https://mikaki.tossa.app",
+        "OIDC_CLIENT_ID": "",
+        "OIDC_KEY_ID": "",
         "EMAIL_FROM": "noreply@example.com"
       }
     },
@@ -79,6 +85,9 @@
         "APP_ORIGIN": "https://tsudoi.example.com",
         "RP_ID": "tsudoi.example.com",
         "RP_NAME": "tsudoi",
+        "OIDC_ISSUER": "https://mikaki.tossa.app",
+        "OIDC_CLIENT_ID": "",
+        "OIDC_KEY_ID": "",
         "EMAIL_FROM": "noreply@example.com"
       }
     }

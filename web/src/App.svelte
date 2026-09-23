@@ -1,22 +1,21 @@
 <script lang="ts">
   import { onMount } from "svelte";
-  import { startAuthentication, startRegistration } from "@simplewebauthn/browser";
+  import { startRegistration } from "@simplewebauthn/browser";
   import QRCode from "qrcode";
 
   type ParticipantTicket = { id: string; status: string; event_name: string; starts_at: string; ends_at: string; timezone: string; venue_name: string | null; cancellation_closes_at: string | null };
-  let administratorName = "";
-  let administratorEmail = "";
-  let administratorAvatarUrl = "";
   let organizationId = "";
   let profileName = "";
   let profileEmail = "";
   let profileAvatarUrl = "";
   let profileMessage = "";
   let initialSetupRequired = false;
+  let bootstrapToken = "";
+  let oidcEnabled = false;
   let workspaceReady = false;
   let isAdministrator = false;
   let screen: "setup" | "home" | "event" | "admin" = "setup";
-  let setupMessage = "この tsudoi を使い始めるには、初期管理者の Passkey を登録してください。";
+  let setupMessage = "mikaki でログインしてください。";
   let events: Array<{ id: string; name: string; starts_at: string; ends_at: string; status: string; scheduling_enabled?: number; schedule_status?: string }> = [];
   let message = "イベントを読み込んでいます。";
   let eventName = "";
@@ -95,11 +94,6 @@
   function toggleDate(dates: string[], date: string) { return dates.includes(date) ? dates.filter((item) => item !== date) : [...dates, date].sort(); }
   function toggleInitialDate(date: string) { initialScheduleOptions = toggleDate(initialScheduleOptions.map((option) => option.date), date).map((selectedDate) => initialScheduleOptions.find((option) => option.date === selectedDate) ?? { date: selectedDate, note: "" }); }
   function toggleScheduleDraftDate(date: string) { scheduleDraftDates = toggleDate(scheduleDraftDates, date); }
-  async function selectAdministratorAvatar(file: File | undefined) {
-    if (!file) return;
-    if (!["image/png", "image/jpeg", "image/webp"].includes(file.type) || file.size > 200_000) { setupMessage = "画像は PNG・JPEG・WebP の200KB以下にしてください。"; return; }
-    administratorAvatarUrl = await new Promise<string>((resolve, reject) => { const reader = new FileReader(); reader.onload = () => resolve(String(reader.result)); reader.onerror = () => reject(new Error("画像を読み込めませんでした。")); reader.readAsDataURL(file); });
-  }
   async function selectProfileAvatar(file: File | undefined) {
     if (!file) return;
     if (!["image/png", "image/jpeg", "image/webp"].includes(file.type) || file.size > 200_000) { profileMessage = "画像は PNG・JPEG・WebP の200KB以下にしてください。"; return; }
@@ -107,6 +101,7 @@
   }
 
   onMount(() => {
+    void fetch("/api/oidc/status").then((response) => response.json()).then((status) => { oidcEnabled = status.enabled === true; }).catch(() => {});
     if (ticketPage) void loadParticipantTicket();
     else if (registrationEventId) void loadRegistration();
     else if (scheduleEventId) { scheduleRespondentId = localStorage.getItem(`tsudoi-schedule-${scheduleEventId}`) ?? crypto.randomUUID(); localStorage.setItem(`tsudoi-schedule-${scheduleEventId}`, scheduleRespondentId); void loadPublicSchedule(); }
@@ -158,41 +153,24 @@
       const session = await api("/session");
       organizationId = session.organizationId; isAdministrator = session.role === "owner" || session.role === "admin";
       workspaceReady = true; screen = "home"; await Promise.all([loadEvents(), loadProfile()]);
-    } catch { screen = "setup"; setupMessage = "Passkey でログインしてください。"; }
-  }
-  async function registerInitialAdministrator() {
-    try {
-      if (!administratorName.trim()) throw new Error("お名前を入力してください。");
-      if (!window.PublicKeyCredential) throw new Error("この端末は Passkey に対応していません。");
-      setupMessage = "Passkey を登録しています…";
-      const optionsResponse = await fetch("/api/setup/initial-admin/options", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ displayName: administratorName.trim(), email: administratorEmail.trim() || undefined, avatarUrl: administratorAvatarUrl || undefined }) });
-      const optionBody = await optionsResponse.json();
-      if (!optionsResponse.ok) throw new Error(optionBody.message ?? optionBody.error ?? "初期設定に失敗しました。");
-      const credential = await startRegistration({ optionsJSON: optionBody.options });
-      const response = await fetch("/api/setup/initial-admin/verify", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ challengeId: optionBody.challengeId, response: credential }) });
-      const session = await response.json();
-      if (!response.ok) throw new Error(session.message ?? session.error ?? "初期設定に失敗しました。");
-      isAdministrator = true; workspaceReady = true; screen = "home";
-      await Promise.all([loadEvents(), loadProfile()]); message = "初期管理者を登録しました。まずはイベントを作成しましょう。";
-    } catch (error) { setupMessage = error instanceof Error ? error.message : "Passkey を登録できませんでした。"; }
+      const oidcResult = new URLSearchParams(window.location.search).get("oidc");
+      if (oidcResult === "failed" || oidcResult === "inactive") message = "mikaki での確認が完了しませんでした。もう一度お試しください。";
+    } catch {
+      screen = "setup";
+      const oidcResult = new URLSearchParams(window.location.search).get("oidc");
+      setupMessage = oidcResult === "unlinked" ? "この mikaki アカウントには tsudoi の利用権限がありません。" : oidcResult === "failed" || oidcResult === "inactive" ? "mikaki での確認が完了しませんでした。もう一度お試しください。" : "mikaki でログインしてください。";
+    }
   }
   function openEvent(eventId: string) { selectedEventId = eventId; screen = "event"; void selectEvent(eventId); }
-  async function signIn() {
+  async function signOut() { await fetch("/api/session/logout", { method: "POST", credentials: "same-origin" }); workspaceReady = false; isAdministrator = false; events = []; screen = "setup"; setupMessage = "mikaki でログインしてください。"; }
+  async function startOidc() {
     try {
-      if (!window.PublicKeyCredential) throw new Error("この端末は Passkey に対応していません。");
-      setupMessage = "Passkey を確認しています…";
-      const optionsResponse = await fetch("/api/session/options", { method: "POST", credentials: "same-origin" });
-      const optionBody = await optionsResponse.json();
-      if (!optionsResponse.ok) throw new Error(optionBody.message ?? optionBody.error ?? "ログインを開始できません。");
-      const credential = await startAuthentication({ optionsJSON: optionBody.options });
-      const response = await fetch("/api/session/verify", { method: "POST", credentials: "same-origin", headers: { "content-type": "application/json" }, body: JSON.stringify({ challengeId: optionBody.challengeId, response: credential }) });
-      const session = await response.json();
-      if (!response.ok) throw new Error(session.message ?? session.error ?? "Passkey を確認できませんでした。");
-      organizationId = session.organizationId ?? organizationId; isAdministrator = session.role === "owner" || session.role === "admin";
-      workspaceReady = true; screen = "home"; await Promise.all([loadEvents(), loadProfile()]);
-    } catch (error) { setupMessage = error instanceof Error ? error.message : "Passkey でログインできませんでした。"; }
+      const response = await fetch("/api/oidc/login/start", { method: "POST", credentials: "same-origin", headers: { "content-type": "application/json" }, body: JSON.stringify(initialSetupRequired ? { bootstrapToken } : {}) });
+      const body = await response.json();
+      if (!response.ok || typeof body.authorizationUrl !== "string") throw new Error(body.error === "invalid_bootstrap_token" ? "初期設定コードを確認してください。" : "mikaki に接続できませんでした。");
+      window.location.assign(body.authorizationUrl);
+    } catch (error) { setupMessage = error instanceof Error ? error.message : "mikaki に接続できませんでした。"; }
   }
-  async function signOut() { await fetch("/api/session/logout", { method: "POST", credentials: "same-origin" }); workspaceReady = false; isAdministrator = false; events = []; screen = "setup"; setupMessage = "Passkey でログインしてください。"; }
   async function loadParticipantTicket() {
     try {
       const response = await fetch("/api/participant/ticket", { credentials: "same-origin" });
@@ -349,20 +327,17 @@
   {#if issuedTicket}<section aria-labelledby="passkey-registration"><h2 id="passkey-registration">Passkey を登録する</h2><p>この端末でチケットを安全に再表示できるようにします。PRF対応Passkeyでは、E2EE鍵の保護にも使用します。</p><button onclick={registerPasskey}>Passkey を登録</button>{#if passkeyMessage}<p class="notice" aria-live="polite">{passkeyMessage}</p>{/if}</section>{/if}
 {:else}
   {#if !workspaceReady || screen === "setup"}
-    <header><p class="eyebrow">WELCOME TO TSUDOI</p><h1>tsudoi</h1><p>{initialSetupRequired ? "最初に、初期管理者を登録します。" : "Passkey でログインします。"}</p></header>
-    <section class="focus-card" aria-labelledby="initial-admin"><h2 id="initial-admin">{initialSetupRequired ? "初期管理者の Passkey を登録" : "Passkey でログイン"}</h2>
-      {#if initialSetupRequired}<p>この端末の Passkey で管理を始めます。イベントごとに主催者・共同主催者を設定できます。</p>
-        <label>お名前<input bind:value={administratorName} autocomplete="name" placeholder="例: 山田 太郎" required /></label>
-        <div class="avatar-setup"><img src={administratorAvatarUrl || identiconUrl(administratorName)} alt="プロフィール画像のプレビュー" /><div><label>プロフィール画像（任意）<input accept="image/png,image/jpeg,image/webp" onchange={(event) => void selectAdministratorAvatar(event.currentTarget.files?.[0])} type="file" /></label><p class="muted">未設定時は名前から作る Identicon を使います。PNG・JPEG・WebP、200KB以下。</p>{#if administratorAvatarUrl}<button type="button" class="quiet" onclick={() => administratorAvatarUrl = ""}>画像を外す</button>{/if}</div></div>
-        <label>メールアドレス（任意・非公開）<input bind:value={administratorEmail} autocomplete="email" type="email" placeholder="通知・復旧用" /></label>
-        <button onclick={registerInitialAdministrator}>Passkey を登録して始める</button>
-      {:else}<p>登録済みの Passkey を使って管理画面を開きます。</p><button onclick={signIn}>Passkey でログイン</button>{/if}
+    <header><p class="eyebrow">WELCOME TO TSUDOI</p><h1>tsudoi</h1><p>{initialSetupRequired ? "最初の管理者を mikaki で登録します。" : "mikaki でログインします。"}</p></header>
+    <section class="focus-card" aria-labelledby="initial-admin"><h2 id="initial-admin">{initialSetupRequired ? "初期管理者を登録" : "ログイン"}</h2>
+      <p>{initialSetupRequired ? "初期設定コードを入力し、mikaki で本人確認したアカウントを管理者として登録します。" : "mikaki アカウントで管理画面を開きます。"}</p>
+      {#if initialSetupRequired}<label>初期設定コード<input bind:value={bootstrapToken} type="password" autocomplete="off" required /></label>{/if}
+      {#if oidcEnabled}<button disabled={initialSetupRequired && !bootstrapToken.trim()} onclick={() => void startOidc()}>mikaki で続ける</button>{:else}<p>mikaki への接続設定が完了していません。</p>{/if}
       <p class="notice" aria-live="polite">{setupMessage}</p>
     </section>
   {:else}
     <header class="app-header"><div><p class="eyebrow">EVENT ROSTER</p><h1>tsudoi</h1></div><nav aria-label="管理ナビゲーション">
       {#if screen !== "home"}<button class="quiet" onclick={() => screen = "home"}>イベント</button>{/if}
-      {#if isAdministrator}<button class="quiet" onclick={() => screen = "admin"}>管理メニュー</button>{/if}
+      <button class="quiet" onclick={() => screen = "admin"}>プロフィール・ログイン</button>
     </nav></header>
     {#if screen === "home"}
       <p class="notice" aria-live="polite">{message}</p>

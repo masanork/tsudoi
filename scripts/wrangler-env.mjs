@@ -32,6 +32,9 @@ config.vars = {
   ...(values.APP_ORIGIN ? { APP_ORIGIN: values.APP_ORIGIN } : {}),
   ...(values.RP_ID ? { RP_ID: values.RP_ID } : {}),
   ...(values.RP_NAME ? { RP_NAME: values.RP_NAME } : {}),
+  ...(values.OIDC_ISSUER ? { OIDC_ISSUER: values.OIDC_ISSUER } : {}),
+  ...(values.OIDC_CLIENT_ID ? { OIDC_CLIENT_ID: values.OIDC_CLIENT_ID } : {}),
+  ...(values.OIDC_KEY_ID ? { OIDC_KEY_ID: values.OIDC_KEY_ID } : {}),
   ...(values.EMAIL_FROM ? { EMAIL_FROM: values.EMAIL_FROM } : {}),
 };
 

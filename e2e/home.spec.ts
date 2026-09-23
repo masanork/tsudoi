@@ -1,8 +1,9 @@
 import { expect, test } from "@playwright/test";
-test("shows initial setup or Passkey login without credential fields", async ({ page }) => {
+test("shows mikaki setup or login without local Passkey controls", async ({ page }) => {
   await page.goto("/");
   await expect(page.getByRole("heading", { name: "tsudoi" })).toBeVisible();
-  await expect(page.getByRole("heading", { name: /初期管理者の Passkey を登録|Passkey でログイン/ })).toBeVisible();
+  await expect(page.getByRole("heading", { name: /初期管理者を登録|ログイン/ })).toBeVisible();
+  await expect(page.getByRole("button", { name: "Passkey でログイン" })).not.toBeVisible();
   await expect(page.getByLabel("API トークン")).not.toBeVisible();
   await expect(page.getByLabel("組織 ID")).not.toBeVisible();
 });
