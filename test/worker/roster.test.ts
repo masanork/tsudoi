@@ -1,5 +1,6 @@
 import { env, SELF } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
+import { app } from "../../src/index";
 
 async function createApiOrganization(name: string) {
   const organizationId = crypto.randomUUID();
@@ -808,6 +809,204 @@ describe("OAuth scheduling boundaries", () => {
     expect(denied.status).toBe(401);
     const insecure = await SELF.fetch("https://tsudoi.test/oauth/register", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ redirect_uris: ["http://example.test/callback"] }) });
     expect(insecure.status).toBe(400);
+  });
+});
+
+describe("reviewed CSV import boundaries", () => {
+  it("imports 100 attendees with 9,000 real answer values without row-per-answer D1 statements", async () => {
+    const { sessionToken, organizationId } = await createOrganizerSession("Bulk CSV answers");
+    const auth = { "content-type": "application/json", cookie: `tsudoi_organizer=${sessionToken}` };
+    const eventResponse = await SELF.fetch(`https://tsudoi.test/api/organizations/${organizationId}/events`, { method: "POST", headers: auth, body: JSON.stringify({ name: "Bulk answers", startsAt: "2026-12-10", registrationMode: "hybrid" }) });
+    const { id: eventId } = await eventResponse.json<{ id: string }>();
+    const venueResponse = await SELF.fetch(`https://tsudoi.test/api/events/${eventId}/venues`, { method: "POST", headers: auth, body: JSON.stringify({ name: "Tokyo Hall" }) });
+    const { id: venueId } = await venueResponse.json<{ id: string }>();
+    const fields = [
+      ["answer_text", "text", []], ["answer_number", "number", []], ["answer_multi", "multi_select", ["Blue", "Green"]],
+      ["answer_check", "checkbox", []], ["answer_consent", "consent", []], ["answer_date", "date", []],
+      ["answer_choice", "single_select", ["A", "B"]], ["answer_note", "textarea", []], ["answer_extra1", "text", []], ["answer_extra2", "text", []],
+    ] as const;
+    const extraFields = Array.from({ length: 80 }, (_, index) => [`answer_bulk_${String(index + 10).padStart(2, "0")}`, `answer_bulk_${String(index + 10).padStart(2, "0")}`] as const);
+    for (const [key, type, options] of fields) {
+      const response = await SELF.fetch(`https://tsudoi.test/api/events/${eventId}/form-fields`, { method: "POST", headers: auth, body: JSON.stringify({ key, label: key, type, options, required: key !== "answer_check" }) });
+      expect(response.status).toBe(201);
+    }
+    await env.DB.batch(extraFields.map(([key, label]) => env.DB.prepare("INSERT INTO form_fields (id, event_id, field_key, label, field_type, required, options_json) VALUES (?, ?, ?, ?, 'text', 1, '[]')").bind(crypto.randomUUID(), eventId, key, label)));
+    const allFieldKeys = [...fields.map(([key]) => key), ...extraFields.map(([key]) => key)];
+    const columns = ["Name", "Affiliation", "Email", "Venue", ...allFieldKeys];
+    const mapping = { name: "Name", affiliation: "Affiliation", email: "Email", venueId: "Venue", ...Object.fromEntries(allFieldKeys.map((key) => [`answer:${key}`, key])) };
+    const valuesForRow = (index: number) => [
+      `Guest ${String(index).padStart(3, "0")}`, `Organization ${index % 7}`, `bulk-${index}@example.test`, "Tokyo Hall",
+      `free text ${index}`, String(index % 2 === 0 ? 0 : -2.5), index % 2 === 0 ? "Blue|Green" : "Green", index % 2 === 0 ? "true" : "false",
+      "yes", "2026-12-10", index % 2 === 0 ? "A" : "B", `note ${index}`, `extra ${index}`, `second ${index}`,
+      ...extraFields.map(([key]) => `${key}:${index}`),
+    ];
+    const previewResponse = await SELF.fetch(`https://tsudoi.test/api/events/${eventId}/roster/import/preview`, { method: "POST", headers: auth, body: JSON.stringify({ columns, rows: Array.from({ length: 100 }, (_, index) => valuesForRow(index)), mapping }) });
+    expect(previewResponse.status).toBe(200);
+    const preview = await previewResponse.json<{ previewToken: string; rows: Array<{ rowIndex: number; errors: string[] }> }>();
+    expect(preview.rows).toHaveLength(100);
+    expect(preview.rows.map((row) => row.errors).filter((errors) => errors.length > 0).slice(0, 3)).toEqual([]);
+
+    let executedStatements = 0, maxBatchStatements = 0, maxSqlBytes = 0, maxBindCount = 0, maxStringArgumentBytes = 0;
+    const wrapStatement = (statement: D1PreparedStatement): D1PreparedStatement => new Proxy(statement, {
+      get(target, property) {
+        const value = Reflect.get(target, property, target);
+        if (property === "bind") return (...args: unknown[]) => {
+          maxBindCount = Math.max(maxBindCount, args.length);
+          for (const value of args) if (typeof value === "string") maxStringArgumentBytes = Math.max(maxStringArgumentBytes, new TextEncoder().encode(value).byteLength);
+          return wrapStatement(target.bind(...args));
+        };
+        if (["run", "all", "first", "raw"].includes(String(property))) return (...args: unknown[]) => { executedStatements++; return value.apply(target, args); };
+        return typeof value === "function" ? value.bind(target) : value;
+      },
+    });
+    const countedDb = new Proxy(env.DB, {
+      get(target, property) {
+        if (property === "prepare") return (...args: Parameters<typeof target.prepare>) => { maxSqlBytes = Math.max(maxSqlBytes, new TextEncoder().encode(String(args[0])).byteLength); return wrapStatement(target.prepare(...args)); };
+        if (property === "batch") return (statements: Parameters<typeof target.batch>[0]) => { executedStatements += statements.length; maxBatchStatements = Math.max(maxBatchStatements, statements.length); return target.batch(statements); };
+        const value = Reflect.get(target, property, target);
+        return typeof value === "function" ? value.bind(target) : value;
+      },
+    });
+    const countedEnv = new Proxy(env, { get(target, property) { return property === "DB" ? countedDb : Reflect.get(target, property, target); } });
+    const request = new Request(`https://tsudoi.test/api/events/${eventId}/roster/import/commit`, { method: "POST", headers: auth, body: JSON.stringify({ previewToken: preview.previewToken, decisions: preview.rows.map((row) => ({ rowIndex: row.rowIndex, action: "include" })) }) });
+    const context = { waitUntil: (_promise: Promise<unknown>) => {}, passThroughOnException: () => {} };
+    const committed = await app.fetch(request, countedEnv as never, context as never);
+    expect(committed.status).toBe(201);
+    await expect(committed.json()).resolves.toEqual({ imported: 100, skipped: 0 });
+    expect(executedStatements).toBeLessThan(50);
+    expect(maxBatchStatements).toBeLessThan(50);
+    expect(maxBindCount).toBeLessThanOrEqual(100);
+    expect(maxSqlBytes).toBeLessThan(100_000);
+    expect(maxStringArgumentBytes).toBeLessThan(2_000_000);
+    console.info("CSV import D1 commit metrics", { executedStatements, maxBatchStatements, maxBindCount, maxSqlBytes, maxStringArgumentBytes });
+    await expect(env.DB.prepare("SELECT COUNT(*) AS total FROM attendees WHERE event_id = ?").bind(eventId).first()).resolves.toMatchObject({ total: 100 });
+    await expect(env.DB.prepare("SELECT COUNT(*) AS total FROM tickets WHERE event_id = ?").bind(eventId).first()).resolves.toMatchObject({ total: 100 });
+    await expect(env.DB.prepare("SELECT COUNT(*) AS total FROM attendee_answers a JOIN attendees p ON p.id = a.attendee_id WHERE p.event_id = ?").bind(eventId).first()).resolves.toMatchObject({ total: 9000 });
+    await expect(env.DB.prepare("SELECT COUNT(*) AS total FROM audit_logs WHERE action = 'attendee.imported' AND target_id IN (SELECT id FROM attendees WHERE event_id = ?)").bind(eventId).first()).resolves.toMatchObject({ total: 100 });
+    await expect(env.DB.prepare("SELECT venue_id FROM attendees WHERE event_id = ? ORDER BY name LIMIT 1").bind(eventId).first()).resolves.toEqual({ venue_id: venueId });
+  });
+
+  it("validates event-local venue names and IDs and rejects non-finite CSV numbers while accepting finite boundaries", async () => {
+    const { sessionToken, organizationId } = await createOrganizerSession("CSV venue and number validation");
+    const auth = { "content-type": "application/json", cookie: `tsudoi_organizer=${sessionToken}` };
+    const createEvent = async (name: string) => {
+      const response = await SELF.fetch(`https://tsudoi.test/api/organizations/${organizationId}/events`, { method: "POST", headers: auth, body: JSON.stringify({ name, startsAt: "2026-12-10", registrationMode: "hybrid" }) });
+      return (await response.json<{ id: string }>()).id;
+    };
+    const eventId = await createEvent("CSV validation");
+    const otherEventId = await createEvent("Other event");
+    const createVenue = async (targetEvent: string, name: string) => {
+      const response = await SELF.fetch(`https://tsudoi.test/api/events/${targetEvent}/venues`, { method: "POST", headers: auth, body: JSON.stringify({ name }) });
+      return (await response.json<{ id: string }>()).id;
+    };
+    const localId = await createVenue(eventId, "East Hall");
+    await createVenue(eventId, "Duplicate Hall");
+    await createVenue(eventId, "Duplicate Hall");
+    const foreignId = await createVenue(otherEventId, "Foreign Hall");
+    const numberField = await SELF.fetch(`https://tsudoi.test/api/events/${eventId}/form-fields`, { method: "POST", headers: auth, body: JSON.stringify({ key: "score", label: "Score", type: "number" }) });
+    expect(numberField.status).toBe(201);
+    const columns = ["Name", "Venue", "Score"];
+    const preview = await SELF.fetch(`https://tsudoi.test/api/events/${eventId}/roster/import/preview`, { method: "POST", headers: auth, body: JSON.stringify({
+      columns, mapping: { name: "Name", venueId: "Venue", "answer:score": "Score" },
+      rows: [["By venue name", "East Hall", "0"], ["By venue UUID", localId, "-3.75"], ["Ambiguous", "Duplicate Hall", "Infinity"], ["Foreign UUID", foreignId, "NaN"], ["Missing venue", crypto.randomUUID(), "2.5"]],
+    }) });
+    expect(preview.status).toBe(200);
+    const body = await preview.json<{ rows: Array<{ errors: string[] }> }>();
+    expect(body.rows[0]?.errors).toEqual([]);
+    expect(body.rows[1]?.errors).toEqual([]);
+    expect(body.rows[2]?.errors).toEqual(expect.arrayContaining(["ambiguous_venue_name", "invalid:score"]));
+    expect(body.rows[3]?.errors).toEqual(expect.arrayContaining(["invalid_venue_id", "invalid:score"]));
+    expect(body.rows[4]?.errors).toContain("invalid_venue_id");
+  });
+
+  it("keeps a preview retryable and rolls back if its venue or field schema changes before commit", async () => {
+    const { sessionToken, organizationId } = await createOrganizerSession("CSV schema conflicts");
+    const auth = { "content-type": "application/json", cookie: `tsudoi_organizer=${sessionToken}` };
+    const created = await SELF.fetch(`https://tsudoi.test/api/organizations/${organizationId}/events`, { method: "POST", headers: auth, body: JSON.stringify({ name: "Schema conflict", startsAt: "2026-12-10", registrationMode: "hybrid" }) });
+    const { id: eventId } = await created.json<{ id: string }>();
+    const createVenue = async () => {
+      const response = await SELF.fetch(`https://tsudoi.test/api/events/${eventId}/venues`, { method: "POST", headers: auth, body: JSON.stringify({ name: "Temporary Hall" }) });
+      return (await response.json<{ id: string }>()).id;
+    };
+    const venueId = await createVenue();
+    const venuePreview = await SELF.fetch(`https://tsudoi.test/api/events/${eventId}/roster/import/preview`, { method: "POST", headers: auth, body: JSON.stringify({ columns: ["Name", "Venue"], mapping: { name: "Name", venueId: "Venue" }, rows: [["Venue race", venueId]] }) });
+    const venueToken = (await venuePreview.json<{ previewToken: string }>()).previewToken;
+    await env.DB.prepare("DELETE FROM venues WHERE id = ?").bind(venueId).run();
+    const venueCommit = await SELF.fetch(`https://tsudoi.test/api/events/${eventId}/roster/import/commit`, { method: "POST", headers: auth, body: JSON.stringify({ previewToken: venueToken, decisions: [{ rowIndex: 0, action: "include" }] }) });
+    expect(venueCommit.status).toBe(409);
+    await expect(env.DB.prepare("SELECT consumed_at FROM roster_import_previews WHERE id = ?").bind([...new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(venueToken)))].map((byte) => byte.toString(16).padStart(2, "0")).join("")).first()).resolves.toEqual({ consumed_at: null });
+    await expect(env.DB.prepare("SELECT COUNT(*) AS total FROM attendees WHERE event_id = ?").bind(eventId).first()).resolves.toMatchObject({ total: 0 });
+
+    const replacementVenueId = await createVenue();
+    const fieldResponse = await SELF.fetch(`https://tsudoi.test/api/events/${eventId}/form-fields`, { method: "POST", headers: auth, body: JSON.stringify({ key: "choice", label: "Choice", type: "single_select", options: ["A"] }) });
+    const { id: fieldId } = await fieldResponse.json<{ id: string }>();
+    const schemaPreview = await SELF.fetch(`https://tsudoi.test/api/events/${eventId}/roster/import/preview`, { method: "POST", headers: auth, body: JSON.stringify({ columns: ["Name", "Venue", "Choice"], mapping: { name: "Name", venueId: "Venue", "answer:choice": "Choice" }, rows: [["Schema race", replacementVenueId, "A"]] }) });
+    const schemaToken = (await schemaPreview.json<{ previewToken: string }>()).previewToken;
+    await env.DB.prepare("UPDATE form_fields SET options_json = ? WHERE id = ?").bind(JSON.stringify(["B"]), fieldId).run();
+    const schemaCommit = await SELF.fetch(`https://tsudoi.test/api/events/${eventId}/roster/import/commit`, { method: "POST", headers: auth, body: JSON.stringify({ previewToken: schemaToken, decisions: [{ rowIndex: 0, action: "include" }] }) });
+    expect(schemaCommit.status).toBe(409);
+    const schemaHash = [...new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(schemaToken)))].map((byte) => byte.toString(16).padStart(2, "0")).join("");
+    await expect(env.DB.prepare("SELECT consumed_at, rows_json FROM roster_import_previews WHERE id = ?").bind(schemaHash).first<{ consumed_at: string | null; rows_json: string }>()).resolves.toMatchObject({ consumed_at: null });
+    await expect(env.DB.prepare("SELECT COUNT(*) AS total FROM attendees WHERE event_id = ?").bind(eventId).first()).resolves.toMatchObject({ total: 0 });
+  });
+
+  it("exports and reimports affiliation, venue, and custom answer values", async () => {
+    const { sessionToken, organizationId } = await createOrganizerSession("CSV round trip");
+    const auth = { "content-type": "application/json", cookie: `tsudoi_organizer=${sessionToken}` };
+    const created = await SELF.fetch(`https://tsudoi.test/api/organizations/${organizationId}/events`, { method: "POST", headers: auth, body: JSON.stringify({ name: "Round trip", startsAt: "2026-12-10", registrationMode: "hybrid" }) });
+    const { id: eventId } = await created.json<{ id: string }>();
+    const venueResponse = await SELF.fetch(`https://tsudoi.test/api/events/${eventId}/venues`, { method: "POST", headers: auth, body: JSON.stringify({ name: "North Hall" }) });
+    const { id: venueId } = await venueResponse.json<{ id: string }>();
+    await SELF.fetch(`https://tsudoi.test/api/events/${eventId}/form-fields`, { method: "POST", headers: auth, body: JSON.stringify({ key: "diet", label: "Diet", type: "text" }) });
+    await SELF.fetch(`https://tsudoi.test/api/events/${eventId}/form-fields`, { method: "POST", headers: auth, body: JSON.stringify({ key: "score", label: "Score", type: "number" }) });
+    await SELF.fetch(`https://tsudoi.test/api/events/${eventId}/form-fields`, { method: "POST", headers: auth, body: JSON.stringify({ key: "confirmed", label: "Confirmed", type: "checkbox" }) });
+    await SELF.fetch(`https://tsudoi.test/api/events/${eventId}/form-fields`, { method: "POST", headers: auth, body: JSON.stringify({ key: "favorite", label: "Favorite", type: "multi_select", options: ["salad, green", "rice"] }) });
+    for (const [key, label] of [["name_shadow", "Name"], ["repeat_a", "Repeated"], ["repeat_b", "Repeated"], ["prefix_shadow", "answer:literal"]]) {
+      const response = await SELF.fetch(`https://tsudoi.test/api/events/${eventId}/form-fields`, { method: "POST", headers: auth, body: JSON.stringify({ key, label, type: "text" }) });
+      expect(response.status).toBe(201);
+    }
+    const original = await SELF.fetch(`https://tsudoi.test/api/events/${eventId}/attendees`, { method: "POST", headers: auth, body: JSON.stringify({ name: "Original Guest", email: "original@example.test", affiliation: "Example Org", venueId, answers: { diet: "vegetarian", score: -1.25, confirmed: false, favorite: ["salad, green", "rice"], name_shadow: "Not a display name", repeat_a: "A", repeat_b: "B", prefix_shadow: "prefix value" } }) });
+    expect(original.status).toBe(201);
+    const { attendeeId: originalId } = await original.json<{ attendeeId: string }>();
+    const exported = await SELF.fetch(`https://tsudoi.test/api/events/${eventId}/attendees.csv`, { headers: auth });
+    expect(exported.status).toBe(200);
+    const csv = (await exported.text()).replace(/^\uFEFF/, "");
+    expect(csv.split("\r\n")[0]).toContain("Affiliation");
+    expect(csv.split("\r\n")[0]).toContain("Venue");
+    const [header, data] = csv.split("\r\n").filter(Boolean).map((line) => {
+      const cells: string[] = []; let current = "", quoted = false;
+      for (let index = 0; index < line.length; index++) {
+        const char = line[index]!;
+        if (char === '"' && quoted && line[index + 1] === '"') { current += '"'; index++; }
+        else if (char === '"') quoted = !quoted;
+        else if (char === "," && !quoted) { cells.push(current); current = ""; }
+        else current += char;
+      }
+      cells.push(current); return cells;
+    });
+    const columns = header!;
+    expect(new Set(columns).size).toBe(columns.length);
+    expect(columns).toEqual(expect.arrayContaining(["answer:name_shadow", "answer:repeat_a", "answer:repeat_b", "answer:prefix_shadow"]));
+    const importedValues = data!;
+    const map = (label: string) => columns[columns.indexOf(label)]!;
+    const preview = await SELF.fetch(`https://tsudoi.test/api/events/${eventId}/roster/import/preview`, { method: "POST", headers: auth, body: JSON.stringify({
+      columns, rows: [importedValues], mapping: { name: map("Name"), affiliation: map("Affiliation"), email: map("Email"), venueId: map("Venue"), "answer:diet": map("Diet"), "answer:score": map("Score"), "answer:confirmed": map("Confirmed"), "answer:favorite": map("Favorite"), "answer:name_shadow": map("answer:name_shadow"), "answer:repeat_a": map("answer:repeat_a"), "answer:repeat_b": map("answer:repeat_b"), "answer:prefix_shadow": map("answer:prefix_shadow") },
+    }) });
+    expect(preview.status).toBe(200);
+    const { previewToken, rows } = await preview.json<{ previewToken: string; rows: Array<{ rowIndex: number; errors: string[]; duplicateCandidates: unknown[] }> }>();
+    expect(rows[0]?.errors).toEqual([]);
+    expect(rows[0]?.duplicateCandidates).toHaveLength(1);
+    const committed = await SELF.fetch(`https://tsudoi.test/api/events/${eventId}/roster/import/commit`, { method: "POST", headers: auth, body: JSON.stringify({ previewToken, decisions: [{ rowIndex: 0, action: "include" }] }) });
+    expect(committed.status).toBe(201);
+    const imported = await env.DB.prepare("SELECT id, affiliation, venue_id FROM attendees WHERE event_id = ? AND name = 'Original Guest' AND id != ?").bind(eventId, originalId).first<{ id: string; affiliation: string; venue_id: string }>();
+    expect(imported).toMatchObject({ affiliation: "Example Org", venue_id: venueId });
+    await expect(env.DB.prepare("SELECT value_json FROM attendee_answers WHERE attendee_id = ? AND field_id = (SELECT id FROM form_fields WHERE event_id = ? AND field_key = 'diet')").bind(imported?.id, eventId).first()).resolves.toEqual({ value_json: '"vegetarian"' });
+    await expect(env.DB.prepare("SELECT value_json FROM attendee_answers WHERE attendee_id = ? AND field_id = (SELECT id FROM form_fields WHERE event_id = ? AND field_key = 'score')").bind(imported?.id, eventId).first()).resolves.toEqual({ value_json: "-1.25" });
+    await expect(env.DB.prepare("SELECT value_json FROM attendee_answers WHERE attendee_id = ? AND field_id = (SELECT id FROM form_fields WHERE event_id = ? AND field_key = 'confirmed')").bind(imported?.id, eventId).first()).resolves.toEqual({ value_json: "false" });
+    await expect(env.DB.prepare("SELECT value_json FROM attendee_answers WHERE attendee_id = ? AND field_id = (SELECT id FROM form_fields WHERE event_id = ? AND field_key = 'favorite')").bind(imported?.id, eventId).first()).resolves.toEqual({ value_json: '["salad, green","rice"]' });
+    for (const [key, value] of [["name_shadow", "Not a display name"], ["repeat_a", "A"], ["repeat_b", "B"], ["prefix_shadow", "prefix value"]]) {
+      await expect(env.DB.prepare("SELECT value_json FROM attendee_answers WHERE attendee_id = ? AND field_id = (SELECT id FROM form_fields WHERE event_id = ? AND field_key = ?)").bind(imported?.id, eventId, key).first()).resolves.toEqual({ value_json: JSON.stringify(value) });
+    }
   });
 });
 

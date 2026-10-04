@@ -192,17 +192,22 @@ test("completes Passkey setup, registration, roster reception, duplicate detecti
     } });
     expect(csvEventResponse.status()).toBe(201);
     const { id: csvEventId } = await csvEventResponse.json();
+    expect((await context.request.post(`/api/events/${csvEventId}/venues`, { data: { name: "メイン会場" } })).status()).toBe(201);
     expect((await context.request.post(`/api/events/${csvEventId}/attendees`, { data: { name: "既存参加者" } })).status()).toBe(201);
     expect((await context.request.post(`/api/events/${csvEventId}/form-fields`, { data: { key: "notes", label: "備考", type: "textarea" } })).status()).toBe(201);
+    expect((await context.request.post(`/api/events/${csvEventId}/form-fields`, { data: { key: "custom_name", label: "Name", type: "text" } })).status()).toBe(201);
     await page.goto("/");
     await page.locator("li").filter({ hasText: "CSV取込検証" }).getByRole("button", { name: "管理する", exact: true }).click();
+    await expect(page.getByLabel("CSVファイル", { exact: true })).toBeEnabled();
     await page.getByLabel("CSVファイル", { exact: true }).setInputFiles({
       name: "roster.csv", mimeType: "text/csv",
-      buffer: Buffer.from('\uFEFF名前,会社,備考\r\n既存参加者,,\r\nCSV新規参加者,"新規,所属","複数行の備考\r\n2行目"\r\n,氏名なし,除外する行\r\n'),
+      buffer: Buffer.from('\uFEFF名前,会社,備考,会場,Name\r\n既存参加者,,,,\r\nCSV新規参加者,"新規,所属","複数行の備考\r\n2行目",メイン会場,CSVカスタム回答\r\n,氏名なし,除外する行,,\r\n'),
     });
     await page.getByRole("combobox", { name: "氏名列", exact: true }).selectOption("名前");
     await page.getByRole("combobox", { name: "所属列", exact: true }).selectOption("会社");
     await page.getByRole("combobox", { name: "備考列", exact: true }).selectOption("備考");
+    await page.getByRole("combobox", { name: "会場列", exact: true }).selectOption("会場");
+    await page.getByRole("combobox", { name: "Name列", exact: true }).selectOption("Name");
     await page.getByRole("button", { name: "プレビューを確認", exact: true }).click();
     await expect(page.getByText("新規,所属", { exact: true })).toBeVisible();
     const committed = page.waitForResponse((response) => response.url().endsWith(`/api/events/${csvEventId}/roster/import/commit`));
@@ -212,10 +217,38 @@ test("completes Passkey setup, registration, roster reception, duplicate detecti
     await expect(importedRoster.locator("tbody tr")).toHaveCount(2);
     await expect(importedRoster.locator("tbody tr").filter({ hasText: "CSV新規参加者" })).toContainText("新規,所属");
     await expect(importedRoster.locator("tbody tr").filter({ hasText: "CSV新規参加者" })).toContainText("複数行の備考");
+    await expect(importedRoster.locator("tbody tr").filter({ hasText: "CSV新規参加者" })).toContainText("メイン会場");
     await expect(importedRoster.locator("tbody tr").filter({ hasText: "既存参加者" })).toHaveCount(1);
     await page.setViewportSize({ width: 390, height: 844 });
     expect(await page.getByLabel("CSVファイル", { exact: true }).evaluate((input) => input.getBoundingClientRect().right <= input.parentElement!.getBoundingClientRect().right)).toBe(true);
     await importedRoster.screenshot({ path: "test-results/roster-management-mobile.png" });
+
+    // Exported human-readable venues also work in a different event with different IDs.
+    const exported = await context.request.get(`/api/events/${csvEventId}/attendees.csv`);
+    expect(exported.status()).toBe(200);
+    const copyEvent = await context.request.post("/api/events", { data: {
+      name: "CSV再取込検証", startsAt: "2026-12-12", registrationMode: "hybrid",
+    } });
+    expect(copyEvent.status()).toBe(201);
+    const { id: copyEventId } = await copyEvent.json();
+    expect((await context.request.post(`/api/events/${copyEventId}/venues`, { data: { name: "メイン会場" } })).status()).toBe(201);
+    expect((await context.request.post(`/api/events/${copyEventId}/form-fields`, { data: { key: "notes", label: "備考", type: "textarea" } })).status()).toBe(201);
+    expect((await context.request.post(`/api/events/${copyEventId}/form-fields`, { data: { key: "custom_name", label: "Name", type: "text" } })).status()).toBe(201);
+    await page.goto("/");
+    await page.locator("li").filter({ hasText: "CSV再取込検証" }).getByRole("button", { name: "管理する", exact: true }).click();
+    await expect(page.getByLabel("CSVファイル", { exact: true })).toBeEnabled();
+    await page.getByLabel("CSVファイル", { exact: true }).setInputFiles({ name: "export.csv", mimeType: "text/csv", buffer: await exported.body() });
+    await page.getByRole("button", { name: "プレビューを確認", exact: true }).click();
+    const copied = page.waitForResponse((response) => response.url().endsWith(`/api/events/${copyEventId}/roster/import/commit`));
+    await page.getByRole("button", { name: "取り込みを確定", exact: true }).click();
+    expect((await copied).status()).toBe(201);
+    const copiedRoster = page.getByRole("region", { name: "名簿を管理", exact: true });
+    await expect(copiedRoster.locator("tbody tr")).toHaveCount(2);
+    const copiedParticipant = copiedRoster.locator("tbody tr").filter({ hasText: "CSV新規参加者" });
+    await expect(copiedParticipant).toContainText("新規,所属");
+    await expect(copiedParticipant).toContainText("メイン会場");
+    await expect(copiedParticipant).toContainText("複数行の備考");
+    await expect(copiedParticipant).toContainText("CSVカスタム回答");
 
     // A real viewer session sees roster data without write controls.
     const { organizationId } = await (await context.request.get("/api/session")).json();
