@@ -1,12 +1,12 @@
 # 本番反映・実環境確認ランブック
 
-この手順は次回の本番反映と、実機・実メール・OAuth/MCP 確認に使う。2026-10-05 05:53 JSTに PR4 のマージcommit `6bde4c19ab8f65521aa9e25483d2ceebc177814d` を反映済み。本番 Worker version は `71dcc52b-a3db-4e4c-a54a-56ea5c98b7ef`（100%配信）、本番DBには `0001`〜`0004` が適用済み。[反映記録](releases/2026-10-05-production.md)を参照し、次回は作業直前に状態を再取得する。
+この手順は次回の本番反映と、実機・実メール・OAuth/MCP 確認に使う。PR4を反映後、2026-10-05 07:01 JSTにPNGメール修正の検証済みcommit `19500e0034c41ec6989ebe849e659edb78350c61` を反映した。本番 Worker version は `7586923b-24e7-4187-83df-cc2e888e32d4`（100%配信）、本番DBには `0001`〜`0004` が適用済み。[反映記録](releases/2026-10-05-production.md)を参照し、次回は作業直前に状態を再取得する。
 
 手順を実行する担当者は、本番操作の権限と時間帯を確認し、送信可能な検証用メールアドレスを用意する。実機、メール受信、実 OAuth/MCP クライアントの確認ができない場合は「未確認」と記録し、合格扱いにしない。
 
 ## 1. 対象と作業前確認
 
-1. `main` に PR4 のマージ commit `6bde4c1` が含まれていることを確認し、作業ツリーが clean であることを確認する。
+1. `main` に PR4 のマージ commit `6bde4c1` とPNGメール修正commit `19500e0` が含まれていることを確認し、作業ツリーが clean であることを確認する。
 
    ```bash
    git switch main
@@ -14,6 +14,7 @@
    git status --short
    git log -1 --format='%H %s'
    git merge-base --is-ancestor 6bde4c1 HEAD
+   git merge-base --is-ancestor 19500e0 HEAD
    ```
 
    `git status --short` に出力がある場合は止め、対象を特定してから clean な checkout でやり直す。以降の記録には `git rev-parse HEAD` の完全な commit hash を使う。
@@ -150,7 +151,7 @@ Worker の不具合なら、確認済みの直前 production version を Cloudfl
 
 rollback 先が active になる前にデータ構造の互換性を確認する。どちらの方法でも戻した Git commit と active version ID を記録する。復旧後に health・metadata・ログイン・名簿・受付を再確認する。
 
-直前version `e9dbff5c-488f-4c54-ace4-393f3906a523` は元commitが不明なので、互換性未確認のまま戻さない。新規 `possession-v2` チケットを扱えることを確認したコードを選ぶ。
+PNG修正の直前versionは `71dcc52b-a3db-4e4c-a54a-56ea5c98b7ef`（PR4、SVG添付）。さらに以前のversion `e9dbff5c-488f-4c54-ace4-393f3906a523` は元commitが不明なので、互換性未確認のまま戻さない。新規 `possession-v2` チケットを扱えることを確認したコードを選ぶ。
 
 **`0004` はロールバック時にも保持する。** migration を戻す SQL は実行せず、列・テーブル・履歴を削除しない。`0004` の追加は旧アプリとの後方互換を保つための additive schema change である。データベース migration の後戻しは Worker の rollback に含めない。将来の schema cleanup が必要なら、別リリースで利用状況を確認し、独立した計画・レビューを経て行う。
 
