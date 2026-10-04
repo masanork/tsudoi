@@ -19,6 +19,7 @@ async function fillAnswers(form: Locator, company: string) {
 }
 
 test("completes Passkey setup, registration, roster reception, duplicate detection, and reversal", async ({ page, context }) => {
+  test.setTimeout(90_000);
   const cdp = await context.newCDPSession(page);
   await cdp.send("WebAuthn.enable");
   await cdp.send("WebAuthn.addVirtualAuthenticator", { options: {
@@ -99,7 +100,8 @@ test("completes Passkey setup, registration, roster reception, duplicate detecti
 
     await page.getByLabel("チケットリンク", { exact: true }).fill(`http://localhost:4173/public/tickets/${registration.ticketId}/check-in/${registration.qrToken}`);
     await page.getByRole("button", { name: "受付する", exact: true }).click();
-    await expect(page.getByText("受付が完了しました。", { exact: true })).toBeVisible();
+    await expect(page.getByRole("status")).toContainText("受付が完了しました。");
+    await expect(page.getByRole("status")).toContainText("受付担当");
     await expect(page.locator("tbody tr").filter({ hasText: "事前申込者" })).toContainText("checked_in");
     await page.getByRole("button", { name: "受付する", exact: true }).click();
     await expect(page.getByText(/受付済みです。最初の受付:/)).toBeVisible();
@@ -110,6 +112,7 @@ test("completes Passkey setup, registration, roster reception, duplicate detecti
     const row = page.locator("tbody tr").filter({ hasText: "事前申込者" });
     await expect(row).toContainText("issued");
     await row.getByRole("button", { name: "受付", exact: true }).click();
+    await page.getByRole("dialog", { name: "参加者を確認" }).getByRole("button", { name: "本人確認して受付", exact: true }).click();
     await expect(row).toContainText("checked_in");
 
     await page.setViewportSize({ width: 390, height: 844 });
@@ -138,10 +141,105 @@ test("completes Passkey setup, registration, roster reception, duplicate detecti
     await expect(walkInRow).toContainText("当日所属");
     await expect(walkInRow).toContainText("交流");
     await walkInRow.getByRole("button", { name: "受付", exact: true }).click();
+    await page.getByRole("dialog", { name: "参加者を確認" }).getByRole("button", { name: "本人確認して受付", exact: true }).click();
     await expect(walkInRow).toContainText("checked_in");
     await page.getByLabel("検索", { exact: true }).fill("当日参加者");
     await page.getByRole("button", { name: "絞り込む", exact: true }).click();
     await expect(page.locator("tbody tr")).toHaveCount(1);
     await expect(page.locator("tbody tr")).toContainText("当日参加者");
+
+    // Editing keeps the issued QR and reception state while changing roster data.
+    await page.locator("tbody tr").getByRole("button", { name: "編集", exact: true }).click();
+    const edit = page.locator("form").filter({ has: page.getByRole("button", { name: "変更を保存", exact: true }) });
+    await edit.getByLabel("氏名", { exact: true }).fill("当日参加者（修正）");
+    await edit.getByLabel("所属", { exact: true }).fill("名簿所属");
+    await edit.getByLabel("所属（必須）", { exact: true }).fill("回答所属（修正）");
+    await expect(edit.getByRole("combobox", { name: "会場", exact: true })).toBeDisabled();
+    const edited = page.waitForResponse((response) => response.url().includes(`/api/events/${eventId}/attendees/`) && response.request().method() === "PATCH");
+    await edit.getByRole("button", { name: "変更を保存", exact: true }).click();
+    expect((await edited).status()).toBe(200);
+    await expect(edit).toHaveCount(0);
+    await expect(page.locator("tbody tr")).toHaveCount(1);
+    await expect(page.locator("tbody tr")).toContainText("当日参加者（修正）");
+    await expect(page.locator("tbody tr")).toContainText("名簿所属");
+    await expect(page.locator("tbody tr")).toContainText("回答所属（修正）");
+    await expect(page.locator("tbody tr")).toContainText("checked_in");
+
+    // Simulate camera input to verify continuous scanning without camera hardware.
+    await page.evaluate((initialQr) => {
+      const camera = window as Window & { BarcodeDetector?: unknown; testQr: string; testDetections: number };
+      camera.testQr = initialQr; camera.testDetections = 0;
+      camera.BarcodeDetector = class { async detect() { camera.testDetections++; return [{ rawValue: camera.testQr }]; } };
+      navigator.mediaDevices.getUserMedia = async () => new MediaStream();
+      HTMLMediaElement.prototype.play = async () => {};
+    }, `http://localhost:4173/public/tickets/${registration.ticketId}/check-in/${registration.qrToken}`);
+    let cameraRequests = 0;
+    const cameraRequestListener = (request: import("@playwright/test").Request) => {
+      if (request.method() === "POST" && /\/api\/tickets\/[^/]+\/check-in$/.test(request.url())) cameraRequests++;
+    };
+    page.on("request", cameraRequestListener);
+    await page.getByRole("button", { name: "カメラで QR を読む", exact: true }).click();
+    await expect.poll(() => page.evaluate(() => (window as Window & { testDetections: number }).testDetections)).toBeGreaterThan(3);
+    expect(cameraRequests).toBe(1);
+    await page.evaluate((qr) => { (window as Window & { testQr: string }).testQr = qr; }, `http://localhost:4173/public/tickets/${(await saved.json()).ticketId}/check-in/${(await saved.json()).qrToken}`);
+    await expect.poll(() => cameraRequests).toBe(2);
+    await page.getByRole("button", { name: "カメラを閉じる", exact: true }).click();
+    page.off("request", cameraRequestListener);
+
+    // Use a separate event without required fields for CSV mapping and duplicates.
+    const csvEventResponse = await context.request.post("/api/events", { data: {
+      name: "CSV取込検証", startsAt: "2026-12-11", registrationMode: "hybrid",
+    } });
+    expect(csvEventResponse.status()).toBe(201);
+    const { id: csvEventId } = await csvEventResponse.json();
+    expect((await context.request.post(`/api/events/${csvEventId}/attendees`, { data: { name: "既存参加者" } })).status()).toBe(201);
+    expect((await context.request.post(`/api/events/${csvEventId}/form-fields`, { data: { key: "notes", label: "備考", type: "textarea" } })).status()).toBe(201);
+    await page.goto("/");
+    await page.locator("li").filter({ hasText: "CSV取込検証" }).getByRole("button", { name: "管理する", exact: true }).click();
+    await page.getByLabel("CSVファイル", { exact: true }).setInputFiles({
+      name: "roster.csv", mimeType: "text/csv",
+      buffer: Buffer.from('\uFEFF名前,会社,備考\r\n既存参加者,,\r\nCSV新規参加者,"新規,所属","複数行の備考\r\n2行目"\r\n,氏名なし,除外する行\r\n'),
+    });
+    await page.getByRole("combobox", { name: "氏名列", exact: true }).selectOption("名前");
+    await page.getByRole("combobox", { name: "所属列", exact: true }).selectOption("会社");
+    await page.getByRole("combobox", { name: "備考列", exact: true }).selectOption("備考");
+    await page.getByRole("button", { name: "プレビューを確認", exact: true }).click();
+    await expect(page.getByText("新規,所属", { exact: true })).toBeVisible();
+    const committed = page.waitForResponse((response) => response.url().endsWith(`/api/events/${csvEventId}/roster/import/commit`));
+    await page.getByRole("button", { name: "取り込みを確定", exact: true }).click();
+    expect((await committed).status()).toBe(201);
+    const importedRoster = page.getByRole("region", { name: "名簿を管理", exact: true });
+    await expect(importedRoster.locator("tbody tr")).toHaveCount(2);
+    await expect(importedRoster.locator("tbody tr").filter({ hasText: "CSV新規参加者" })).toContainText("新規,所属");
+    await expect(importedRoster.locator("tbody tr").filter({ hasText: "CSV新規参加者" })).toContainText("複数行の備考");
+    await expect(importedRoster.locator("tbody tr").filter({ hasText: "既存参加者" })).toHaveCount(1);
+    await page.setViewportSize({ width: 390, height: 844 });
+    expect(await page.getByLabel("CSVファイル", { exact: true }).evaluate((input) => input.getBoundingClientRect().right <= input.parentElement!.getBoundingClientRect().right)).toBe(true);
+    await importedRoster.screenshot({ path: "test-results/roster-management-mobile.png" });
+
+    // A real viewer session sees roster data without write controls.
+    const { organizationId } = await (await context.request.get("/api/session")).json();
+    const invitation = await context.request.post(`/api/organizations/${organizationId}/invites`, { data: { role: "viewer" } });
+    expect(invitation.status()).toBe(201);
+    const viewerContext = await context.browser()!.newContext();
+    try {
+      const viewer = await viewerContext.newPage();
+      const viewerCdp = await viewerContext.newCDPSession(viewer);
+      await viewerCdp.send("WebAuthn.enable");
+      await viewerCdp.send("WebAuthn.addVirtualAuthenticator", { options: {
+        protocol: "ctap2", transport: "internal", hasResidentKey: true,
+        hasUserVerification: true, isUserVerified: true, automaticPresenceSimulation: true,
+      } });
+      await viewer.goto((await invitation.json()).url);
+      await viewer.getByLabel("表示名", { exact: true }).fill("閲覧担当");
+      await viewer.getByRole("button", { name: "Passkey を登録して参加", exact: true }).click();
+      await expect(viewer.locator("li").filter({ hasText: "CSV取込検証" })).toBeVisible();
+      await expect(viewer.getByRole("heading", { name: "新しいイベントを作成" })).toHaveCount(0);
+      await viewer.locator("li").filter({ hasText: "CSV取込検証" }).getByRole("button", { name: "管理する", exact: true }).click();
+      await expect(viewer.locator("tbody tr")).toHaveCount(2);
+      for (const label of ["編集", "受付", "プレビューを確認", "受付する", "登録する", "項目を追加"]) {
+        await expect(viewer.getByRole("button", { name: label, exact: true })).toHaveCount(0);
+      }
+    } finally { await viewerContext.close(); }
   } finally { await participantContext.close(); }
 });

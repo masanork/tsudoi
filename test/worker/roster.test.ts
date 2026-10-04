@@ -13,17 +13,29 @@ async function createApiOrganization(name: string) {
   return { organizationId, token };
 }
 
-async function createOrganizerSession(name: string) {
+async function createOrganizerSession(name: string, role: "owner" | "admin" | "staff" | "viewer" = "owner") {
   const organizationId = crypto.randomUUID(), userId = crypto.randomUUID(), sessionToken = `session_${crypto.randomUUID()}`;
   const hash = [...new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(sessionToken)))].map((byte) => byte.toString(16).padStart(2, "0")).join("");
   await env.DB.batch([
     env.DB.prepare("INSERT INTO organizations (id, name) VALUES (?, ?)").bind(organizationId, name),
     env.DB.prepare("INSERT INTO users (id, display_name) VALUES (?, ?)").bind(userId, "Owner"),
-    env.DB.prepare("INSERT INTO organization_members (organization_id, user_id, role) VALUES (?, ?, 'owner')").bind(organizationId, userId),
+    env.DB.prepare("INSERT INTO organization_members (organization_id, user_id, role) VALUES (?, ?, ?)").bind(organizationId, userId, role),
     env.DB.prepare("INSERT INTO organizer_sessions (id, user_id, organization_id, token_hash, expires_at) VALUES (?, ?, ?, ?, datetime('now', '+12 hours'))")
       .bind(crypto.randomUUID(), userId, organizationId, hash),
   ]);
   return { sessionToken, organizationId, userId };
+}
+
+async function createMemberSession(organizationId: string, role: "admin" | "staff" | "viewer") {
+  const userId = crypto.randomUUID(), sessionToken = `session_${crypto.randomUUID()}`;
+  const hash = [...new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(sessionToken)))].map((byte) => byte.toString(16).padStart(2, "0")).join("");
+  await env.DB.batch([
+    env.DB.prepare("INSERT INTO users (id, display_name) VALUES (?, ?)").bind(userId, role),
+    env.DB.prepare("INSERT INTO organization_members (organization_id, user_id, role) VALUES (?, ?, ?)").bind(organizationId, userId, role),
+    env.DB.prepare("INSERT INTO organizer_sessions (id, user_id, organization_id, token_hash, expires_at) VALUES (?, ?, ?, ?, datetime('now', '+12 hours'))")
+      .bind(crypto.randomUUID(), userId, organizationId, hash),
+  ]);
+  return { userId, sessionToken };
 }
 
 async function createParticipantSession(attendeeId: string) {
@@ -413,6 +425,180 @@ describe("Worker D1 roster flow", () => {
     expect(new Set([...firstPage.attendees, ...secondPage.attendees].map((attendee) => attendee.id)).size).toBe(51);
     const filtered = await SELF.fetch(`https://tsudoi.test/api/events/${eventId}/roster?q=Needle&status=cancelled&source=walk_in`, { headers: auth });
     await expect(filtered.json()).resolves.toMatchObject({ attendees: [{ name: "Search Needle" }], nextCursor: null });
+  });
+
+  it("edits roster data with revision checks, before/after audit, and one-use CSV import previews", async () => {
+    const { sessionToken, organizationId, userId } = await createOrganizerSession("Roster editing");
+    const auth = { "content-type": "application/json", cookie: `tsudoi_organizer=${sessionToken}` };
+    const created = await SELF.fetch(`https://tsudoi.test/api/organizations/${organizationId}/events`, { method: "POST", headers: auth, body: JSON.stringify({ name: "Editable roster", startsAt: "2026-12-10", registrationMode: "hybrid" }) });
+    const { id: eventId } = await created.json<{ id: string }>();
+    await SELF.fetch(`https://tsudoi.test/api/events/${eventId}/form-fields`, { method: "POST", headers: auth, body: JSON.stringify({ key: "diet", label: "Diet", type: "text" }) });
+    const createdAttendee = await SELF.fetch(`https://tsudoi.test/api/events/${eventId}/attendees`, { method: "POST", headers: auth, body: JSON.stringify({ name: "Before", email: "person@example.test", answers: { diet: "omnivore" } }) });
+    const { attendeeId } = await createdAttendee.json<{ attendeeId: string }>();
+
+    const edited = await SELF.fetch(`https://tsudoi.test/api/events/${eventId}/attendees/${attendeeId}`, { method: "PATCH", headers: auth, body: JSON.stringify({ revision: 0, name: "After", affiliation: "Example Co", answers: { diet: "vegetarian" } }) });
+    await expect(edited.json()).resolves.toEqual({ updated: true, revision: 1 });
+    const stale = await SELF.fetch(`https://tsudoi.test/api/events/${eventId}/attendees/${attendeeId}`, { method: "PATCH", headers: auth, body: JSON.stringify({ revision: 0, name: "Stale" }) });
+    expect(stale.status).toBe(409);
+    await expect(env.DB.prepare("SELECT name, affiliation, revision FROM attendees WHERE id = ?").bind(attendeeId).first()).resolves.toEqual({ name: "After", affiliation: "Example Co", revision: 1 });
+    const audit = await env.DB.prepare("SELECT actor_id, metadata_json FROM audit_logs WHERE target_type = 'attendee' AND target_id = ? AND action = 'attendee.updated'").bind(attendeeId).first<{ actor_id: string; metadata_json: string }>();
+    expect(audit?.actor_id).toBe(userId);
+    expect(JSON.parse(audit?.metadata_json ?? "{}")).toMatchObject({ before: { name: "Before", answers: { diet: "omnivore" } }, after: { name: "After", affiliation: "Example Co", answers: { diet: "vegetarian" } } });
+
+    const preview = await SELF.fetch(`https://tsudoi.test/api/events/${eventId}/roster/import/preview`, { method: "POST", headers: auth, body: JSON.stringify({ columns: ["氏名", "会社", "メール"], mapping: { name: "氏名", affiliation: "会社", email: "メール", diet: "" }, rows: [["After", "Example Co", "person@example.test"], ["New Guest", "Other Co", "new@example.test"]] }) });
+    expect(preview.status).toBe(200);
+    const result = await preview.json<{ previewToken: string; rows: Array<{ duplicateCandidates: Array<{ attendeeId: string }>; errors: string[] }> }>();
+    expect(result.rows[0]?.duplicateCandidates.map((candidate) => candidate.attendeeId)).toContain(attendeeId);
+    expect(result.rows[0]?.errors).toEqual([]);
+    const committed = await SELF.fetch(`https://tsudoi.test/api/events/${eventId}/roster/import/commit`, { method: "POST", headers: auth, body: JSON.stringify({ previewToken: result.previewToken, decisions: [{ rowIndex: 0, action: "skip" }, { rowIndex: 1, action: "include" }] }) });
+    await expect(committed.json()).resolves.toEqual({ imported: 1, skipped: 1 });
+    const replay = await SELF.fetch(`https://tsudoi.test/api/events/${eventId}/roster/import/commit`, { method: "POST", headers: auth, body: JSON.stringify({ previewToken: result.previewToken, decisions: [{ rowIndex: 0, action: "skip" }, { rowIndex: 1, action: "include" }] }) });
+    expect(replay.status).toBe(409);
+    await expect(env.DB.prepare("SELECT COUNT(*) AS total FROM attendees WHERE event_id = ?").bind(eventId).first()).resolves.toMatchObject({ total: 2 });
+
+    const concurrentPreview = await SELF.fetch(`https://tsudoi.test/api/events/${eventId}/roster/import/preview`, { method: "POST", headers: auth, body: JSON.stringify({ columns: ["氏名"], mapping: { name: "氏名" }, rows: [["Concurrent import"]] }) });
+    const { previewToken: concurrentToken } = await concurrentPreview.json<{ previewToken: string }>();
+    const concurrentRequest = () => SELF.fetch(`https://tsudoi.test/api/events/${eventId}/roster/import/commit`, { method: "POST", headers: auth, body: JSON.stringify({ previewToken: concurrentToken, decisions: [{ rowIndex: 0, action: "include" }] }) });
+    const concurrentResults = await Promise.all([concurrentRequest(), concurrentRequest()]);
+    expect(concurrentResults.map((response) => response.status).sort()).toEqual([201, 409]);
+    await expect(env.DB.prepare("SELECT COUNT(*) AS total FROM attendees WHERE event_id = ?").bind(eventId).first()).resolves.toMatchObject({ total: 3 });
+    await expect(env.DB.prepare("SELECT COUNT(*) AS total FROM tickets WHERE event_id = ?").bind(eventId).first()).resolves.toMatchObject({ total: 3 });
+    await expect(env.DB.prepare("SELECT COUNT(*) AS total FROM audit_logs WHERE organization_id = ? AND action = 'attendee.imported' AND target_id IN (SELECT id FROM attendees WHERE event_id = ?)").bind(organizationId, eventId).first()).resolves.toMatchObject({ total: 2 });
+    const previewHash = [...new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(concurrentToken)))].map((byte) => byte.toString(16).padStart(2, "0")).join("");
+    const persistedPreview = await env.DB.prepare("SELECT rows_json FROM roster_import_previews WHERE id = ?").bind(previewHash).first<{ rows_json: string }>();
+    expect(persistedPreview === null || persistedPreview.rows_json === "[]").toBe(true);
+  });
+
+  it("serializes a check-in against a venue edit and preserves a coherent audit snapshot", async () => {
+    const { sessionToken, organizationId } = await createOrganizerSession("Roster venue race");
+    const auth = { "content-type": "application/json", cookie: `tsudoi_organizer=${sessionToken}` };
+    const created = await SELF.fetch(`https://tsudoi.test/api/organizations/${organizationId}/events`, { method: "POST", headers: auth, body: JSON.stringify({ name: "Venue race", startsAt: "2026-12-10", registrationMode: "hybrid" }) });
+    const { id: eventId } = await created.json<{ id: string }>();
+    const venueAResponse = await SELF.fetch(`https://tsudoi.test/api/events/${eventId}/venues`, { method: "POST", headers: auth, body: JSON.stringify({ name: "Venue A" }) });
+    const venueBResponse = await SELF.fetch(`https://tsudoi.test/api/events/${eventId}/venues`, { method: "POST", headers: auth, body: JSON.stringify({ name: "Venue B" }) });
+    const { id: venueA } = await venueAResponse.json<{ id: string }>();
+    const { id: venueB } = await venueBResponse.json<{ id: string }>();
+    const createdAttendee = await SELF.fetch(`https://tsudoi.test/api/events/${eventId}/attendees`, { method: "POST", headers: auth, body: JSON.stringify({ name: "Check-in race", venueId: venueA }) });
+    const { attendeeId, ticketId } = await createdAttendee.json<{ attendeeId: string; ticketId: string }>();
+
+    const race = await Promise.all([
+      SELF.fetch(`https://tsudoi.test/api/events/${eventId}/attendees/${attendeeId}/check-in`, { method: "POST", headers: auth, body: JSON.stringify({ venueId: venueA }) }),
+      SELF.fetch(`https://tsudoi.test/api/events/${eventId}/attendees/${attendeeId}`, { method: "PATCH", headers: auth, body: JSON.stringify({ revision: 0, venueId: venueB }) }),
+    ]);
+    expect(race.map((response) => response.status)).toEqual(expect.arrayContaining([200, 409]));
+    const state = await env.DB.prepare("SELECT a.venue_id, a.revision, t.status, t.checked_in_venue_id FROM attendees a JOIN tickets t ON t.attendee_id = a.id WHERE a.id = ?").bind(attendeeId).first<{ venue_id: string; revision: number; status: string; checked_in_venue_id: string | null }>();
+    if (state?.status === "checked_in") expect(state).toMatchObject({ venue_id: venueA, checked_in_venue_id: venueA, revision: 0 });
+    else expect(state).toMatchObject({ venue_id: venueB, revision: 1, status: "issued", checked_in_venue_id: null });
+    const editAudit = await env.DB.prepare("SELECT metadata_json FROM audit_logs WHERE target_id = ? AND action = 'attendee.updated'").bind(attendeeId).first<{ metadata_json: string }>();
+    if (state?.revision === 1) expect(JSON.parse(editAudit?.metadata_json ?? "{}")).toMatchObject({ before: { venueId: venueA }, after: { venueId: venueB } });
+    else expect(editAudit).toBeNull();
+    const resultBody = await race[1]!.json<{ error?: string; revision?: number }>();
+    if (state?.status === "checked_in") expect(resultBody).toMatchObject({ error: "checked_in_venue_locked" });
+
+    if (state?.status === "checked_in") {
+      const reversed = await SELF.fetch(`https://tsudoi.test/api/tickets/${ticketId}/reverse-check-in`, { method: "POST", headers: auth, body: JSON.stringify({ reason: "Wrong venue" }) });
+      expect(reversed.status).toBe(200);
+      const moved = await SELF.fetch(`https://tsudoi.test/api/events/${eventId}/attendees/${attendeeId}`, { method: "PATCH", headers: auth, body: JSON.stringify({ revision: 0, venueId: venueB }) });
+      expect(moved.status).toBe(200);
+      await expect(env.DB.prepare("SELECT status FROM tickets WHERE id = ?").bind(ticketId).first()).resolves.toEqual({ status: "issued" });
+    }
+
+    const lockedAttendeeResponse = await SELF.fetch(`https://tsudoi.test/api/events/${eventId}/attendees`, { method: "POST", headers: auth, body: JSON.stringify({ name: "Checked-in lock", venueId: venueA }) });
+    const { attendeeId: lockedAttendeeId, ticketId: lockedTicketId } = await lockedAttendeeResponse.json<{ attendeeId: string; ticketId: string }>();
+    const lockedCheckin = await SELF.fetch(`https://tsudoi.test/api/events/${eventId}/attendees/${lockedAttendeeId}/check-in`, { method: "POST", headers: auth, body: JSON.stringify({ venueId: venueA }) });
+    expect(lockedCheckin.status).toBe(200);
+    const lockedEdit = await SELF.fetch(`https://tsudoi.test/api/events/${eventId}/attendees/${lockedAttendeeId}`, { method: "PATCH", headers: auth, body: JSON.stringify({ revision: 0, venueId: venueB }) });
+    await expect(lockedEdit.json()).resolves.toMatchObject({ error: "checked_in_venue_locked" });
+    const unlocked = await SELF.fetch(`https://tsudoi.test/api/tickets/${lockedTicketId}/reverse-check-in`, { method: "POST", headers: auth, body: JSON.stringify({ reason: "Correcting venue" }) });
+    expect(unlocked.status).toBe(200);
+    const movedAfterReversal = await SELF.fetch(`https://tsudoi.test/api/events/${eventId}/attendees/${lockedAttendeeId}`, { method: "PATCH", headers: auth, body: JSON.stringify({ revision: 0, venueId: venueB }) });
+    expect(movedAfterReversal.status).toBe(200);
+  });
+
+  it("rolls back roster edits when audit storage fails", async () => {
+    const { sessionToken, organizationId } = await createOrganizerSession("Audit rollback");
+    const auth = { "content-type": "application/json", cookie: `tsudoi_organizer=${sessionToken}` };
+    const created = await SELF.fetch(`https://tsudoi.test/api/organizations/${organizationId}/events`, { method: "POST", headers: auth, body: JSON.stringify({ name: "Audit rollback", startsAt: "2026-12-10", registrationMode: "hybrid" }) });
+    const { id: eventId } = await created.json<{ id: string }>();
+    const createdAttendee = await SELF.fetch(`https://tsudoi.test/api/events/${eventId}/attendees`, { method: "POST", headers: auth, body: JSON.stringify({ name: "Original" }) });
+    const { attendeeId } = await createdAttendee.json<{ attendeeId: string }>();
+    await env.DB.prepare(`CREATE TRIGGER fail_attendee_update_audit BEFORE INSERT ON audit_logs WHEN NEW.action = 'attendee.updated' BEGIN SELECT RAISE(ABORT, 'audit blocked'); END`).run();
+    try {
+      const response = await SELF.fetch(`https://tsudoi.test/api/events/${eventId}/attendees/${attendeeId}`, { method: "PATCH", headers: auth, body: JSON.stringify({ revision: 0, name: "Must roll back" }) });
+      expect(response.status).toBe(500);
+      await expect(env.DB.prepare("SELECT name, revision FROM attendees WHERE id = ?").bind(attendeeId).first()).resolves.toEqual({ name: "Original", revision: 0 });
+      await expect(env.DB.prepare("SELECT COUNT(*) AS total FROM audit_logs WHERE action = 'attendee.updated' AND target_id = ?").bind(attendeeId).first()).resolves.toMatchObject({ total: 0 });
+    } finally { await env.DB.prepare("DROP TRIGGER fail_attendee_update_audit").run(); }
+  });
+
+  it("limits roster edits to admins, lets staff leave admin-only answers blank, and supports reserved custom-field names", async () => {
+    const { sessionToken, organizationId } = await createOrganizerSession("Roster role rules");
+    const ownerHeaders = { "content-type": "application/json", cookie: `tsudoi_organizer=${sessionToken}` };
+    const created = await SELF.fetch(`https://tsudoi.test/api/organizations/${organizationId}/events`, { method: "POST", headers: ownerHeaders, body: JSON.stringify({ name: "Role rules", startsAt: "2026-12-10", registrationMode: "hybrid" }) });
+    const { id: eventId } = await created.json<{ id: string }>();
+    const venueResponse = await SELF.fetch(`https://tsudoi.test/api/events/${eventId}/venues`, { method: "POST", headers: ownerHeaders, body: JSON.stringify({ name: "Staff venue" }) });
+    const { id: venueId } = await venueResponse.json<{ id: string }>();
+    await SELF.fetch(`https://tsudoi.test/api/events/${eventId}/form-fields`, { method: "POST", headers: ownerHeaders, body: JSON.stringify({ key: "admin_note", label: "Admin note", type: "text", required: true, staffVisibility: "admin_only" }) });
+    await SELF.fetch(`https://tsudoi.test/api/events/${eventId}/form-fields`, { method: "POST", headers: ownerHeaders, body: JSON.stringify({ key: "name", label: "Custom name answer", type: "text" }) });
+    const staff = await createMemberSession(organizationId, "staff");
+    const viewer = await createMemberSession(organizationId, "viewer");
+    const admin = await createMemberSession(organizationId, "admin");
+    await SELF.fetch(`https://tsudoi.test/api/events/${eventId}/venues/${venueId}/staff/${staff.userId}`, { method: "PUT", headers: ownerHeaders });
+    const staffHeaders = { "content-type": "application/json", cookie: `tsudoi_organizer=${staff.sessionToken}` };
+    const staffCreate = await SELF.fetch(`https://tsudoi.test/api/events/${eventId}/attendees`, { method: "POST", headers: staffHeaders, body: JSON.stringify({ name: "Walk-in", venueId }) });
+    expect(staffCreate.status).toBe(201);
+    const { attendeeId } = await staffCreate.json<{ attendeeId: string }>();
+    await expect(env.DB.prepare("SELECT value_json FROM attendee_answers a JOIN form_fields f ON f.id = a.field_id WHERE a.attendee_id = ? AND f.field_key = 'admin_note'").bind(attendeeId).first()).resolves.toBeNull();
+    const staffEdit = await SELF.fetch(`https://tsudoi.test/api/events/${eventId}/attendees/${attendeeId}`, { method: "PATCH", headers: staffHeaders, body: JSON.stringify({ revision: 0, name: "Forbidden" }) });
+    expect(staffEdit.status).toBe(403);
+    const viewerEdit = await SELF.fetch(`https://tsudoi.test/api/events/${eventId}/attendees/${attendeeId}`, { method: "PATCH", headers: { "content-type": "application/json", cookie: `tsudoi_organizer=${viewer.sessionToken}` }, body: JSON.stringify({ revision: 0, name: "Forbidden" }) });
+    expect(viewerEdit.status).toBe(403);
+    const hiddenAnswer = await SELF.fetch(`https://tsudoi.test/api/events/${eventId}/attendees/${attendeeId}`, { method: "PATCH", headers: ownerHeaders, body: JSON.stringify({ revision: 0, answers: { admin_note: "hidden" } }) });
+    expect(hiddenAnswer.status).toBe(200);
+    const adminEdit = await SELF.fetch(`https://tsudoi.test/api/events/${eventId}/attendees/${attendeeId}`, { method: "PATCH", headers: { "content-type": "application/json", cookie: `tsudoi_organizer=${admin.sessionToken}` }, body: JSON.stringify({ revision: 1, answers: { "name": "same-named custom question" } }) });
+    expect(adminEdit.status).toBe(200);
+    const other = await createOrganizerSession("Other tenant");
+    const crossTenant = await SELF.fetch(`https://tsudoi.test/api/events/${eventId}/attendees/${attendeeId}`, { method: "PATCH", headers: { "content-type": "application/json", cookie: `tsudoi_organizer=${other.sessionToken}` }, body: JSON.stringify({ revision: 2, name: "Forbidden" }) });
+    expect(crossTenant.status).toBe(404);
+
+    const preview = await SELF.fetch(`https://tsudoi.test/api/events/${eventId}/roster/import/preview`, { method: "POST", headers: ownerHeaders, body: JSON.stringify({ columns: ["Person", "Answer", "Admin"], mapping: { name: "Person", "answer:name": "Answer", admin_note: "Admin" }, rows: [["Imported", "Custom value", "Secret"]] }) });
+    expect(preview.status).toBe(200);
+    const { previewToken } = await preview.json<{ previewToken: string }>();
+    const importResult = await SELF.fetch(`https://tsudoi.test/api/events/${eventId}/roster/import/commit`, { method: "POST", headers: ownerHeaders, body: JSON.stringify({ previewToken, decisions: [{ rowIndex: 0, action: "include" }] }) });
+    expect(importResult.status).toBe(201);
+    const imported = await env.DB.prepare("SELECT id FROM attendees WHERE event_id = ? AND name = 'Imported'").bind(eventId).first<{ id: string }>();
+    await expect(env.DB.prepare("SELECT value_json FROM attendee_answers a JOIN form_fields f ON f.id = a.field_id WHERE a.attendee_id = ? AND f.field_key = 'name'").bind(imported?.id).first()).resolves.toEqual({ value_json: '"Custom value"' });
+    await expect(env.DB.prepare("SELECT value_json FROM attendee_answers a JOIN form_fields f ON f.id = a.field_id WHERE a.attendee_id = ? AND f.field_key = 'admin_note'").bind(imported?.id).first()).resolves.toEqual({ value_json: '"Secret"' });
+  });
+
+  it("cascades an abandoned roster preview when a draft event is deleted", async () => {
+    const { sessionToken, organizationId } = await createOrganizerSession("Preview cleanup");
+    const auth = { "content-type": "application/json", cookie: `tsudoi_organizer=${sessionToken}` };
+    const created = await SELF.fetch(`https://tsudoi.test/api/organizations/${organizationId}/events`, { method: "POST", headers: auth, body: JSON.stringify({ name: "Disposable draft", startsAt: "2026-12-10", registrationMode: "hybrid" }) });
+    const { id: eventId } = await created.json<{ id: string }>();
+    const preview = await SELF.fetch(`https://tsudoi.test/api/events/${eventId}/roster/import/preview`, { method: "POST", headers: auth, body: JSON.stringify({ columns: ["氏名"], mapping: { name: "氏名" }, rows: [["Temporary"]] }) });
+    expect(preview.status).toBe(200);
+    const deleted = await SELF.fetch(`https://tsudoi.test/api/events/${eventId}`, { method: "DELETE", headers: auth });
+    await expect(deleted.json()).resolves.toEqual({ action: "deleted" });
+    await expect(env.DB.prepare("SELECT COUNT(*) AS total FROM roster_import_previews WHERE event_id = ?").bind(eventId).first()).resolves.toMatchObject({ total: 0 });
+  });
+
+  it("rolls back an over-capacity CSV batch and lets the same preview retry with an explicit skip", async () => {
+    const { sessionToken, organizationId } = await createOrganizerSession("Import capacity");
+    const auth = { "content-type": "application/json", cookie: `tsudoi_organizer=${sessionToken}` };
+    const created = await SELF.fetch(`https://tsudoi.test/api/organizations/${organizationId}/events`, { method: "POST", headers: auth, body: JSON.stringify({ name: "One seat", startsAt: "2026-12-10", registrationMode: "hybrid", capacity: 1 }) });
+    const { id: eventId } = await created.json<{ id: string }>();
+    const preview = await SELF.fetch(`https://tsudoi.test/api/events/${eventId}/roster/import/preview`, { method: "POST", headers: auth, body: JSON.stringify({ columns: ["氏名"], mapping: { name: "氏名" }, rows: [["Seat one"], ["Seat two"]] }) });
+    const { previewToken } = await preview.json<{ previewToken: string }>();
+    const request = (decisions: Array<{ rowIndex: number; action: string }>) => SELF.fetch(`https://tsudoi.test/api/events/${eventId}/roster/import/commit`, { method: "POST", headers: auth, body: JSON.stringify({ previewToken, decisions }) });
+    const fullBatch = await request([{ rowIndex: 0, action: "include" }, { rowIndex: 1, action: "include" }]);
+    expect(fullBatch.status).toBe(409);
+    await expect(env.DB.prepare("SELECT COUNT(*) AS total FROM attendees WHERE event_id = ?").bind(eventId).first()).resolves.toMatchObject({ total: 0 });
+    await expect(env.DB.prepare("SELECT COUNT(*) AS total FROM tickets WHERE event_id = ?").bind(eventId).first()).resolves.toMatchObject({ total: 0 });
+    await expect(env.DB.prepare("SELECT COUNT(*) AS total FROM audit_logs WHERE action = 'attendee.imported' AND target_id IN (SELECT id FROM attendees WHERE event_id = ?)").bind(eventId).first()).resolves.toMatchObject({ total: 0 });
+    const retry = await request([{ rowIndex: 0, action: "include" }, { rowIndex: 1, action: "skip" }]);
+    expect(retry.status).toBe(201);
+    await expect(env.DB.prepare("SELECT COUNT(*) AS total FROM attendees WHERE event_id = ?").bind(eventId).first()).resolves.toMatchObject({ total: 1 });
   });
 
   it("checks in by roster identity and records a reason when an admin reverses it", async () => {

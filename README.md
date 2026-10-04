@@ -21,6 +21,7 @@ Snapshot: [`stats/stats.md`](stats/stats.md)
 
 - Multi-tenant organizations, events, venues, Passkey organizer sessions, and role-scoped API tokens for future integrations
 - Configurable registration fields and roster data model
+- Administrator roster editing with revision checks and before/after audit records; CSV column mapping, duplicate preview, and one-time import confirmation
 - Individual ticket tokens and atomic duplicate-safe check-in
 - Attendee Passkey registration and session issuance
 - E2EE message ciphertext, key-envelope, and encrypted attachment storage boundaries
