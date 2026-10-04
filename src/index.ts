@@ -7,6 +7,7 @@ import { generateAuthenticationOptions, generateRegistrationOptions, verifyAuthe
 import type { AuthenticationResponseJSON, RegistrationResponseJSON } from "@simplewebauthn/server";
 import * as QRCodeServer from "qrcode/lib/server.js";
 import { checkIn } from "./check-in";
+import { cleanupExpiredImportPreviews } from "./maintenance";
 import { calendarDate, canonicalDate, confirmedCalendar, extractInviteToken, parseConstraints, parseScheduleSlot, pkceS256, suggestSlots } from "./schedule-protocol";
 
 type Role = "owner" | "admin" | "staff" | "viewer";
@@ -2288,6 +2289,14 @@ type FieldRow = { id: string; field_key: string; field_type: string; required: n
 
 export default {
   fetch: app.fetch,
+  async scheduled(_controller, env) {
+    const deletedCount = await cleanupExpiredImportPreviews(env.DB);
+    console.info(JSON.stringify({
+      event: "import_preview_cleanup",
+      deletedCount,
+      limitReached: deletedCount >= 1000,
+    }));
+  },
   async queue(batch: MessageBatch, env: Cloudflare.Env) {
     for (const message of batch.messages) {
       const job = message.body;
