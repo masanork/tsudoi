@@ -29,6 +29,8 @@ Snapshot: [`stats/stats.md`](stats/stats.md)
 
 See [`docs/release-readiness.md`](docs/release-readiness.md) for the reviewed change groups, validation, deployment state, and remaining device checks.
 
+Use [`docs/deployment-runbook.md`](docs/deployment-runbook.md) for an existing production database, commit/version tracking, rollback, and device/mail/OAuth acceptance checks. `npm run check:deployed -- --origin https://your-host` checks public deployed endpoints without credentials or remote data writes; `--output report.json` saves a local report. It does not verify organizer login, mail delivery, or the supplied deployment identity. `npm run test:operations` tests this checker.
+
 See the full product and technical requirements in [`docs/specification.md`](docs/specification.md).
 
 ## Configuration and deployment
