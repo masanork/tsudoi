@@ -231,7 +231,9 @@ test("completes Passkey setup, registration, roster reception, duplicate detecti
     } });
     expect(copyEvent.status()).toBe(201);
     const { id: copyEventId } = await copyEvent.json();
-    expect((await context.request.post(`/api/events/${copyEventId}/venues`, { data: { name: "メイン会場" } })).status()).toBe(201);
+    const copyVenue = await context.request.post(`/api/events/${copyEventId}/venues`, { data: { name: "メイン会場" } });
+    expect(copyVenue.status()).toBe(201);
+    const { id: copyVenueId } = await copyVenue.json();
     expect((await context.request.post(`/api/events/${copyEventId}/form-fields`, { data: { key: "notes", label: "備考", type: "textarea" } })).status()).toBe(201);
     expect((await context.request.post(`/api/events/${copyEventId}/form-fields`, { data: { key: "custom_name", label: "Name", type: "text" } })).status()).toBe(201);
     await page.goto("/");
@@ -249,6 +251,16 @@ test("completes Passkey setup, registration, roster reception, duplicate detecti
     await expect(copiedParticipant).toContainText("メイン会場");
     await expect(copiedParticipant).toContainText("複数行の備考");
     await expect(copiedParticipant).toContainText("CSVカスタム回答");
+
+    // Duplicate venue names export their IDs so the same event remains importable.
+    expect((await context.request.post(`/api/events/${copyEventId}/venues`, { data: { name: "メイン会場" } })).status()).toBe(201);
+    const ambiguousExport = await context.request.get(`/api/events/${copyEventId}/attendees.csv`);
+    expect(ambiguousExport.status()).toBe(200);
+    expect(await ambiguousExport.text()).toContain(copyVenueId);
+    await expect(page.getByLabel("CSVファイル", { exact: true })).toBeEnabled();
+    await page.getByLabel("CSVファイル", { exact: true }).setInputFiles({ name: "duplicate-venues.csv", mimeType: "text/csv", buffer: await ambiguousExport.body() });
+    await page.getByRole("button", { name: "プレビューを確認", exact: true }).click();
+    await expect(page.getByText("プレビュー: 2 行を登録できます。", { exact: true })).toBeVisible();
 
     // A real viewer session sees roster data without write controls.
     const { organizationId } = await (await context.request.get("/api/session")).json();

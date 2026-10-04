@@ -578,9 +578,18 @@ app.get("/api/events/:eventId/attendees.csv", requireScope("admin"), async (c) =
   const event = await eventForAuth(c);
   if (!event) return c.json({ error: "not_found" }, 404);
   const fields = await c.env.DB.prepare("SELECT id, field_key, label, field_type FROM form_fields WHERE event_id = ? ORDER BY sort_order, created_at").bind(event.id).all<{ id: string; field_key: string; label: string; field_type: string }>();
-  const attendees = await c.env.DB.prepare(`SELECT a.id, a.name, a.affiliation, a.email_normalized, v.name AS venue_name, a.registration_source, a.status, a.created_at
-    FROM attendees a LEFT JOIN venues v ON v.id = a.venue_id WHERE a.event_id = ? ORDER BY a.created_at`).bind(event.id)
-    .all<{ id: string; name: string; affiliation: string; email_normalized: string | null; venue_name: string | null; registration_source: string; status: string; created_at: string }>();
+  const venueRows = await c.env.DB.prepare("SELECT id, name FROM venues WHERE event_id = ?").bind(event.id).all<{ id: string; name: string }>();
+  const venueNameCounts = new Map<string, number>();
+  for (const venue of venueRows.results) {
+    const key = venue.name.trim().toLocaleLowerCase();
+    venueNameCounts.set(key, (venueNameCounts.get(key) ?? 0) + 1);
+  }
+  const venueLabels = new Map(venueRows.results.map((venue) => [venue.id,
+    (venueNameCounts.get(venue.name.trim().toLocaleLowerCase()) ?? 0) > 1 ? venue.id : venue.name,
+  ]));
+  const attendees = await c.env.DB.prepare(`SELECT id, name, affiliation, email_normalized, venue_id, registration_source, status, created_at
+    FROM attendees WHERE event_id = ? ORDER BY created_at`).bind(event.id)
+    .all<{ id: string; name: string; affiliation: string; email_normalized: string | null; venue_id: string | null; registration_source: string; status: string; created_at: string }>();
   const answers = await c.env.DB.prepare("SELECT attendee_id, field_id, value_json FROM attendee_answers WHERE attendee_id IN (SELECT id FROM attendees WHERE event_id = ?)").bind(event.id).all<{ attendee_id: string; field_id: string; value_json: string }>();
   const fieldTypeById = new Map(fields.results.map((field) => [field.id, field.field_type]));
   const answerMap = new Map(answers.results.map((answer) => [`${answer.attendee_id}:${answer.field_id}`, csvAnswer(answer.value_json, fieldTypeById.get(answer.field_id))]));
@@ -597,7 +606,7 @@ app.get("/api/events/:eventId/attendees.csv", requireScope("admin"), async (c) =
       : field.label;
   });
   const header = ["Name", "Affiliation", "Email", "Venue", "Registration source", "Status", "Registered at", ...answerHeaders];
-  const rows = attendees.results.map((attendee) => [attendee.name, attendee.affiliation, attendee.email_normalized ?? "", attendee.venue_name ?? "", attendee.registration_source, attendee.status, attendee.created_at, ...fields.results.map((field) => answerMap.get(`${attendee.id}:${field.id}`) ?? "")]);
+  const rows = attendees.results.map((attendee) => [attendee.name, attendee.affiliation, attendee.email_normalized ?? "", attendee.venue_id ? venueLabels.get(attendee.venue_id) ?? attendee.venue_id : "", attendee.registration_source, attendee.status, attendee.created_at, ...fields.results.map((field) => answerMap.get(`${attendee.id}:${field.id}`) ?? "")]);
   await audit(c.env.DB, c.get("auth"), "attendees.exported", "event", event.id);
   c.header("Content-Type", "text/csv; charset=utf-8");
   c.header("Content-Disposition", `attachment; filename="tsudoi-${event.id}-attendees.csv"`);
@@ -697,9 +706,9 @@ app.post("/api/events/:eventId/roster/import/preview", requireSession, async (c)
   const columns = body.columns;
   const rows = body.rows;
   const mapping = body.mapping;
-  if (!Array.isArray(columns) || columns.length < 1 || columns.length > 100 || columns.some((value) => typeof value !== "string" || value.length > 200)
+  if (!Array.isArray(columns) || columns.length < 1 || columns.length > 107 || columns.some((value) => typeof value !== "string" || value.length > 200)
     || !Array.isArray(rows) || rows.length < 1 || rows.length > 100 || rows.some((row) => !Array.isArray(row) || row.length !== columns.length || row.some((value) => typeof value !== "string" || value.length > 2000))
-    || !isRecord(mapping)) return badRequest(c, "invalid import payload (maximum 100 rows)");
+    || !isRecord(mapping)) return badRequest(c, "invalid import payload (maximum 100 rows and 107 columns)");
   if ((rows as string[][]).reduce((total, row) => total + row.reduce((rowTotal, value) => rowTotal + value.length, 0), 0) > 400_000) return c.json({ error: "import_payload_too_large", maxCharacters: 400000 }, 413);
   const columnIndex = new Map((columns as string[]).map((column, index) => [column, index]));
   if (new Set(columns as string[]).size !== columns.length) return badRequest(c, "duplicate column names");

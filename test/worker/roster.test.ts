@@ -47,6 +47,27 @@ async function createParticipantSession(attendeeId: string) {
   return sessionToken;
 }
 
+function parseWorkerCsv(input: string): string[][] {
+  const source = input.replace(/^\uFEFF/, "");
+  const records: string[][] = [];
+  let row: string[] = [], value = "", quoted = false;
+  for (let index = 0; index < source.length; index++) {
+    const char = source[index]!;
+    if (char === '"' && quoted && source[index + 1] === '"') { value += '"'; index++; }
+    else if (char === '"') quoted = !quoted;
+    else if (char === "," && !quoted) { row.push(value); value = ""; }
+    else if ((char === "\r" || char === "\n") && !quoted) {
+      if (char === "\r" && source[index + 1] === "\n") index++;
+      row.push(value); value = "";
+      if (row.some((cell) => cell !== "")) records.push(row);
+      row = [];
+    } else value += char;
+  }
+  row.push(value);
+  if (row.some((cell) => cell !== "")) records.push(row);
+  return records;
+}
+
 describe("Worker D1 roster flow", () => {
   it("uses an HttpOnly organizer session without a bearer token", async () => {
     const { sessionToken } = await createOrganizerSession("Session organization");
@@ -1007,6 +1028,81 @@ describe("reviewed CSV import boundaries", () => {
     for (const [key, value] of [["name_shadow", "Not a display name"], ["repeat_a", "A"], ["repeat_b", "B"], ["prefix_shadow", "prefix value"]]) {
       await expect(env.DB.prepare("SELECT value_json FROM attendee_answers WHERE attendee_id = ? AND field_id = (SELECT id FROM form_fields WHERE event_id = ? AND field_key = ?)").bind(imported?.id, eventId, key).first()).resolves.toEqual({ value_json: JSON.stringify(value) });
     }
+  });
+
+  it("exports duplicate venue names as IDs so the same-event CSV can be imported", async () => {
+    const { sessionToken, organizationId } = await createOrganizerSession("Duplicate venue CSV roundtrip");
+    const auth = { "content-type": "application/json", cookie: `tsudoi_organizer=${sessionToken}` };
+    const eventResponse = await SELF.fetch(`https://tsudoi.test/api/organizations/${organizationId}/events`, { method: "POST", headers: auth, body: JSON.stringify({ name: "Duplicate venue event", startsAt: "2026-12-10", registrationMode: "hybrid" }) });
+    const { id: eventId } = await eventResponse.json<{ id: string }>();
+    const createVenue = async () => {
+      const response = await SELF.fetch(`https://tsudoi.test/api/events/${eventId}/venues`, { method: "POST", headers: auth, body: JSON.stringify({ name: "Same name" }) });
+      return (await response.json<{ id: string }>()).id;
+    };
+    const firstVenueId = await createVenue();
+    await createVenue();
+    await SELF.fetch(`https://tsudoi.test/api/events/${eventId}/form-fields`, { method: "POST", headers: auth, body: JSON.stringify({ key: "note", label: "Note", type: "text" }) });
+    const attendeeResponse = await SELF.fetch(`https://tsudoi.test/api/events/${eventId}/attendees`, { method: "POST", headers: auth, body: JSON.stringify({ name: "Venue guest", email: "venue@example.test", venueId: firstVenueId, answers: { note: "keep this attendee" } }) });
+    const { attendeeId: originalId } = await attendeeResponse.json<{ attendeeId: string }>();
+    const exportResponse = await SELF.fetch(`https://tsudoi.test/api/events/${eventId}/attendees.csv`, { headers: auth });
+    expect(exportResponse.status).toBe(200);
+    const [header, ...rows] = parseWorkerCsv(await exportResponse.text());
+    const venueColumn = header!.indexOf("Venue");
+    expect(venueColumn).toBeGreaterThanOrEqual(0);
+    expect(rows[0]?.[venueColumn]).toBe(firstVenueId);
+    const mapping = { name: "Name", affiliation: "Affiliation", email: "Email", venueId: "Venue", "answer:note": "Note" };
+    const previewResponse = await SELF.fetch(`https://tsudoi.test/api/events/${eventId}/roster/import/preview`, { method: "POST", headers: auth, body: JSON.stringify({ columns: header, rows, mapping }) });
+    expect(previewResponse.status).toBe(200);
+    const { previewToken, rows: previewRows } = await previewResponse.json<{ previewToken: string; rows: Array<{ rowIndex: number; errors: string[] }> }>();
+    expect(previewRows[0]?.errors).toEqual([]);
+    const commit = await SELF.fetch(`https://tsudoi.test/api/events/${eventId}/roster/import/commit`, { method: "POST", headers: auth, body: JSON.stringify({ previewToken, decisions: previewRows.map((row) => ({ rowIndex: row.rowIndex, action: "include" })) }) });
+    expect(commit.status).toBe(201);
+    const imported = await env.DB.prepare("SELECT id, venue_id FROM attendees WHERE event_id = ? AND id != ?").bind(eventId, originalId).first<{ id: string; venue_id: string }>();
+    expect(imported?.venue_id).toBe(firstVenueId);
+  });
+
+  it("roundtrips a full 107-column export for 100 attendees with 100 answers each", async () => {
+    const { sessionToken, organizationId } = await createOrganizerSession("Maximum CSV columns");
+    const auth = { "content-type": "application/json", cookie: `tsudoi_organizer=${sessionToken}` };
+    const eventResponse = await SELF.fetch(`https://tsudoi.test/api/organizations/${organizationId}/events`, { method: "POST", headers: auth, body: JSON.stringify({ name: "Max columns", startsAt: "2026-12-10", registrationMode: "hybrid" }) });
+    const { id: eventId } = await eventResponse.json<{ id: string }>();
+    const venueResponse = await SELF.fetch(`https://tsudoi.test/api/events/${eventId}/venues`, { method: "POST", headers: auth, body: JSON.stringify({ name: "Main hall" }) });
+    const { id: venueId } = await venueResponse.json<{ id: string }>();
+    const customFields = Array.from({ length: 100 }, (_, index) => ({ key: `field_${String(index).padStart(3, "0")}`, label: `Custom ${String(index).padStart(3, "0")}`, id: crypto.randomUUID() }));
+    await env.DB.batch(customFields.map((field) => env.DB.prepare("INSERT INTO form_fields (id, event_id, field_key, label, field_type, required, options_json) VALUES (?, ?, ?, ?, 'text', 1, '[]')").bind(field.id, eventId, field.key, field.label)));
+    const columns = ["Name", "Affiliation", "Email", "Venue", ...customFields.map((field) => field.label)];
+    const mapping = { name: "Name", affiliation: "Affiliation", email: "Email", venueId: "Venue", ...Object.fromEntries(customFields.map((field) => [`answer:${field.key}`, field.label])) };
+    const rows = Array.from({ length: 100 }, (_, rowIndex) => [
+      `Max guest ${String(rowIndex).padStart(3, "0")}`, `Org ${rowIndex % 9}`, `max-${rowIndex}@example.test`, "Main hall",
+      ...customFields.map((field, fieldIndex) => `${field.key}:r${rowIndex}:v${fieldIndex}`),
+    ]);
+    const initialPreview = await SELF.fetch(`https://tsudoi.test/api/events/${eventId}/roster/import/preview`, { method: "POST", headers: auth, body: JSON.stringify({ columns, rows, mapping }) });
+    expect(initialPreview.status).toBe(200);
+    const { previewToken, rows: previewRows } = await initialPreview.json<{ previewToken: string; rows: Array<{ rowIndex: number; errors: string[] }> }>();
+    expect(previewRows).toHaveLength(100);
+    expect(previewRows.every((row) => row.errors.length === 0)).toBe(true);
+    const initialCommit = await SELF.fetch(`https://tsudoi.test/api/events/${eventId}/roster/import/commit`, { method: "POST", headers: auth, body: JSON.stringify({ previewToken, decisions: previewRows.map((row) => ({ rowIndex: row.rowIndex, action: "include" })) }) });
+    expect(initialCommit.status).toBe(201);
+    await expect(env.DB.prepare("SELECT COUNT(*) AS total FROM attendee_answers a JOIN attendees p ON p.id = a.attendee_id WHERE p.event_id = ?").bind(eventId).first()).resolves.toMatchObject({ total: 10_000 });
+
+    const exported = await SELF.fetch(`https://tsudoi.test/api/events/${eventId}/attendees.csv`, { headers: auth });
+    expect(exported.status).toBe(200);
+    const [exportColumns, ...exportRows] = parseWorkerCsv(await exported.text());
+    expect(exportColumns).toHaveLength(107);
+    expect(exportRows).toHaveLength(100);
+    const exportMapping = {
+      name: "Name", affiliation: "Affiliation", email: "Email", venueId: "Venue",
+      ...Object.fromEntries(customFields.map((field) => [`answer:${field.key}`, field.label])),
+    };
+    const clonePreview = await SELF.fetch(`https://tsudoi.test/api/events/${eventId}/roster/import/preview`, { method: "POST", headers: auth, body: JSON.stringify({ columns: exportColumns, rows: exportRows, mapping: exportMapping }) });
+    expect(clonePreview.status).toBe(200);
+    const cloned = await clonePreview.json<{ previewToken: string; rows: Array<{ rowIndex: number; errors: string[]; duplicateCandidates: unknown[] }> }>();
+    expect(cloned.rows).toHaveLength(100);
+    expect(cloned.rows.every((row) => row.errors.length === 0 && row.duplicateCandidates.length === 1)).toBe(true);
+    const cloneCommit = await SELF.fetch(`https://tsudoi.test/api/events/${eventId}/roster/import/commit`, { method: "POST", headers: auth, body: JSON.stringify({ previewToken: cloned.previewToken, decisions: cloned.rows.map((row) => ({ rowIndex: row.rowIndex, action: "include" })) }) });
+    expect(cloneCommit.status).toBe(201);
+    await expect(env.DB.prepare("SELECT COUNT(*) AS total FROM attendees WHERE event_id = ?").bind(eventId).first()).resolves.toMatchObject({ total: 200 });
+    await expect(env.DB.prepare("SELECT COUNT(*) AS total FROM attendee_answers a JOIN attendees p ON p.id = a.attendee_id WHERE p.event_id = ?").bind(eventId).first()).resolves.toMatchObject({ total: 20_000 });
   });
 });
 
