@@ -2,6 +2,8 @@
   import { onDestroy, onMount, tick } from "svelte";
   import { startAuthentication, startRegistration } from "@simplewebauthn/browser";
   import QRCode from "qrcode";
+  import FieldInputs from "./lib/FieldInputs.svelte";
+  import type { FormAnswers, FormField } from "./lib/form-fields";
 
   type ParticipantTicket = { id: string; status: string; event_name: string; starts_at: string; ends_at: string; timezone: string; venue_name: string | null; cancellation_closes_at: string | null };
   let administratorName = "";
@@ -49,6 +51,11 @@
   let walkInName = "";
   let walkInEmail = "";
   let walkInQr = "";
+  let walkInFields: FormField[] = [];
+  let walkInAnswers: FormAnswers = {};
+  let walkInFieldsReady = false;
+  let walkInFieldMessage = "";
+  let walkInSaving = false;
   let selectedStaffId = "";
   let selectedEventId = "";
   let schedule: { enabled: boolean; status: string; date: string | null; startsAt?: string | null; endsAt?: string | null; allDay?: boolean; timeZone?: string; readyToConfirm?: string[]; participants?: Array<{ displayName: string; role: string; answered: boolean }>; options: Array<{ id: string; date: string; note: string; yes: number; maybe: number; no: number; start?: string | null; end?: string | null; allDay?: boolean }> } | null = null;
@@ -81,8 +88,8 @@
   const scheduleMatch = typeof window !== "undefined" ? window.location.pathname.match(/^\/events\/([^/]+)\/schedule$/) : null;
   const scheduleEventId = scheduleMatch?.[1] ?? "";
   let publicEvent: { name: string; description: string; starts_at: string } | null = null;
-  let publicFields: Array<{ field_key: string; label: string; field_type: string; required: number; options_json: string }> = [];
-  let registrationName = ""; let registrationEmail = ""; let registrationAnswers: Record<string, string | string[] | boolean> = {}; let registrationMessage = "";
+  let publicFields: FormField[] = [];
+  let registrationName = ""; let registrationEmail = ""; let registrationAnswers: FormAnswers = {}; let registrationMessage = "";
   let turnstileSiteKey = "";
   let turnstileToken = "";
   let publicSchedule: { event: { name: string; description: string; timezone: string; schedule_status: string }; options: Array<{ id: string; date: string; note: string; yes: number; maybe: number; no: number; start?: string | null; end?: string | null; allDay?: boolean }> } | null = null;
@@ -364,8 +371,28 @@
     catch (error) { message = error instanceof Error ? error.message : "担当会場を設定できませんでした。"; }
   }
   async function registerWalkIn() {
-    try { const result = await api(`/events/${selectedEventId}/attendees`, { method: "POST", body: JSON.stringify({ name: walkInName, email: walkInEmail || undefined, venueId: selectedVenueId || undefined }) }); walkInQr = await QRCode.toDataURL(`${window.location.origin}/public/tickets/${result.ticketId}/check-in/${result.qrToken}`, { errorCorrectionLevel: "M", margin: 1, width: 640 }); walkInName = ""; walkInEmail = ""; checkinMessage = "当日参加者を登録しました。QR を本人に渡してください。"; await Promise.all([loadMetrics(selectedEventId), loadRoster(selectedEventId)]); }
+    if (!walkInFieldsReady || walkInSaving) return;
+    walkInSaving = true; walkInQr = "";
+    try {
+      const result = await api(`/events/${selectedEventId}/attendees`, { method: "POST", body: JSON.stringify({ name: walkInName, email: walkInEmail || undefined, venueId: selectedVenueId || undefined, answers: walkInAnswers }) });
+      walkInName = ""; walkInEmail = ""; walkInAnswers = {};
+      checkinMessage = "当日参加者を登録しました。QR を本人に渡してください。";
+      try { walkInQr = await QRCode.toDataURL(`${window.location.origin}/public/tickets/${result.ticketId}/check-in/${result.qrToken}`, { errorCorrectionLevel: "M", margin: 1, width: 640 }); }
+      catch { checkinMessage = "当日参加者は登録済みですが、QR を表示できませんでした。名簿から受付してください。"; }
+      await Promise.all([loadMetrics(selectedEventId), loadRoster(selectedEventId)]);
+    }
     catch (error) { checkinMessage = error instanceof Error ? error.message : "当日参加者を登録できませんでした。"; }
+    finally { walkInSaving = false; }
+  }
+  async function loadWalkInFields(eventId: string) {
+    walkInFieldsReady = false; walkInFieldMessage = "申込項目を読み込んでいます。";
+    try {
+      const fields: FormField[] = await api(`/events/${eventId}/form-fields`);
+      if (selectedEventId !== eventId) return;
+      walkInFields = fields; walkInFieldsReady = true; walkInFieldMessage = "";
+    } catch (error) {
+      if (selectedEventId === eventId) walkInFieldMessage = error instanceof Error ? error.message : "申込項目を読み込めませんでした。";
+    }
   }
   async function loadOrganizers(eventId: string) {
     try {
@@ -417,12 +444,16 @@
       screen = "home"; selectedEventId = ""; await loadEvents(); message = result.action === "deleted" ? "下書きイベントを削除しました。" : "イベントをアーカイブしました。";
     } catch (error) { message = error instanceof Error ? error.message : "イベントを処理できませんでした。"; }
   }
-  async function selectEvent(eventId: string) { await Promise.all([loadMetrics(eventId), loadRoster(eventId), loadSchedule(eventId), loadOrganizers(eventId), loadVenues(eventId)]); }
+  async function selectEvent(eventId: string) {
+    walkInName = ""; walkInEmail = ""; walkInAnswers = {}; walkInQr = ""; walkInFields = []; checkinMessage = "";
+    await Promise.all([loadMetrics(eventId), loadRoster(eventId), loadSchedule(eventId), loadOrganizers(eventId), loadVenues(eventId), loadWalkInFields(eventId)]);
+  }
   async function createField() {
     try {
       const options = fieldOptions.split(/[\n,]/).map((option) => option.trim()).filter(Boolean);
       await api(`/events/${selectedEventId}/form-fields`, { method: "POST", body: JSON.stringify({ key: fieldKey, label: fieldLabel, type: fieldType, required: fieldRequired, options }) });
       fieldKey = ""; fieldLabel = ""; fieldOptions = ""; fieldRequired = false; fieldMessage = "項目を追加しました。";
+      await Promise.all([loadRoster(selectedEventId), loadWalkInFields(selectedEventId)]);
     } catch (error) { fieldMessage = error instanceof Error ? error.message : "項目を追加できませんでした。"; }
   }
   async function loadRegistration() {
@@ -486,13 +517,6 @@
       passkeyMessage = verification.prfCapable ? "Passkeyを登録しました。PRFによる鍵保護が利用可能です。" : "Passkeyを登録しました。この端末ではPRF鍵保護は利用できません。";
     } catch (error) { passkeyMessage = error instanceof Error ? error.message : "Passkeyを登録できませんでした。"; }
   }
-  function options(field: { options_json: string }) { try { const value: unknown = JSON.parse(field.options_json); return Array.isArray(value) ? value.filter((item): item is string => typeof item === "string") : []; } catch { return []; } }
-  function stringAnswer(key: string) { const value = registrationAnswers[key]; return typeof value === "string" ? value : ""; }
-  function setStringAnswer(key: string, value: string) { registrationAnswers = { ...registrationAnswers, [key]: value }; }
-  function checkedAnswer(key: string) { return registrationAnswers[key] === true; }
-  function setCheckedAnswer(key: string, checked: boolean) { registrationAnswers = { ...registrationAnswers, [key]: checked }; }
-  function selectedAnswer(key: string, option: string) { const value = registrationAnswers[key]; return Array.isArray(value) && value.includes(option); }
-  function toggleSelectedAnswer(key: string, option: string, checked: boolean) { const current = registrationAnswers[key]; const values = Array.isArray(current) ? current : []; registrationAnswers = { ...registrationAnswers, [key]: checked ? [...new Set([...values, option])] : values.filter((value) => value !== option) }; }
   function answerText(value: unknown) { return Array.isArray(value) ? value.join(", ") : value === true ? "Yes" : value === false ? "No" : typeof value === "string" || typeof value === "number" ? String(value) : ""; }
   function publicScheduleOption(date: string) { return publicSchedule?.options.find((option) => option.date === date); }
 </script>
@@ -529,7 +553,7 @@
   {#if scheduleResponseMessage}<p class="notice" aria-live="polite">{scheduleResponseMessage}</p>{/if}
 {:else if registrationEventId}
   <header><p class="eyebrow">EVENT REGISTRATION</p><h1>tsudoi</h1><p>{publicEvent?.name ?? "申込フォーム"}</p></header>
-  {#if publicEvent}<section><h2>{publicEvent.name}</h2><p>{publicEvent.description}</p><p>{publicEvent.starts_at}</p><form onsubmit={(event) => { event.preventDefault(); void register(); }}><label>氏名<input bind:value={registrationName} required /></label><label>メールアドレス<input bind:value={registrationEmail} type="email" /></label>{#each publicFields as field}{#if field.field_type === "multi_select"}<fieldset><legend>{field.label}{#if field.required === 1}（必須）{/if}</legend>{#each options(field) as option}<label class="inline"><input type="checkbox" checked={selectedAnswer(field.field_key, option)} onchange={(event) => toggleSelectedAnswer(field.field_key, option, event.currentTarget.checked)} />{option}</label>{/each}</fieldset>{:else if field.field_type === "checkbox" || field.field_type === "consent"}<label class="inline"><input type="checkbox" checked={checkedAnswer(field.field_key)} onchange={(event) => setCheckedAnswer(field.field_key, event.currentTarget.checked)} required={field.required === 1} />{field.label}</label>{:else}<label>{field.label}{#if field.field_type === "textarea"}<textarea value={stringAnswer(field.field_key)} oninput={(event) => setStringAnswer(field.field_key, event.currentTarget.value)} required={field.required === 1}></textarea>{:else if field.field_type === "single_select"}<select value={stringAnswer(field.field_key)} onchange={(event) => setStringAnswer(field.field_key, event.currentTarget.value)} required={field.required === 1}><option value="">選択してください</option>{#each options(field) as option}<option value={option}>{option}</option>{/each}</select>{:else}<input value={stringAnswer(field.field_key)} oninput={(event) => setStringAnswer(field.field_key, event.currentTarget.value)} required={field.required === 1} type={field.field_type === "number" ? "number" : field.field_type === "date" ? "date" : "text"} />{/if}</label>{/if}{/each}{#if turnstileSiteKey}<div id="registration-turnstile"></div>{/if}<button disabled={Boolean(turnstileSiteKey) && !turnstileToken}>申し込む</button></form></section>{/if}
+  {#if publicEvent}<section><h2>{publicEvent.name}</h2><p>{publicEvent.description}</p><p>{publicEvent.starts_at}</p><form onsubmit={(event) => { event.preventDefault(); void register(); }}><label>氏名<input bind:value={registrationName} required /></label><label>メールアドレス<input bind:value={registrationEmail} type="email" /></label><FieldInputs fields={publicFields} bind:answers={registrationAnswers} />{#if turnstileSiteKey}<div id="registration-turnstile"></div>{/if}<button disabled={Boolean(turnstileSiteKey) && !turnstileToken}>申し込む</button></form></section>{/if}
   {#if registrationMessage}<p class="notice" aria-live="polite">{registrationMessage}</p>{/if}
   {#if ticketQr}<section aria-labelledby="ticket-qr"><h2 id="ticket-qr">あなたの受付QR</h2><p>会場で提示してください。安全のため、他者へ転送しないでください。</p><img src={ticketQr} alt="受付用QRコード" width="320" height="320" /></section>{/if}
   {#if issuedTicket}<section aria-labelledby="passkey-registration"><h2 id="passkey-registration">Passkey を登録する</h2><p>この端末でチケットを安全に再表示できるようにします。PRF対応Passkeyでは、E2EE鍵の保護にも使用します。</p><button onclick={registerPasskey}>Passkey を登録</button>{#if passkeyMessage}<p class="notice" aria-live="polite">{passkeyMessage}</p>{/if}</section>{/if}
@@ -631,7 +655,9 @@
       <button>受付する</button>
     </form>
     {#if checkinMessage}<p class="notice" aria-live="polite">{checkinMessage}</p>{/if}
-    <h3>当日参加者を登録</h3><form onsubmit={(event) => { event.preventDefault(); void registerWalkIn(); }}><label>氏名<input bind:value={walkInName} required /></label><label>メールアドレス（任意）<input bind:value={walkInEmail} type="email" /></label><button>登録する</button></form>
+    <h3>当日参加者を登録</h3>
+    {#if walkInFieldMessage}<p class="notice" aria-live="polite">{walkInFieldMessage}</p>{#if !walkInFieldsReady}<button class="quiet" onclick={() => loadWalkInFields(selectedEventId)}>申込項目を再読み込み</button>{/if}{/if}
+    <form onsubmit={(event) => { event.preventDefault(); void registerWalkIn(); }}><fieldset disabled={!walkInFieldsReady || walkInSaving}><label>氏名<input bind:value={walkInName} required /></label><label>メールアドレス（任意）<input bind:value={walkInEmail} type="email" /></label><FieldInputs fields={walkInFields} bind:answers={walkInAnswers} /><button>{walkInSaving ? "登録しています…" : "登録する"}</button></fieldset></form>
     {#if walkInQr}<img src={walkInQr} alt="当日参加者の受付用 QR コード" width="320" height="320" />{/if}
       </section>
     {/if}
