@@ -86,6 +86,18 @@ node scripts/wrangler-env.mjs production versions view '<今回のversion ID>' -
 
 Worker version と deployment は別の記録対象である。version に含まれるのは Worker code/assets/bindings/compatibility settings であり、D1/KV/R2 の状態や Git commit は自動で含まれない。上記ではcommitをmessage/tagに明示的に記録する。active versionの100%配信とversion messageのcommitを照合する。[Cloudflare Workers versions and deployments](https://developers.cloudflare.com/workers/versions-and-deployments/)
 
+### CSVプレビューの定時削除
+
+default・staging・productionのWrangler設定に `*/5 * * * *` を定義し、5分ごとに期限切れの `roster_import_previews` を削除する。DBの現在時刻と比較して期限内のプレビューを保持し、100件ずつ最大10回（1000件）で終了する。超過分は次回以降へ繰り越す。参加者・チケット・回答・監査ログは削除しない。CronはUTCで動き、設定変更の反映には最大15分かかる場合がある。[Cloudflare Cron Triggers](https://developers.cloudflare.com/workers/configuration/cron-triggers/)
+
+デプロイ後にWorkerのTriggers設定でCronを照合し、Workers Logs / Cron Eventsで `import_preview_cleanup` の成功と `deletedCount`、`limitReached` を確認する。`limitReached: true` は処理上限へ到達した意味で、残件の存在を確定するものではない。繰り返し上限へ達する場合や失敗が続く場合は、滞留件数を調べて処理量を見直す。本文やプレビューJSONをログへ出さない。
+
+```bash
+node scripts/wrangler-env.mjs production d1 execute DB --remote --command "SELECT COUNT(*) AS expired_count FROM roster_import_previews WHERE expires_at <= CURRENT_TIMESTAMP;"
+```
+
+新規Cronのイベント表示には時間がかかることがある。設定が存在するだけで実行成功と記録せず、確認できた範囲を反映記録に残す。HTTP経由の公開メンテナンスAPIは設けない。D1エラーはscheduled handlerから伝播し、成功ログは出さない。
+
 デプロイ失敗、active version の特定失敗、または想定と異なる commit/version の場合は受入確認へ進まず、実行ログを保全して担当者へ連絡する。
 
 ## 4. 即時 smoke test

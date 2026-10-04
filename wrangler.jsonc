@@ -5,6 +5,7 @@
   "compatibility_date": "2026-09-21",
   "compatibility_flags": ["nodejs_compat"],
   "observability": { "enabled": true, "head_sampling_rate": 1 },
+  "triggers": { "crons": ["*/5 * * * *"] },
 
   // The default environment is safe for local development and Deploy to Cloudflare.
   // Resource IDs are intentionally omitted so Wrangler can provision resources for a fork.
@@ -36,6 +37,7 @@
   "env": {
     "staging": {
       "name": "tsudoi-staging",
+      "triggers": { "crons": ["*/5 * * * *"] },
       "assets": {
         "directory": "./web/dist",
         "binding": "ASSETS",
@@ -59,6 +61,7 @@
     },
     "production": {
       "name": "tsudoi-production",
+      "triggers": { "crons": ["*/5 * * * *"] },
       "workers_dev": true,
       "preview_urls": false,
       "assets": {
