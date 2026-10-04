@@ -8,6 +8,8 @@ tsudoi manages venue-based rosters, advance registration, walk-in check-in, QR t
 
 CI records Worker, UI, and test line counts on every push to `main`. Dashboard data and charts are committed in [`stats/`](stats/).
 
+The coverage chart measures `web/src/lib/e2ee.ts` only. Worker integration tests and browser acceptance tests run separately; the chart does not represent overall application coverage.
+
 ![Codebase size](stats/codebase-growth.svg)
 ![Unit test coverage](stats/coverage-trend.svg)
 
@@ -22,6 +24,9 @@ Snapshot: [`stats/stats.md`](stats/stats.md)
 - Individual ticket tokens and atomic duplicate-safe check-in
 - Attendee Passkey registration and session issuance
 - E2EE message ciphertext, key-envelope, and encrypted attachment storage boundaries
+- Date polls and OAuth/MCP scheduling connections, availability overlap suggestions, and confirmed iCalendar events
+
+See [`docs/release-readiness.md`](docs/release-readiness.md) for the reviewed change groups, validation, deployment state, and remaining device checks.
 
 See the full product and technical requirements in [`docs/specification.md`](docs/specification.md).
 
@@ -29,7 +34,9 @@ See the full product and technical requirements in [`docs/specification.md`](doc
 
 `wrangler.jsonc` is a public template. It contains no account-specific resource IDs or production domains. The default environment is intended for local development and the Deploy to Cloudflare button; `staging` and `production` are named environments with separate resource names.
 
-Before deploying `staging` or `production`, copy `.env.<environment>.example` to `.env.<environment>.local` and fill in the account, resource, domain, and verified sender values. The local file is ignored by git. `RP_ID` must be the hostname used by `APP_ORIGIN`.
+Before deploying `staging` or `production`, copy `.env.<environment>.example` to `.env.<environment>.local` and fill in the account, resource, domain, and verified sender values. The local file is ignored by git. `RP_ID` must be the hostname used by `APP_ORIGIN` or a valid registrable parent domain ([WebAuthn RP ID rules](https://www.w3.org/TR/webauthn-3/#rp-id)); retain the existing RP ID when deploying so existing Passkeys continue to work.
+
+Set `TURNSTILE_SITE_KEY` in each deployed environment and add its matching `TURNSTILE_SECRET` as a Wrangler secret. When a site key is configured, public registration fails closed if the secret is missing or verification fails. Local development can leave both unset. Apply the D1 migrations before accepting traffic after a deployment that adds a migration.
 
 Resource IDs are intentionally omitted from the public template. The deploy wrapper generates an ignored, environment-specific Wrangler config from the local env file. Leave an ID empty to let Wrangler provision a resource, or provide an existing resource ID. Routes and verified email senders are also supplied by the local env file.
 
@@ -47,6 +54,8 @@ npm run db:migrate:production
 
 Apply the remote migration after the first deployment has provisioned the selected D1 database. The Deploy to Cloudflare button continues to use the public template; environment-specific deploys use the local wrapper.
 
+For an existing database, apply additive migrations before deploying code that depends on them. Preserve the numbered migrations already recorded in that environment.
+
 ## Local development
 
 ```bash
@@ -58,6 +67,8 @@ npm run dev
 ```
 
 Local bindings use Wrangler's local storage. Do not put API tokens, private keys, or other secrets in `wrangler.jsonc`; use Wrangler secrets or ignored `.dev.vars` files instead.
+
+`npm run test:e2e` builds the app and starts a local Worker with all D1 migrations in a fresh, ignored `.wrangler/e2e/run-*` directory. It uses `localhost` for WebAuthn and Chromium virtual authenticators for organizer and participant Passkeys. It never uses remote bindings or the private production configuration.
 
 ## Health dashboard
 
