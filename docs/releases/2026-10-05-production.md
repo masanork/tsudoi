@@ -87,10 +87,12 @@ PNG生成は`qrcode`のserver entrypointを明示し、Worker向けbundleのbrow
 | DB | 追加migrationなし。反映前に未適用migrationなしを確認 |
 | 自動検証 | build、型チェック0/0、通常12件、Worker/D1 59件、運用4件、Chromium E2E 5件、production dry-run成功 |
 | 本番HTTP確認 | 2026-10-04 22:26:52 UTC、7チェック成功 |
-| Cron設定 | 2026-10-04 22:25:17 UTC、Cloudflare APIで `*/5 * * * *` を確認 |
-| 定時処理の本番実行 | 2026-10-04 22:30 UTC時点では成功ログ未確認（Cron設定の確認とは区別） |
+| Cron設定 | 2026-10-04 22:25:17 UTCと22:46:07 UTC、Cloudflare APIで `*/5 * * * *` を確認 |
+| 定時処理の本番実行 | 2026-10-04 22:46:07 UTC時点で成功ログ未確認。Cloudflare GraphQLの `workersInvocationsScheduled` も反映後の履歴は空。実行成功・失敗のどちらも確定していない |
 | 反映前の期限切れ件数 | `COUNT(*)` による読み取りで0件 |
 
 scheduled handlerの存在、version messageのcommit、active deploymentを照合した。定時処理はD1現在時刻で期限切れだけを判定し、100件ずつ最大10回削除する。期限内のプレビュー、参加者・チケット・回答・監査ログは対象外。成功ログは削除件数と上限到達だけを記録する。実装者・テスト担当・独立レビュワーを分け、境界時刻・複数組織・有効プレビュー保持・冪等性・1000件上限と残件の後続削除・D1エラー伝播を実Workerd/D1で確認した。
+
+本番の定時実行は残確認とする。WorkerのTriggers設定を再照合し、Cron Events / Workers Logsで成功したscheduled invocationを確認する。上記の空の履歴や絞り込んだtailでログを取得できなかった結果だけから、Cronが実行されていないと断定しない。
 
 今回の反映では新たな参加申込・受付・メール送信は行っていない。実機Passkey・カメラ、主催者認証後の本番操作、実AIクライアント接続は引き続き未確認。定時削除導入前のhandlerなしの版へ戻す場合は、先に対象環境の `triggers.crons` を `[]` にしてCron設定を反映し、停止を確認してからWorkerをrollbackする。handler対応版の復元までCronは無効に保つ。詳しい順序は[ランブック](../deployment-runbook.md#8-失敗時のロールバック)を参照する。
