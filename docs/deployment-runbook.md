@@ -6,7 +6,7 @@
 
 ## 1. 対象と作業前確認
 
-1. `main` に PR4 のマージ commit `6bde4c1` とPNGメール修正commit `19500e0` が含まれていることを確認し、作業ツリーが clean であることを確認する。
+1. `main` に PR4 のマージ commit `6bde4c1`、PNGメール修正commit `19500e0`、CSVプレビュー定時削除のPR6マージcommit `aeff98c` が含まれていることを確認し、作業ツリーが clean であることを確認する。
 
    ```bash
    git switch main
@@ -15,6 +15,7 @@
    git log -1 --format='%H %s'
    git merge-base --is-ancestor 6bde4c1 HEAD
    git merge-base --is-ancestor 19500e0 HEAD
+   git merge-base --is-ancestor aeff98c HEAD
    ```
 
    `git status --short` に出力がある場合は止め、対象を特定してから clean な checkout でやり直す。以降の記録には `git rev-parse HEAD` の完全な commit hash を使う。
@@ -164,6 +165,8 @@ Worker の不具合なら、確認済みの直前 production version を Cloudfl
 rollback 先が active になる前にデータ構造の互換性を確認する。どちらの方法でも戻した Git commit と active version ID を記録する。復旧後に health・metadata・ログイン・名簿・受付を再確認する。
 
 現在の直前versionは `7586923b-24e7-4187-83df-cc2e888e32d4`（PNG修正、定時削除導入前）。Cron設定はWorker versionのrollbackでは戻らない。`scheduled()`のない版へ戻す前に対象環境のWrangler設定の `triggers.crons` を `[]` にし、`node scripts/wrangler-env.mjs production triggers deploy` で反映する。Triggers設定でCronがないことを照合し、設定変更の伝播中は旧handlerへ切り替えず、停止を確認してからWorkerをrollbackする。handler対応版を復元するまでCronを無効に保つ。PNG修正の直前versionは `71dcc52b-a3db-4e4c-a54a-56ea5c98b7ef`（PR4、SVG添付）。さらに以前のversion `e9dbff5c-488f-4c54-ace4-393f3906a523` は元commitが不明なので、互換性未確認のまま戻さない。新規 `possession-v2` チケットを扱えることを確認したコードを選ぶ。
+
+復旧時はhandler対応版のactive配信を先に確認し、対象環境の `triggers.crons` を `["*/5 * * * *"]` に戻して `node scripts/wrangler-env.mjs production triggers deploy` を再実行する。Triggers設定と伝播後の `import_preview_cleanup` 成功ログを確認してから、定時削除の復旧を完了とする。Worker versionの切替だけでCronが再開したと判断しない。
 
 **`0004` はロールバック時にも保持する。** migration を戻す SQL は実行せず、列・テーブル・履歴を削除しない。`0004` の追加は旧アプリとの後方互換を保つための additive schema change である。データベース migration の後戻しは Worker の rollback に含めない。将来の schema cleanup が必要なら、別リリースで利用状況を確認し、独立した計画・レビューを経て行う。
 
