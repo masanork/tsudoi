@@ -14,6 +14,8 @@
     "typecheck": "tsc --noEmit && npm --prefix web run check",
     "test": "vitest run --passWithNoTests",
     "test:worker": "vitest run --config vitest.worker.config.ts",
+    "test:operations": "node --test test/scripts/production-preflight.test.mjs",
+    "check:deployed": "node scripts/production-preflight.mjs",
     "test:coverage": "vitest run --coverage",
     "test:e2e": "playwright test",
     "stats": "node scripts/health.mjs",
