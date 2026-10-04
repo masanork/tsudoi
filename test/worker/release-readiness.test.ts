@@ -39,6 +39,41 @@ async function fixture() {
 }
 
 describe("Release reception boundaries", () => {
+  it("registers walk-ins with visible required answers without exposing or writing administrator-only fields", async () => {
+    const f = await fixture();
+    const venueId = await f.venue("Reception");
+    for (const field of [
+      { key: "company", label: "Company", type: "text", required: true },
+      { key: "interests", label: "Interests", type: "multi_select", required: true, options: ["A", "B"] },
+      { key: "consent", label: "Consent", type: "consent", required: true },
+      { key: "private", label: "Private", type: "text", required: true, staffVisibility: "admin_only" },
+    ]) {
+      expect((await SELF.fetch(`${base}/api/events/${f.eventId}/form-fields`, { method: "POST", headers: f.headers, body: JSON.stringify(field) })).status).toBe(201);
+    }
+    const staff = await f.member("staff", venueId);
+    const register = (headers: Record<string, string>, answers: Record<string, unknown>) => SELF.fetch(`${base}/api/events/${f.eventId}/attendees`, {
+      method: "POST", headers, body: JSON.stringify({ name: "Walk-in", venueId, answers }),
+    });
+    const answers = { company: "Example", interests: ["B"], consent: true };
+    const fields = await (await SELF.fetch(`${base}/api/events/${f.eventId}/form-fields`, { headers: staff.headers })).json<Array<{ field_key: string }>>();
+    expect(fields.map((field) => field.field_key).sort()).toEqual(["company", "consent", "interests"]);
+    expect((await register(staff.headers, {})).status).toBe(400);
+    expect((await register(staff.headers, { ...answers, interests: [] })).status).toBe(400);
+    expect((await register(staff.headers, { ...answers, consent: false })).status).toBe(400);
+    expect((await register(staff.headers, { ...answers, private: "Forbidden" })).status).toBe(403);
+    // Administrators and public applicants still answer every required field.
+    expect((await register(f.headers, answers)).status).toBe(400);
+    await SELF.fetch(`${base}/api/events/${f.eventId}/publish`, { method: "POST", headers: f.headers });
+    expect((await SELF.fetch(`${base}/public/events/${f.eventId}/register`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ name: "Public", answers }) })).status).toBe(400);
+    const registered = await register(staff.headers, answers);
+    expect(registered.status).toBe(201);
+    const guest = await registered.json<Registration>();
+    await expect(env.DB.prepare("SELECT field_id FROM attendee_answers WHERE attendee_id = ?").bind(guest.attendeeId).all()).resolves.toMatchObject({ results: [expect.anything(), expect.anything(), expect.anything()] });
+    const roster = await SELF.fetch(`${base}/api/events/${f.eventId}/roster`, { headers: staff.headers });
+    await expect(roster.json()).resolves.toMatchObject({ attendees: [expect.objectContaining({ id: guest.attendeeId, answers })] });
+    expect((await SELF.fetch(`${base}/api/tickets/${guest.ticketId}/check-in`, { method: "POST", headers: staff.headers, body: JSON.stringify({ ticketToken: guest.qrToken, venueId }) })).status).toBe(200);
+  });
+
   it("limits both roster endpoints and form metadata to a staff member's assigned venue", async () => {
     const f = await fixture();
     const venueA = await f.venue("A"), venueB = await f.venue("B");

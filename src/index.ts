@@ -1141,9 +1141,13 @@ async function registerAttendee(c: Context<AppEnv>, event: EventRow, staffRegist
   if (!name) return badRequest(c, "name is required");
   const email = optionalString(body.email)?.trim().toLowerCase();
   if (email && !email.includes("@")) return badRequest(c, "invalid email");
-  const fields = await c.env.DB.prepare("SELECT id, field_key, field_type, required, options_json FROM form_fields WHERE event_id = ? AND retired_at IS NULL").bind(event.id).all<FieldRow>();
+  const fields = await c.env.DB.prepare("SELECT id, field_key, field_type, required, options_json, staff_visibility FROM form_fields WHERE event_id = ? AND retired_at IS NULL").bind(event.id).all<FieldRow & { staff_visibility: string }>();
   const answers = isRecord(body.answers) ? body.answers : {};
-  for (const field of fields.results) {
+  const isStaff = staffRegistration && c.get("auth").role === "staff";
+  // Staff cannot supply or be required to answer fields they cannot view.
+  if (isStaff && fields.results.some((field) => field.staff_visibility !== "visible" && answers[field.field_key] !== undefined)) return forbidden(c);
+  const writableFields = fields.results.filter((field) => !isStaff || field.staff_visibility === "visible");
+  for (const field of writableFields) {
     const answer = answers[field.field_key];
     if (field.required && !hasRequiredAnswer(field, answer)) return badRequest(c, `${field.field_key} is required`);
     if (answer !== undefined && !isValidFieldAnswer(field, answer)) return badRequest(c, `${field.field_key} is invalid`);
@@ -1164,7 +1168,7 @@ async function registerAttendee(c: Context<AppEnv>, event: EventRow, staffRegist
     c.env.DB.prepare("INSERT INTO ticket_qr_tokens (id, ticket_id, token_hash, expires_at) VALUES (?, ?, ?, datetime('now', '+1 year'))")
       .bind(crypto.randomUUID(), ticketId, await sha256(qrToken)),
   ];
-  for (const field of fields.results) if (answers[field.field_key] !== undefined) statements.push(c.env.DB.prepare("INSERT INTO attendee_answers (attendee_id, field_id, value_json) VALUES (?, ?, ?)").bind(attendeeId, field.id, JSON.stringify(answers[field.field_key])));
+  for (const field of writableFields) if (answers[field.field_key] !== undefined) statements.push(c.env.DB.prepare("INSERT INTO attendee_answers (attendee_id, field_id, value_json) VALUES (?, ?, ?)").bind(attendeeId, field.id, JSON.stringify(answers[field.field_key])));
   try { await c.env.DB.batch(statements); }
   catch (error) {
     if (error instanceof Error && error.message.includes("capacity_reached")) return c.json({ error: "capacity_reached" }, 409);
