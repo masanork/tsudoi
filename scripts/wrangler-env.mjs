@@ -33,6 +33,7 @@ config.vars = {
   ...(values.RP_ID ? { RP_ID: values.RP_ID } : {}),
   ...(values.RP_NAME ? { RP_NAME: values.RP_NAME } : {}),
   ...(values.EMAIL_FROM ? { EMAIL_FROM: values.EMAIL_FROM } : {}),
+  ...(values.TURNSTILE_SITE_KEY ? { TURNSTILE_SITE_KEY: values.TURNSTILE_SITE_KEY } : {}),
 };
 
 const database = config.d1_databases?.[0];

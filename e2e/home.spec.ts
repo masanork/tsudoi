@@ -10,6 +10,12 @@ test("shows initial setup or Passkey login without credential fields", async ({ 
 test("routes a participant to the ticket screen", async ({ page }) => {
   await page.goto("/ticket");
   await expect(page.getByText("YOUR TICKET")).toBeVisible();
+  await expect(page.getByRole("button", { name: "Passkey でログイン" })).toBeVisible();
+});
+
+test("routes an invitee to Passkey enrollment", async ({ page }) => {
+  await page.goto("/invite/sample-token");
+  await expect(page.getByRole("heading", { name: "tsudoi への招待" })).toBeVisible();
 });
 
 test("routes a visitor to an event registration screen", async ({ page }) => {
