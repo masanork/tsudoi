@@ -577,12 +577,36 @@ app.get("/api/events/:eventId/attendees", requireScope("roster:read"), async (c)
 app.get("/api/events/:eventId/attendees.csv", requireScope("admin"), async (c) => {
   const event = await eventForAuth(c);
   if (!event) return c.json({ error: "not_found" }, 404);
-  const fields = await c.env.DB.prepare("SELECT id, label FROM form_fields WHERE event_id = ? ORDER BY sort_order, created_at").bind(event.id).all<{ id: string; label: string }>();
-  const attendees = await c.env.DB.prepare("SELECT id, name, email_normalized, registration_source, status, created_at FROM attendees WHERE event_id = ? ORDER BY created_at").bind(event.id).all<{ id: string; name: string; email_normalized: string | null; registration_source: string; status: string; created_at: string }>();
+  const fields = await c.env.DB.prepare("SELECT id, field_key, label, field_type FROM form_fields WHERE event_id = ? ORDER BY sort_order, created_at").bind(event.id).all<{ id: string; field_key: string; label: string; field_type: string }>();
+  const venueRows = await c.env.DB.prepare("SELECT id, name FROM venues WHERE event_id = ?").bind(event.id).all<{ id: string; name: string }>();
+  const venueNameCounts = new Map<string, number>();
+  for (const venue of venueRows.results) {
+    const key = venue.name.trim().toLocaleLowerCase();
+    venueNameCounts.set(key, (venueNameCounts.get(key) ?? 0) + 1);
+  }
+  const venueLabels = new Map(venueRows.results.map((venue) => [venue.id,
+    (venueNameCounts.get(venue.name.trim().toLocaleLowerCase()) ?? 0) > 1 ? venue.id : venue.name,
+  ]));
+  const attendees = await c.env.DB.prepare(`SELECT id, name, affiliation, email_normalized, venue_id, registration_source, status, created_at
+    FROM attendees WHERE event_id = ? ORDER BY created_at`).bind(event.id)
+    .all<{ id: string; name: string; affiliation: string; email_normalized: string | null; venue_id: string | null; registration_source: string; status: string; created_at: string }>();
   const answers = await c.env.DB.prepare("SELECT attendee_id, field_id, value_json FROM attendee_answers WHERE attendee_id IN (SELECT id FROM attendees WHERE event_id = ?)").bind(event.id).all<{ attendee_id: string; field_id: string; value_json: string }>();
-  const answerMap = new Map(answers.results.map((answer) => [`${answer.attendee_id}:${answer.field_id}`, csvAnswer(answer.value_json)]));
-  const header = ["Name", "Email", "Registration source", "Status", "Registered at", ...fields.results.map((field) => field.label)];
-  const rows = attendees.results.map((attendee) => [attendee.name, attendee.email_normalized ?? "", attendee.registration_source, attendee.status, attendee.created_at, ...fields.results.map((field) => answerMap.get(`${attendee.id}:${field.id}`) ?? "")]);
+  const fieldTypeById = new Map(fields.results.map((field) => [field.id, field.field_type]));
+  const answerMap = new Map(answers.results.map((answer) => [`${answer.attendee_id}:${answer.field_id}`, csvAnswer(answer.value_json, fieldTypeById.get(answer.field_id))]));
+  const standardHeaders = new Set(["name", "affiliation", "email", "venue", "registration source", "status", "registered at"]);
+  const labelCounts = new Map<string, number>();
+  for (const field of fields.results) {
+    const key = field.label.trim().toLocaleLowerCase();
+    labelCounts.set(key, (labelCounts.get(key) ?? 0) + 1);
+  }
+  const answerHeaders = fields.results.map((field) => {
+    const normalized = field.label.trim().toLocaleLowerCase();
+    return normalized.startsWith("answer:") || standardHeaders.has(normalized) || (labelCounts.get(normalized) ?? 0) > 1
+      ? `answer:${field.field_key}`
+      : field.label;
+  });
+  const header = ["Name", "Affiliation", "Email", "Venue", "Registration source", "Status", "Registered at", ...answerHeaders];
+  const rows = attendees.results.map((attendee) => [attendee.name, attendee.affiliation, attendee.email_normalized ?? "", attendee.venue_id ? venueLabels.get(attendee.venue_id) ?? attendee.venue_id : "", attendee.registration_source, attendee.status, attendee.created_at, ...fields.results.map((field) => answerMap.get(`${attendee.id}:${field.id}`) ?? "")]);
   await audit(c.env.DB, c.get("auth"), "attendees.exported", "event", event.id);
   c.header("Content-Type", "text/csv; charset=utf-8");
   c.header("Content-Disposition", `attachment; filename="tsudoi-${event.id}-attendees.csv"`);
@@ -682,9 +706,9 @@ app.post("/api/events/:eventId/roster/import/preview", requireSession, async (c)
   const columns = body.columns;
   const rows = body.rows;
   const mapping = body.mapping;
-  if (!Array.isArray(columns) || columns.length < 1 || columns.length > 100 || columns.some((value) => typeof value !== "string" || value.length > 200)
+  if (!Array.isArray(columns) || columns.length < 1 || columns.length > 107 || columns.some((value) => typeof value !== "string" || value.length > 200)
     || !Array.isArray(rows) || rows.length < 1 || rows.length > 100 || rows.some((row) => !Array.isArray(row) || row.length !== columns.length || row.some((value) => typeof value !== "string" || value.length > 2000))
-    || !isRecord(mapping)) return badRequest(c, "invalid import payload (maximum 100 rows)");
+    || !isRecord(mapping)) return badRequest(c, "invalid import payload (maximum 100 rows and 107 columns)");
   if ((rows as string[][]).reduce((total, row) => total + row.reduce((rowTotal, value) => rowTotal + value.length, 0), 0) > 400_000) return c.json({ error: "import_payload_too_large", maxCharacters: 400000 }, 413);
   const columnIndex = new Map((columns as string[]).map((column, index) => [column, index]));
   if (new Set(columns as string[]).size !== columns.length) return badRequest(c, "duplicate column names");
@@ -706,8 +730,13 @@ app.post("/api/events/:eventId/roster/import/preview", requireSession, async (c)
   const attendees = await c.env.DB.prepare(`SELECT a.id, a.name, a.email_normalized, a.affiliation, v.name AS venue_name FROM attendees a
     LEFT JOIN venues v ON v.id = a.venue_id WHERE a.event_id = ? AND a.status = 'active'`)
     .bind(event.id).all<{ id: string; name: string; email_normalized: string | null; affiliation: string; venue_name: string | null }>();
-  const venueRows = await c.env.DB.prepare("SELECT id FROM venues WHERE event_id = ?").bind(event.id).all<{ id: string }>();
-  const validVenueIds = new Set(venueRows.results.map((venue) => venue.id));
+  const venueRows = await c.env.DB.prepare("SELECT id, name FROM venues WHERE event_id = ?").bind(event.id).all<{ id: string; name: string }>();
+  const venueById = new Map(venueRows.results.map((venue) => [venue.id.toLocaleLowerCase(), venue.id]));
+  const venuesByName = new Map<string, string[]>();
+  for (const venue of venueRows.results) {
+    const key = venue.name.trim().toLocaleLowerCase();
+    venuesByName.set(key, [...(venuesByName.get(key) ?? []), venue.id]);
+  }
   const seenImportKeys = new Set<string>();
   const previewRows = (rows as string[][]).map((values, rowIndex) => {
     const errors: string[] = [];
@@ -716,8 +745,17 @@ app.post("/api/events/:eventId/roster/import/preview", requireSession, async (c)
     if (!name || name.length > 200) errors.push("name_required_or_too_long");
     if (email && !email.includes("@")) errors.push("invalid_email");
     if (affiliation.length > 200) errors.push("affiliation_too_long");
-    const venueId = get("venueId");
-    if (venueId && !validVenueIds.has(venueId)) errors.push("invalid_venue_id");
+    const venueValue = get("venueId");
+    let venueId: string | null = null;
+    if (venueValue) {
+      const idMatch = venueById.get(venueValue.toLocaleLowerCase());
+      if (idMatch) venueId = idMatch;
+      else {
+        const nameMatches = venuesByName.get(venueValue.trim().toLocaleLowerCase()) ?? [];
+        if (nameMatches.length === 1) venueId = nameMatches[0]!;
+        else errors.push(nameMatches.length > 1 ? "ambiguous_venue_name" : "invalid_venue_id");
+      }
+    }
     const answers: Record<string, unknown> = {};
     for (const field of fields.results) {
       const raw = get(`answer:${field.field_key}`);
@@ -729,7 +767,12 @@ app.post("/api/events/:eventId/roster/import/preview", requireSession, async (c)
         else if (/^(false|no|0|いいえ)$/i.test(raw)) answer = false;
         else { errors.push(`invalid:${field.field_key}`); continue; }
       }
-      else if (field.field_type === "multi_select") answer = raw.split("|").map((value) => value.trim()).filter(Boolean);
+      else if (field.field_type === "multi_select") {
+        try {
+          const parsed: unknown = JSON.parse(raw);
+          answer = Array.isArray(parsed) ? parsed : raw.split(/[|;]/).map((value) => value.trim()).filter(Boolean);
+        } catch { answer = raw.split(/[|;]/).map((value) => value.trim()).filter(Boolean); }
+      }
       if (!isValidFieldAnswer(field, answer) || (field.required && !hasRequiredAnswer(field, answer))) errors.push(`invalid:${field.field_key}`);
       else answers[field.field_key] = answer;
     }
@@ -738,7 +781,7 @@ app.post("/api/events/:eventId/roster/import/preview", requireSession, async (c)
     const importKey = email ? `email:${email}` : `name:${name.toLocaleLowerCase()}:${affiliation.toLocaleLowerCase()}`;
     if (seenImportKeys.has(importKey)) errors.push("duplicate_in_import");
     seenImportKeys.add(importKey);
-    return { rowIndex, values, errors, duplicateCandidates, normalized: { name, email: email || null, affiliation, venueId: venueId || null, answers } };
+    return { rowIndex, values, errors, duplicateCandidates, normalized: { name, email: email || null, affiliation, venueId, answers } };
   });
   const previewToken = randomToken();
   const storedPreview = JSON.stringify(previewRows.map(({ values: _values, ...stored }) => stored));
@@ -781,32 +824,73 @@ app.post("/api/events/:eventId/roster/import/commit", requireSession, async (c) 
     for (const field of fields.results) if (field.required && !hasRequiredAnswer(field, row.normalized.answers[field.field_key])) return c.json({ error: "form_schema_changed" }, 409);
   }
   const batchId = crypto.randomUUID();
-  const statements = [c.env.DB.prepare("UPDATE roster_import_previews SET consumed_at = CURRENT_TIMESTAMP, claim_id = ? WHERE id = ? AND consumed_at IS NULL AND expires_at > CURRENT_TIMESTAMP").bind(batchId, preview.id)];
-  for (const row of chosenRows) {
-    const attendeeId = crypto.randomUUID(), ticketId = crypto.randomUUID(), rawTicketToken = randomToken();
+  const schemaJson = JSON.stringify(fields.results.map((field) => ({ id: field.id, field_key: field.field_key, field_type: field.field_type, required: field.required, options_json: field.options_json })));
+  if (new TextEncoder().encode(schemaJson).byteLength > 1_800_000) return c.json({ error: "form_schema_too_large" }, 413);
+  const importRecords = await Promise.all(chosenRows.map(async (row) => {
+    const attendeeId = crypto.randomUUID();
     const data = row.normalized;
-    const candidateIds = row.duplicateCandidates.map((candidate) => candidate.attendeeId);
-    const candidateClause = candidateIds.length ? `id NOT IN (${candidateIds.map(() => "?").join(",")})` : "1 = 1";
-    const dupePredicate = data.email ? "email_normalized = ?" : "name = ? COLLATE NOCASE AND affiliation = ? COLLATE NOCASE";
-    const dupeValues = data.email ? [data.email] : [data.name, data.affiliation];
-    statements.push(c.env.DB.prepare(`INSERT INTO attendees (id, organization_id, event_id, venue_id, name, email_normalized, affiliation, registration_source)
-      SELECT ?, ?, ?, ?, ?, ?, ?, 'admin' WHERE EXISTS (SELECT 1 FROM roster_import_previews WHERE id = ? AND claim_id = ?)
-      AND NOT EXISTS (SELECT 1 FROM attendees WHERE event_id = ? AND status = 'active' AND ${dupePredicate} AND ${candidateClause})`)
-      .bind(attendeeId, auth.organizationId, event.id, data.venueId, data.name, data.email, data.affiliation, preview.id, batchId, event.id, ...dupeValues, ...candidateIds));
-    statements.push(c.env.DB.prepare(`INSERT INTO tickets (id, attendee_id, event_id, token_hash, token_key_id)
-      SELECT ?, ?, ?, ?, 'possession-v2' WHERE EXISTS (SELECT 1 FROM roster_import_previews WHERE id = ? AND claim_id = ?)`)
-      .bind(ticketId, attendeeId, event.id, await sha256(rawTicketToken), preview.id, batchId));
-    for (const [key, value] of Object.entries(data.answers)) if (fieldId.has(key)) statements.push(c.env.DB.prepare(`INSERT INTO attendee_answers (attendee_id, field_id, value_json)
-      SELECT ?, ?, ? WHERE EXISTS (SELECT 1 FROM roster_import_previews WHERE id = ? AND claim_id = ?)`)
-      .bind(attendeeId, fieldId.get(key), JSON.stringify(value), preview.id, batchId));
-    statements.push(c.env.DB.prepare(`INSERT INTO audit_logs (id, organization_id, actor_id, action, target_type, target_id, metadata_json)
-      SELECT ?, ?, ?, 'attendee.imported', 'attendee', ?, ? WHERE EXISTS (SELECT 1 FROM roster_import_previews WHERE id = ? AND claim_id = ?)`)
-      .bind(crypto.randomUUID(), auth.organizationId, auth.actorId, attendeeId, JSON.stringify({ importId: batchId, venueId: data.venueId, name: data.name, affiliation: data.affiliation }), preview.id, batchId));
-  }
-  statements.push(c.env.DB.prepare(`INSERT INTO audit_logs (id, organization_id, actor_id, action, target_type, target_id, metadata_json)
-    SELECT ?, ?, ?, 'roster.imported', 'event', ?, ? WHERE EXISTS (SELECT 1 FROM roster_import_previews WHERE id = ? AND claim_id = ?)`)
-    .bind(crypto.randomUUID(), auth.organizationId, auth.actorId, event.id, JSON.stringify({ importId: batchId, count: chosenRows.length }), preview.id, batchId));
-  statements.push(c.env.DB.prepare("UPDATE roster_import_previews SET rows_json = '[]' WHERE id = ? AND claim_id = ?").bind(preview.id, batchId));
+    const answers = Object.entries(data.answers).flatMap(([key, value]) => {
+      const id = fieldId.get(key);
+      return id ? [{ fieldId: id, valueJson: JSON.stringify(value) }] : [];
+    });
+    return {
+      attendeeId,
+      ticketId: crypto.randomUUID(),
+      ticketHash: await sha256(randomToken()),
+      name: data.name,
+      email: data.email,
+      affiliation: data.affiliation,
+      venueId: data.venueId,
+      candidateIds: row.duplicateCandidates.map((candidate) => candidate.attendeeId),
+      answers,
+      auditId: crypto.randomUUID(),
+      auditMetadata: JSON.stringify({ importId: batchId, venueId: data.venueId, name: data.name, affiliation: data.affiliation }),
+    };
+  }));
+  const importJson = JSON.stringify(importRecords);
+  if (new TextEncoder().encode(importJson).byteLength > 1_800_000) return c.json({ error: "import_commit_too_large" }, 413);
+  const statements = [
+    c.env.DB.prepare("UPDATE roster_import_previews SET consumed_at = CURRENT_TIMESTAMP, claim_id = ? WHERE id = ? AND consumed_at IS NULL AND expires_at > CURRENT_TIMESTAMP").bind(batchId, preview.id),
+    c.env.DB.prepare(`INSERT INTO attendee_answers (attendee_id, field_id, value_json)
+      SELECT NULL, NULL, NULL WHERE EXISTS (SELECT 1 FROM roster_import_previews WHERE id = ? AND claim_id = ?)
+      AND (EXISTS (SELECT 1 FROM form_fields f WHERE f.event_id = ? AND f.retired_at IS NULL AND NOT EXISTS (
+        SELECT 1 FROM json_each(?) s WHERE json_extract(s.value, '$.id') = f.id AND json_extract(s.value, '$.field_key') = f.field_key
+          AND json_extract(s.value, '$.field_type') = f.field_type AND json_extract(s.value, '$.required') = f.required AND json_extract(s.value, '$.options_json') = f.options_json))
+        OR EXISTS (SELECT 1 FROM json_each(?) s WHERE NOT EXISTS (SELECT 1 FROM form_fields f WHERE f.event_id = ? AND f.retired_at IS NULL
+          AND f.id = json_extract(s.value, '$.id') AND f.field_key = json_extract(s.value, '$.field_key')
+          AND f.field_type = json_extract(s.value, '$.field_type') AND f.required = json_extract(s.value, '$.required') AND f.options_json = json_extract(s.value, '$.options_json'))))`)
+      .bind(preview.id, batchId, event.id, schemaJson, schemaJson, event.id),
+    c.env.DB.prepare(`INSERT INTO attendees (id, organization_id, event_id, venue_id, name, email_normalized, affiliation, registration_source)
+      SELECT json_extract(r.value, '$.attendeeId'), ?, ?, json_extract(r.value, '$.venueId'), json_extract(r.value, '$.name'), json_extract(r.value, '$.email'), json_extract(r.value, '$.affiliation'), 'admin'
+      FROM json_each(?) r WHERE EXISTS (SELECT 1 FROM roster_import_previews WHERE id = ? AND claim_id = ?)
+      AND NOT EXISTS (SELECT 1 FROM attendees a WHERE a.event_id = ? AND a.status = 'active'
+        AND ((json_extract(r.value, '$.email') IS NOT NULL AND a.email_normalized = json_extract(r.value, '$.email'))
+          OR (json_extract(r.value, '$.email') IS NULL AND a.name COLLATE NOCASE = json_extract(r.value, '$.name') COLLATE NOCASE AND a.affiliation COLLATE NOCASE = json_extract(r.value, '$.affiliation') COLLATE NOCASE))
+        AND NOT EXISTS (SELECT 1 FROM json_each(r.value, '$.candidateIds') known WHERE known.value = a.id))
+      AND (json_extract(r.value, '$.venueId') IS NULL OR EXISTS (SELECT 1 FROM venues v WHERE v.id = json_extract(r.value, '$.venueId') AND v.event_id = ?))`)
+      .bind(auth.organizationId, event.id, importJson, preview.id, batchId, event.id, event.id),
+    // An omitted row means a new duplicate appeared after preview or this request lost the claim race.
+    // Violating attendee_answers.attendee_id NOT NULL aborts the entire D1 batch and rolls the claim back.
+    c.env.DB.prepare("INSERT INTO attendee_answers (attendee_id, field_id, value_json) SELECT NULL, NULL, NULL WHERE changes() != ?").bind(importRecords.length),
+    c.env.DB.prepare(`INSERT INTO tickets (id, attendee_id, event_id, token_hash, token_key_id)
+      SELECT json_extract(r.value, '$.ticketId'), a.id, ?, json_extract(r.value, '$.ticketHash'), 'possession-v2'
+      FROM json_each(?) r JOIN attendees a ON a.id = json_extract(r.value, '$.attendeeId') AND a.event_id = ?
+      WHERE EXISTS (SELECT 1 FROM roster_import_previews WHERE id = ? AND claim_id = ?)`).bind(event.id, importJson, event.id, preview.id, batchId),
+    // Keep ticket count tied to selected rows, so a partial batch never consumes the preview.
+    c.env.DB.prepare("INSERT INTO attendee_answers (attendee_id, field_id, value_json) SELECT NULL, NULL, NULL WHERE changes() != ?").bind(importRecords.length),
+    c.env.DB.prepare(`INSERT INTO attendee_answers (attendee_id, field_id, value_json)
+      SELECT json_extract(r.value, '$.attendeeId'), json_extract(answer.value, '$.fieldId'), json_extract(answer.value, '$.valueJson')
+      FROM json_each(?) r CROSS JOIN json_each(r.value, '$.answers') answer
+      WHERE EXISTS (SELECT 1 FROM roster_import_previews WHERE id = ? AND claim_id = ?)`).bind(importJson, preview.id, batchId),
+    c.env.DB.prepare(`INSERT INTO audit_logs (id, organization_id, actor_id, action, target_type, target_id, metadata_json)
+      SELECT json_extract(r.value, '$.auditId'), ?, ?, 'attendee.imported', 'attendee', json_extract(r.value, '$.attendeeId'), json_extract(r.value, '$.auditMetadata')
+      FROM json_each(?) r WHERE EXISTS (SELECT 1 FROM roster_import_previews WHERE id = ? AND claim_id = ?)`)
+      .bind(auth.organizationId, auth.actorId, importJson, preview.id, batchId),
+    c.env.DB.prepare(`INSERT INTO audit_logs (id, organization_id, actor_id, action, target_type, target_id, metadata_json)
+      SELECT ?, ?, ?, 'roster.imported', 'event', ?, ? WHERE EXISTS (SELECT 1 FROM roster_import_previews WHERE id = ? AND claim_id = ?)`)
+      .bind(crypto.randomUUID(), auth.organizationId, auth.actorId, event.id, JSON.stringify({ importId: batchId, count: chosenRows.length }), preview.id, batchId),
+    c.env.DB.prepare("UPDATE roster_import_previews SET rows_json = '[]' WHERE id = ? AND claim_id = ?").bind(preview.id, batchId),
+  ];
   try {
     const result = await c.env.DB.batch(statements);
     if (!result[0]?.meta.changes) return c.json({ error: "preview_expired_or_consumed" }, 409);
@@ -1361,6 +1445,8 @@ async function registerAttendee(c: Context<AppEnv>, event: EventRow, staffRegist
   const body = await jsonBody(c);
   const name = requiredString(body, "name");
   if (!name) return badRequest(c, "name is required");
+  const affiliation = body.affiliation === undefined || body.affiliation === null ? "" : typeof body.affiliation === "string" ? body.affiliation.trim() : undefined;
+  if (affiliation === undefined || affiliation.length > 200) return badRequest(c, "invalid affiliation");
   const email = optionalString(body.email)?.trim().toLowerCase();
   if (email && !email.includes("@")) return badRequest(c, "invalid email");
   const fields = await c.env.DB.prepare("SELECT id, field_key, field_type, required, options_json, staff_visibility FROM form_fields WHERE event_id = ? AND retired_at IS NULL").bind(event.id).all<FieldRow & { staff_visibility: string }>();
@@ -1383,8 +1469,8 @@ async function registerAttendee(c: Context<AppEnv>, event: EventRow, staffRegist
   if (staffRegistration && c.get("auth").role === "staff" && await checkInVenueError(c, event.id, venueId)) return forbidden(c);
   const source = staffRegistration ? "walk_in" : "public_form";
   const statements = [
-    c.env.DB.prepare("INSERT INTO attendees (id, organization_id, event_id, venue_id, name, email_normalized, registration_source) VALUES (?, ?, ?, ?, ?, ?, ?)")
-      .bind(attendeeId, event.organization_id, event.id, venueId ?? null, name, email ?? null, source),
+    c.env.DB.prepare("INSERT INTO attendees (id, organization_id, event_id, venue_id, name, email_normalized, affiliation, registration_source) VALUES (?, ?, ?, ?, ?, ?, ?, ?)")
+      .bind(attendeeId, event.organization_id, event.id, venueId ?? null, name, email ?? null, affiliation, source),
     c.env.DB.prepare("INSERT INTO tickets (id, attendee_id, event_id, token_hash, token_key_id) VALUES (?, ?, ?, ?, ?)")
       .bind(ticketId, attendeeId, event.id, await sha256(ticketToken), "possession-v2"),
     c.env.DB.prepare("INSERT INTO ticket_qr_tokens (id, ticket_id, token_hash, expires_at) VALUES (?, ?, ?, datetime('now', '+1 year'))")
@@ -2103,7 +2189,7 @@ function isValidFieldAnswer(field: FieldRow, answer: unknown): boolean {
   if (field.field_type === "checkbox" || field.field_type === "consent") return typeof answer === "boolean";
   if (field.field_type === "multi_select") return Array.isArray(answer) && answer.every((item) => typeof item === "string" && options.includes(item));
   if (field.field_type === "single_select") return typeof answer === "string" && options.includes(answer);
-  if (field.field_type === "number") return typeof answer === "number" || (typeof answer === "string" && answer.trim() !== "" && Number.isFinite(Number(answer)));
+  if (field.field_type === "number") return (typeof answer === "number" && Number.isFinite(answer)) || (typeof answer === "string" && answer.trim() !== "" && Number.isFinite(Number(answer)));
   if (field.field_type === "date") return typeof answer === "string" && /^\d{4}-\d{2}-\d{2}$/.test(answer);
   return typeof answer === "string";
 }
@@ -2143,10 +2229,20 @@ function cookieValue(header: string | undefined, name: string) {
   return header.split(";").map((part) => part.trim()).find((part) => part.startsWith(prefix))?.slice(prefix.length);
 }
 function csvCell(value: string) {
-  const safe = /^[\s]*[=+\-@]|^[\t\r\n]/.test(value) ? `'${value}` : value;
+  const numericLiteral = /^-?(?:0|[1-9]\d*)(?:\.\d+)?(?:[eE][+-]?\d+)?$/.test(value) && Number.isFinite(Number(value));
+  const safe = !numericLiteral && (/^[\s]*[=+\-@]|^[\t\r\n]/.test(value)) ? `'${value}` : value;
   return `"${safe.replaceAll('"', '""')}"`;
 }
-function csvAnswer(value: string) { try { const parsed: unknown = JSON.parse(value); return Array.isArray(parsed) ? parsed.join("; ") : typeof parsed === "string" || typeof parsed === "number" || typeof parsed === "boolean" ? String(parsed) : ""; } catch { return ""; } }
+function csvAnswer(value: string, fieldType?: string) {
+  try {
+    const parsed: unknown = JSON.parse(value);
+    if (fieldType === "number") {
+      if (typeof parsed === "number" && Number.isFinite(parsed)) return String(parsed);
+      if (typeof parsed === "string" && parsed.trim() !== "" && Number.isFinite(Number(parsed))) return String(Number(parsed));
+    }
+    return Array.isArray(parsed) ? JSON.stringify(parsed) : typeof parsed === "string" || typeof parsed === "number" || typeof parsed === "boolean" ? String(parsed) : "";
+  } catch { return ""; }
+}
 function clientIp(c: Context<AppEnv>) { return c.req.header("cf-connecting-ip") ?? "local"; }
 async function inviteForToken(c: Context<AppEnv>) {
   return c.env.DB.prepare("SELECT id, organization_id, role, email_normalized FROM organization_invites WHERE token_hash = ? AND consumed_at IS NULL AND expires_at > CURRENT_TIMESTAMP")

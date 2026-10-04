@@ -82,6 +82,7 @@
   let scheduleNote = "";
   let metrics: { registrations: number; issued: number; cancelled: number; checked_in: number; not_checked_in: number } | null = null;
   let rosterFields: Array<{ field_key: string; label: string }> = [];
+  let rosterReady = false;
   let rosterAttendees: Array<{ id: string; ticket_id: string; name: string; email_normalized: string | null; ticket_status: string; answers: Record<string, string | number | boolean | string[] | null>; affiliation?: string | null; venue_id?: string | null; revision?: number; checked_in_by_display_name?: string | null }> = [];
   let confirmAttendee: typeof rosterAttendees[number] | null = null;
   let rosterQuery = "";
@@ -389,7 +390,7 @@
   function readCsvFile(file: File | undefined) {
     csvPreview = null; csvMessage = ""; csvColumns = []; csvRows = []; csvMapping = {}; csvDecisions = [];
     if (!file) return;
-    if (file.size > 1_000_000) { csvMessage = "CSVはUTF-8、1 MB以下、データ100行・100列以下にしてください。"; return; }
+    if (file.size > 1_000_000) { csvMessage = "CSVはUTF-8、1 MB以下、データ100行・107列以下にしてください。"; return; }
     const eventId = selectedEventId;
     void file.arrayBuffer().then((buffer) => {
       const text = new TextDecoder("utf-8", { fatal: true }).decode(buffer);
@@ -407,10 +408,10 @@
       row.push(value); if (row.some((cell) => cell !== "")) parsed.push(row);
       if (parsed.length < 2) { csvMessage = "見出し行とデータ行を含む CSV を選んでください。"; return; }
       if (parsed.some((cells) => cells.length !== parsed[0].length)) { csvMessage = "CSVの各行で列数が一致しません。"; return; }
-      if (parsed[0].length > 100) { csvMessage = "CSVは100列以下にしてください。"; return; }
+      if (parsed[0].length > 107) { csvMessage = "CSVは107列以下にしてください。"; return; }
       if (parsed.length - 1 > 100) { csvMessage = "CSVはデータ100行以下にしてください。"; return; }
       csvColumns = parsed[0]; csvRows = parsed.slice(1); csvMapping = { name: csvColumns.find((column) => /^(氏名|名前|name)$/i.test(column)) ?? "", affiliation: csvColumns.find((column) => /^(所属|会社|affiliation)$/i.test(column)) ?? "", email: csvColumns.find((column) => /^(メール|メールアドレス|email)$/i.test(column)) ?? "", venueId: csvColumns.find((column) => /^(会場|venue)$/i.test(column)) ?? "" };
-      for (const field of rosterFields) csvMapping[`answer:${field.field_key}`] = csvColumns.find((column) => column === field.label || column === field.field_key) ?? "";
+      for (const field of rosterFields) csvMapping[`answer:${field.field_key}`] = csvColumns.find((column) => column === `answer:${field.field_key}`) ?? csvColumns.find((column) => column === field.label || column === field.field_key) ?? "";
     }).catch(() => { csvColumns = []; csvRows = []; csvMapping = {}; csvMessage = "CSVをUTF-8で読み込めませんでした。"; });
   }
   function invalidateCsvPreview() { csvPreview = null; csvDecisions = []; if (csvMessage.startsWith("プレビュー:")) csvMessage = "列の対応を変更しました。プレビューをやり直してください。"; }
@@ -442,6 +443,7 @@
     catch (error) { message = error instanceof Error ? error.message : "集計を読み込めませんでした。"; }
   }
   async function loadRoster(eventId: string, append = false) {
+    if (!append && selectedEventId === eventId) rosterReady = false;
     try {
       const params = new URLSearchParams();
       if (rosterQuery) params.set("q", rosterQuery);
@@ -450,8 +452,10 @@
       if (rosterVenueId) params.set("venueId", rosterVenueId);
       if (append && rosterCursor) params.set("after", rosterCursor);
       const roster = await api(`/events/${eventId}/roster?${params}`);
+      if (selectedEventId !== eventId) return;
       rosterFields = roster.fields; rosterAttendees = append ? [...rosterAttendees, ...roster.attendees] : roster.attendees;
       rosterCursor = roster.nextCursor;
+      rosterReady = true;
     }
     catch (error) { message = error instanceof Error ? error.message : "名簿を読み込めませんでした。"; }
   }
@@ -551,6 +555,7 @@
     } catch (error) { message = error instanceof Error ? error.message : "イベントを処理できませんでした。"; }
   }
   async function selectEvent(eventId: string) {
+    rosterReady = false; rosterFields = []; rosterAttendees = [];
     walkInName = ""; walkInEmail = ""; walkInAnswers = {}; walkInQr = ""; walkInFields = []; checkinMessage = "";
     await Promise.all([loadMetrics(eventId), loadRoster(eventId), loadSchedule(eventId), loadOrganizers(eventId), loadVenues(eventId), loadWalkInFields(eventId)]);
   }
@@ -740,7 +745,7 @@
       {/if}
       <section aria-labelledby="roster"><h2 id="roster">名簿を管理</h2><p class="muted">申込者と受付状態を確認できます。</p><form onsubmit={(event) => { event.preventDefault(); void loadRoster(selectedEventId); }}><label>検索<input bind:value={rosterQuery} placeholder="氏名またはメール" /></label><label>状態<select bind:value={rosterStatus}><option value="">すべて</option><option value="active">有効</option><option value="cancelled">取消</option></select></label><label>申込経路<select bind:value={rosterSource}><option value="">すべて</option><option value="public_form">事前申込</option><option value="walk_in">当日登録</option></select></label><label>会場<select bind:value={rosterVenueId}><option value="">すべて</option>{#each venues as venue}<option value={venue.id}>{venue.name}</option>{/each}</select></label><button>絞り込む</button></form>
       {#if ticketLinkMessage}<p class="notice" aria-live="polite">{ticketLinkMessage}</p>{/if}
-      {#if isAdministrator}<section aria-labelledby="roster-import"><h3 id="roster-import">CSVから名簿を取り込む</h3><p class="muted">UTF-8 CSV、1 MB以下、データ100行・100列以下にしてください。CSV取込ではメールを送信しません。メールのない参加者は名簿から本人確認して受付してください。</p><label>CSVファイル<input type="file" accept=".csv,text/csv" onchange={(event) => readCsvFile(event.currentTarget.files?.[0])} /></label>
+      {#if isAdministrator}<section aria-labelledby="roster-import"><h3 id="roster-import">CSVから名簿を取り込む</h3><p class="muted">UTF-8 CSV、1 MB以下、データ100行・107列以下にしてください。CSV取込ではメールを送信しません。メールのない参加者は名簿から本人確認して受付してください。会場列は同じイベント内の会場名またはID、複数選択は「|」区切り、チェック項目は true / false、数値は有限の数で指定します。</p><label>CSVファイル<input type="file" accept=".csv,text/csv" disabled={!rosterReady} onchange={(event) => readCsvFile(event.currentTarget.files?.[0])} /></label>
         {#if csvColumns.length}<div class="form-grid"><label>氏名列<select bind:value={csvMapping.name} onchange={invalidateCsvPreview}><option value="">列を選択</option>{#each csvColumns as column}<option value={column}>{column}</option>{/each}</select></label><label>所属列<select bind:value={csvMapping.affiliation} onchange={invalidateCsvPreview}><option value="">列を選択</option>{#each csvColumns as column}<option value={column}>{column}</option>{/each}</select></label><label>メール列<select bind:value={csvMapping.email} onchange={invalidateCsvPreview}><option value="">列を選択</option>{#each csvColumns as column}<option value={column}>{column}</option>{/each}</select></label><label>会場列<select bind:value={csvMapping.venueId} onchange={invalidateCsvPreview}><option value="">列を選択</option>{#each csvColumns as column}<option value={column}>{column}</option>{/each}</select></label>
         {#each rosterFields as field}<label>{field.label}列<select bind:value={csvMapping[`answer:${field.field_key}`]} onchange={invalidateCsvPreview}><option value="">列を選択</option>{#each csvColumns as column}<option value={column}>{column}</option>{/each}</select></label>{/each}</div><button type="button" onclick={() => void previewCsv()}>プレビューを確認</button>{/if}
         {#if csvPreview}<p>{csvPreview.validCount} 行を取り込み可能</p><div class="table-scroll"><table><thead><tr><th>氏名</th><th>所属</th><th>メール</th><th>重複候補・判断</th></tr></thead><tbody>{#each csvPreview.rows as row, rowIndex}<tr><td>{row.values[csvColumns.indexOf(csvMapping.name)] ?? ""}</td><td>{row.values[csvColumns.indexOf(csvMapping.affiliation)] ?? ""}</td><td>{row.values[csvColumns.indexOf(csvMapping.email)] ?? ""}</td><td>{#if row.errors.length}<span>{row.errors.map(csvErrorText).join("、")}</span>{:else if row.duplicateCandidates.length}{#each row.duplicateCandidates as candidate}<p>既存候補: {candidate.name}{#if candidate.affiliation}・{candidate.affiliation}{/if}{#if candidate.venueName}・会場 {candidate.venueName}{/if}{#if candidate.email} ({candidate.email}){/if}</p>{/each}<select aria-label={`重複候補の扱い ${rowIndex + 1}行目`} bind:value={csvDecisions[rowIndex]}><option value="skip">取り込まない</option><option value="include">新規として登録</option></select>{:else}重複候補なし{/if}</td></tr>{/each}</tbody></table></div><button type="button" onclick={() => void commitCsv()}>取り込みを確定</button>{/if}
