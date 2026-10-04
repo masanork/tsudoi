@@ -5,7 +5,7 @@ import type { Context, MiddlewareHandler } from "hono";
 import type { ContentfulStatusCode } from "hono/utils/http-status";
 import { generateAuthenticationOptions, generateRegistrationOptions, verifyAuthenticationResponse, verifyRegistrationResponse } from "@simplewebauthn/server";
 import type { AuthenticationResponseJSON, RegistrationResponseJSON } from "@simplewebauthn/server";
-import * as QRCode from "qrcode";
+import * as QRCodeServer from "qrcode/lib/server.js";
 import { checkIn } from "./check-in";
 import { calendarDate, canonicalDate, confirmedCalendar, extractInviteToken, parseConstraints, parseScheduleSlot, pkceS256, suggestSlots } from "./schedule-protocol";
 
@@ -2301,9 +2301,16 @@ export default {
           const qrToken = await issueQrToken(env.DB, ticket.id, "+1 year");
           ticketUrl = `${env.APP_ORIGIN}/public/tickets/${ticket.id}/check-in/${qrToken}`;
         }
-        const ticketQr = await QRCode.toString(ticketUrl, { type: "svg", errorCorrectionLevel: "M", margin: 1, width: 640 });
+        const ticketQr = await QRCodeServer.toBuffer(ticketUrl, {
+          type: "png",
+          errorCorrectionLevel: "M",
+          margin: 4,
+          width: 640,
+          color: { dark: "#000000", light: "#FFFFFF" },
+        });
+        const ticketQrContentId = "tsudoi-ticket-qr";
         await env.EMAIL.send({ to: job.to, from: { email: env.EMAIL_FROM, name: "tsudoi" }, subject: `Your ticket link for ${job.eventName}`,
-          text: `Open your ticket: ${job.link}\n\nThis link expires in 24 hours and can be used once. The attached QR is for venue check-in.`, html: `<p>Open your ticket for <strong>${escapeHtml(job.eventName)}</strong>:</p><p><a href="${escapeHtml(job.link)}">Open ticket</a></p><p>This link expires in 24 hours and can be used once. The attached QR is for venue check-in.</p>`, attachments: [{ content: ticketQr, filename: "tsudoi-ticket-qr.svg", type: "image/svg+xml", disposition: "attachment" }] });
+          text: `Open your ticket: ${job.link}\n\nThis link expires in 24 hours and can be used once. The inline QR image is for venue check-in.`, html: `<p>Open your ticket for <strong>${escapeHtml(job.eventName)}</strong>:</p><p><a href="${escapeHtml(job.link)}">Open ticket</a></p><p>This link expires in 24 hours and can be used once.</p><p>The QR image below is for venue check-in.</p><p><img src="cid:${ticketQrContentId}" alt="Venue check-in QR code" width="320" height="320"></p>`, attachments: [{ content: ticketQr, filename: "tsudoi-ticket-qr.png", type: "image/png", disposition: "inline", contentId: ticketQrContentId }] });
       } else if (isEventAnnouncementJob(job)) {
         await env.EMAIL.send({ to: job.to, from: { email: env.EMAIL_FROM, name: "tsudoi" }, subject: `${job.eventName}: ${job.subject}`,
           text: job.message, html: `<p>${escapeHtml(job.message).replaceAll("\n", "<br>")}</p>` });
