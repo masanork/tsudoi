@@ -2,7 +2,7 @@
 
 PR4までの変更を `https://tsudoi.tossa.app` に反映し、その後メールQRをPNGへ修正した。司令塔が対象照合・migration・配置、実装者が確認ツール・メール修正・回帰テスト、独立レビュワーがコード・テスト・手順を担当した。実メール受信、本人確認リンク、Gmail本文内でのPNG QR表示は確認済み。実機・実AIクライアントは未確認。
 
-現在の本番は、後述のPNG修正commit `19500e0034c41ec6989ebe849e659edb78350c61`、Worker version `7586923b-24e7-4187-83df-cc2e888e32d4`。次の表はPR4の初回反映の履歴である。
+現在の本番は、後述のCSVプレビュー定時削除のマージcommit `aeff98c071a6e00f75899d3b6064a48e8dd612e8`、Worker version `96b5207f-1128-45f9-be1f-7b67bcee1325`。次の表はPR4の初回反映の履歴である。
 
 | 項目 | 記録 |
 | --- | --- |
@@ -71,3 +71,26 @@ PNG生成は`qrcode`のserver entrypointを明示し、Worker向けbundleのbrow
 許可された同じ検証用宛先へ、新規の専用イベントから通常の公開登録経路で1通再送した。登録`201`・Queue投入を確認し、イベントは閉鎖・アーカイブ済み、参加者は1件。PNG版の本人確認リンクはこの表示確認では使用していない。既存イベント・参加者は変更していない。モバイルのメールアプリ、実カメラ受付、主催者の認証後操作、実AIクライアント接続はこの結果に含めない。
 
 残る確認と次回反映は[ランブック](../deployment-runbook.md)に従う。ロールバックでも`0004`の列・テーブル・履歴を保持し、`possession-v2`チケットに対応するコードを使う。元commit不明の直前versionは互換性を確認してから選ぶ。秘密値・参加者情報・復旧位置をこの公開記録には含めない。
+
+## CSVプレビューの定時削除
+
+[PR5](https://github.com/masanork/tsudoi/pull/5)をマージ後、次の残課題として期限切れCSVプレビューの定時削除を実装した。[PR6](https://github.com/masanork/tsudoi/pull/6)は独立レビュー・GitHub自動レビューで指摘なし、[CI](https://github.com/masanork/tsudoi/actions/runs/37239695218)成功後にマージし、そのマージcommitから本番配置した。
+
+| 項目 | 記録 |
+| --- | --- |
+| Git commit | `aeff98c071a6e00f75899d3b6064a48e8dd612e8`（PR6マージcommit） |
+| Worker version | `96b5207f-1128-45f9-be1f-7b67bcee1325`、100%配信 |
+| deployment作成日時 | 2026-10-04 22:24:50 UTC / 2026-10-05 07:24:50 JST |
+| version tag / message | `aeff98c` / 完全commitとscheduled CSV preview cleanupを記録 |
+| 直前version | `7586923b-24e7-4187-83df-cc2e888e32d4`（PNGメール修正） |
+| 実行者・ツール | Codex司令塔 / Wrangler 4.136.0 |
+| DB | 追加migrationなし。反映前に未適用migrationなしを確認 |
+| 自動検証 | build、型チェック0/0、通常12件、Worker/D1 59件、運用4件、Chromium E2E 5件、production dry-run成功 |
+| 本番HTTP確認 | 2026-10-04 22:26:52 UTC、7チェック成功 |
+| Cron設定 | 2026-10-04 22:25:17 UTC、Cloudflare APIで `*/5 * * * *` を確認 |
+| 定時処理の本番実行 | 2026-10-04 22:30 UTC時点では成功ログ未確認（Cron設定の確認とは区別） |
+| 反映前の期限切れ件数 | `COUNT(*)` による読み取りで0件 |
+
+scheduled handlerの存在、version messageのcommit、active deploymentを照合した。定時処理はD1現在時刻で期限切れだけを判定し、100件ずつ最大10回削除する。期限内のプレビュー、参加者・チケット・回答・監査ログは対象外。成功ログは削除件数と上限到達だけを記録する。実装者・テスト担当・独立レビュワーを分け、境界時刻・複数組織・有効プレビュー保持・冪等性・1000件上限と残件の後続削除・D1エラー伝播を実Workerd/D1で確認した。
+
+今回の反映では新たな参加申込・受付・メール送信は行っていない。実機Passkey・カメラ、主催者認証後の本番操作、実AIクライアント接続は引き続き未確認。定時削除導入前のhandlerなしの版へ戻す場合は、先に対象環境の `triggers.crons` を `[]` にしてCron設定を反映し、停止を確認してからWorkerをrollbackする。handler対応版の復元までCronは無効に保つ。詳しい順序は[ランブック](../deployment-runbook.md#8-失敗時のロールバック)を参照する。
