@@ -1,11 +1,11 @@
 # tsudoi codebase snapshot
 
-Commit `c9cacaf` · 2026-10-04
+Commit `aeff98c` · 2026-10-04
 
 | Area | Files | Lines |
 | --- | ---: | ---: |
-| Worker `src/` | 4 | 2618 |
+| Worker `src/` | 5 | 2652 |
 | UI `web/src/` | 5 | 940 |
-| Tests `test/` | 9 | 1751 |
+| Tests `test/` | 10 | 1870 |
 
 - Line coverage: 100%

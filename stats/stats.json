@@ -1,17 +1,17 @@
 {
-  "generatedAt": "2026-10-04T22:15:47.399Z",
-  "commit": "c9cacaf",
+  "generatedAt": "2026-10-04T22:25:43.770Z",
+  "commit": "aeff98c",
   "worker": {
-    "files": 4,
-    "lines": 2618
+    "files": 5,
+    "lines": 2652
   },
   "web": {
     "files": 5,
     "lines": 940
   },
   "tests": {
-    "files": 9,
-    "lines": 1751
+    "files": 10,
+    "lines": 1870
   },
   "coverage": 100
 }
