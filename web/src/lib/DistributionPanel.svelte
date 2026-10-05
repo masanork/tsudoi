@@ -6,7 +6,7 @@
   type Venue = { id: string; name: string };
   type Attendee = { id: string; name: string; affiliation?: string | null; venue_id?: string | null; ticket_status?: string };
   type Distribution = { id: string; name: string; unit: string; max_per_attendee: number; active: boolean | number; created_at: string };
-  type Claim = { id: string; request_id: string; quantity: number; attendee_id: string; attendee_name: string; affiliation?: string | null; venue_id?: string | null; venue_name?: string | null; status: "accepted" | "limit_reached" | "reversed"; used_now?: number; remaining_now?: number; created_at: string; reversed_at?: string | null; reverse_reason?: string | null };
+  type Claim = { id: string; request_id: string; quantity: number; attendee_id: string; attendee_name: string; affiliation?: string | null; venue_id?: string | null; venue_name?: string | null; status: "accepted" | "limit_reached" | "reversed"; proxy_group_id?: string | null; used_now?: number; remaining_now?: number; created_at: string; reversed_at?: string | null; reverse_reason?: string | null };
   type Person = { attendee_id: string; name: string; affiliation?: string | null; venue_id?: string | null; venue_name?: string | null };
   type ClaimPayload = { requestId: string; attendeeId?: string; qrLink?: string; quantity: number; venueId?: string };
 
@@ -122,7 +122,7 @@
     finally { submitting = false; }
   }
 
-  async function confirmClaim(payload = pendingRetry) {
+  async function confirmClaim(payload = pendingRetry, retryingUnknown = false) {
     if (!payload || submitting || !pendingDistributionId) return;
     submitting = true; errorMessage = ""; statusMessage = "受け渡しを記録しています…";
     try {
@@ -131,7 +131,10 @@
     } catch (error) {
       errorMessage = friendly(error);
       const status = error && typeof error === "object" && "status" in error ? Number((error as { status: unknown }).status) : 0;
-      if (status >= 400 && status < 500 && status !== 429) {
+      if (retryingUnknown && status >= 400 && status < 500 && status !== 429) {
+        pendingRetry = payload;
+        statusMessage = "前回の結果を確認できません。権限や会場の状態を確認し、担当者に照会してください。";
+      } else if (status >= 400 && status < 500 && status !== 429) {
         pendingRetry = null; pendingDistributionId = "";
         statusMessage = "内容を確認して修正してください。受け渡しは記録されていません。";
       }
@@ -153,7 +156,7 @@
       const status = error && typeof error === "object" && "status" in error ? Number((error as { status: unknown }).status) : 0;
       if (status === 404) {
         submitting = false;
-        await confirmClaim(payload);
+        await confirmClaim(payload, true);
         return;
       }
       errorMessage = friendly(error);
@@ -320,7 +323,7 @@
                 {#if claim.status === "accepted" && !claim.reversed_at && claim.used_now !== undefined}<small>この配布回: 使用 {claim.used_now}/{selectedDistribution.max_per_attendee}、残り {claim.remaining_now ?? Math.max(0, selectedDistribution.max_per_attendee - claim.used_now)} {selectedDistribution.unit}</small>{/if}
                 {#if (claim.status === "reversed" || claim.reversed_at) && claim.reverse_reason}<small>取消理由: {claim.reverse_reason}</small>{/if}
               </div>
-              {#if isAdmin && claim.status === "accepted" && !claim.reversed_at}<button type="button" class="quiet" disabled={submitting} onclick={() => { reverseTarget = claim; reverseReason = ""; }}>取消</button>{/if}
+              {#if isAdmin && claim.status === "accepted" && !claim.reversed_at && !claim.proxy_group_id}<button type="button" class="quiet" disabled={submitting} onclick={() => { reverseTarget = claim; reverseReason = ""; }}>取消</button>{:else if isAdmin && claim.status === "accepted" && !claim.reversed_at && claim.proxy_group_id}<span class="muted">世帯受取の履歴からまとめて取消</span>{/if}
             </article>
           {/each}
         </div>

@@ -72,6 +72,16 @@ export async function verifyDistributionFlow(page: Page, context: BrowserContext
   }, { times: 1 });
   await distribution.getByRole("button", { name: /配布確認者.*渡したことを記録/ }).click();
   await expect(distribution.getByRole("button", { name: /再試行|再確認/ })).toBeEnabled();
+  // A permission change can hide the committed status. It must stay unconfirmed.
+  await page.route(`**/api/events/${eventId}/distributions/*/claims/by-request/*`, (route) => route.fulfill({
+    status: 404, contentType: "application/json", body: JSON.stringify({ error: "not_found" }),
+  }), { times: 1 });
+  await page.route(`**/api/events/${eventId}/distributions/*/claims`, (route) => route.fulfill({
+    status: 403, contentType: "application/json", body: JSON.stringify({ error: "venue_not_assigned" }),
+  }), { times: 1 });
+  await distribution.getByRole("button", { name: /再試行|再確認/ }).click();
+  await expect(distribution).toContainText("前回の結果を確認できません");
+  await expect(distribution.getByRole("button", { name: /再試行|再確認/ })).toBeEnabled();
   const dinnerClaimed = page.waitForResponse((r) => (/\/distributions\/[^/]+\/claims$/.test(r.url()) && r.request().method() === "POST")
     || (/\/claims\/by-request\/[^/]+$/.test(r.url()) && r.status() === 200));
   await distribution.getByRole("button", { name: /再試行|再確認/ }).click();

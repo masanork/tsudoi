@@ -1055,7 +1055,7 @@ app.get("/api/events/:eventId/distributions/:distributionId/claims", requireScop
   const rows = await c.env.DB.prepare(`SELECT dc.id, dc.request_id, dc.quantity, dc.attendee_id,
       a.name AS attendee_name, a.affiliation, dc.venue_id, v.name AS venue_name,
       CASE WHEN dc.reversed_at IS NOT NULL THEN 'reversed' ELSE dc.outcome END AS status,
-      dc.created_at, dc.reversed_at, dc.reverse_reason,
+      dc.created_at, dc.reversed_at, dc.reverse_reason, dc.proxy_group_id,
       (SELECT COALESCE(SUM(current_claim.quantity), 0) FROM distribution_claims current_claim
         WHERE current_claim.distribution_id = dc.distribution_id AND current_claim.attendee_id = dc.attendee_id
           AND current_claim.outcome = 'accepted' AND current_claim.reversed_at IS NULL) AS used_now,
@@ -1109,10 +1109,11 @@ app.post("/api/events/:eventId/distributions/:distributionId/claims/:claimId/rev
   const body = await jsonBody(c);
   const reason = typeof body.reason === "string" ? body.reason.trim() : "";
   if (!reason || reason.length > 500 || Object.keys(body).some((key) => key !== "reason")) return badRequest(c, "reason is required and must be at most 500 characters");
-  const claim = await c.env.DB.prepare(`SELECT id, outcome, reversed_at FROM distribution_claims
+  const claim = await c.env.DB.prepare(`SELECT id, outcome, reversed_at, proxy_group_id FROM distribution_claims
     WHERE id = ? AND distribution_id = ? AND event_id = ? AND organization_id = ?`)
-    .bind(claimId, distributionId, event.id, auth.organizationId).first<{ id: string; outcome: string; reversed_at: string | null }>();
+    .bind(claimId, distributionId, event.id, auth.organizationId).first<{ id: string; outcome: string; reversed_at: string | null; proxy_group_id:string|null }>();
   if (!claim) return c.json({ error: "not_found" }, 404);
+  if (claim.proxy_group_id) return c.json({ error: "proxy_claim_requires_group_reverse" }, 409);
   if (claim.reversed_at) return c.json({ error: "claim_already_reversed" }, 409);
   if (claim.outcome !== "accepted") return c.json({ error: "claim_not_reversible" }, 409);
 
@@ -1137,6 +1138,359 @@ app.post("/api/events/:eventId/distributions/:distributionId/claims/:claimId/rev
     return eventActive ? c.json({ error: "claim_already_reversed" }, 409) : c.json({ error: "not_found" }, 404);
   }
   return c.json({ reversed: true, claim: { ...reversed, status: "reversed" } });
+});
+
+// Paper QR cards are a separate issuance record. The QR token is supplied by the
+// authorized issuer and is only ever persisted as a hash in ticket_qr_tokens.
+app.post("/api/events/:eventId/attendees/:attendeeId/qr-cards", requireScope("checkin:write"), (c) => issuePaperQrCard(c, "additional"));
+app.post("/api/events/:eventId/attendees/:attendeeId/qr-cards/reissue", requireScope("admin"), (c) => issuePaperQrCard(c, "replacement"));
+
+app.get("/api/events/:eventId/attendees/:attendeeId/qr-cards/by-request/:requestId", requireScope("checkin:write"), async (c) => {
+  const event = await eventForAuth(c);
+  if (!event) return c.json({ error: "not_found" }, 404);
+  const auth = c.get("auth"), attendeeId = c.req.param("attendeeId"), requestId = c.req.param("requestId");
+  if (!requestId || !isUuid(requestId)) return badRequest(c, "invalid request id");
+  const row = await c.env.DB.prepare(`SELECT r.action,r.revoked_count,r.legacy_credential_invalidated, r.created_by, card.id, card.kind, card.issued_at, card.expires_at,
+      CASE WHEN card.revoked_at IS NULL AND card.expires_at > CURRENT_TIMESTAMP AND t.status IN ('issued','checked_in')
+        AND a.status = 'active' AND (q.id IS NOT NULL) THEN 1 ELSE 0 END AS active,
+      r.venue_id
+    FROM ticket_qr_card_requests r JOIN ticket_qr_cards card ON card.id = r.card_id
+    JOIN attendees a ON a.id = r.attendee_id JOIN tickets t ON t.id = r.ticket_id
+    LEFT JOIN ticket_qr_tokens q ON q.id = card.qr_token_id AND q.expires_at > CURRENT_TIMESTAMP
+    LEFT JOIN attendee_presence p ON p.event_id = a.event_id AND p.attendee_id = a.id
+    WHERE r.organization_id = ? AND r.event_id = ? AND r.attendee_id = ? AND r.request_id = ? AND r.created_by = ?
+      AND a.organization_id = ? AND a.event_id = ? AND t.attendee_id = a.id
+      AND (? != 'staff' OR EXISTS (SELECT 1 FROM venue_staff_assignments s JOIN venues v ON v.id=s.venue_id
+        WHERE s.user_id=? AND v.event_id=a.event_id AND s.venue_id=r.venue_id))`)
+    .bind(auth.organizationId, event.id, attendeeId, requestId, auth.actorId, auth.organizationId, event.id,
+      auth.role, auth.actorId).first<Record<string, unknown>>();
+  return row ? c.json({ card: { id: row.id, kind: row.kind, issued_at: row.issued_at, expires_at: row.expires_at, active: row.active === 1 },
+    ...(row.action==="replacement"?{revokedCount:row.revoked_count,legacyCredentialInvalidated:row.legacy_credential_invalidated===1}:{}) }) : c.json({ error: "not_found" }, 404);
+});
+
+app.get("/api/events/:eventId/households", requireScope("roster:read"), async (c) => {
+  const event = await eventForAuth(c);
+  if (!event) return c.json({ error: "not_found" }, 404);
+  const auth = c.get("auth"), venueId = c.req.query("venueId") ?? "";
+  if (auth.role === "staff") {
+    if (!venueId) return c.json({ error: "venue_required" }, 403);
+    const err = await checkInVenueError(c, event.id, venueId);
+    if (err) return c.json({ error: err }, 403);
+  }
+  const rows = await c.env.DB.prepare(`SELECT h.id,h.name,
+      COUNT(DISTINCT CASE WHEN m.removed_at IS NULL AND a.status='active'
+        AND (? != 'staff' OR COALESCE(CASE WHEN p.state='in' THEN p.venue_id END,a.venue_id)=?) THEN a.id END) AS member_count
+    FROM households h LEFT JOIN household_memberships m ON m.household_id=h.id
+    LEFT JOIN attendees a ON a.id=m.attendee_id AND a.event_id=h.event_id AND a.organization_id=h.organization_id
+    LEFT JOIN attendee_presence p ON p.event_id=a.event_id AND p.attendee_id=a.id
+    WHERE h.event_id=? AND h.organization_id=? AND h.archived_at IS NULL
+      AND (? != 'staff' OR EXISTS (SELECT 1 FROM household_memberships sm JOIN attendees sa ON sa.id=sm.attendee_id
+        LEFT JOIN attendee_presence sp ON sp.event_id=sa.event_id AND sp.attendee_id=sa.id
+        WHERE sm.household_id=h.id AND sm.removed_at IS NULL AND sa.status='active'
+          AND COALESCE(CASE WHEN sp.state='in' THEN sp.venue_id END,sa.venue_id)=?))
+    GROUP BY h.id ORDER BY h.name COLLATE NOCASE,h.id LIMIT 200`)
+    .bind(auth.role,venueId, event.id,auth.organizationId,auth.role,venueId).all<Record<string,unknown>>();
+  return c.json({ households: rows.results });
+});
+
+app.post("/api/events/:eventId/households", requireScope("admin"), async (c) => {
+  const event = await eventForAuth(c);
+  if (!event) return c.json({ error: "not_found" }, 404);
+  const auth = c.get("auth"), body = await jsonBody(c), name = requiredString(body,"name")?.trim();
+  if (!name || name.length > 120 || Object.keys(body).some(k=>k!=="name")) return badRequest(c,"invalid household name");
+  const id=crypto.randomUUID(), auditId=crypto.randomUUID();
+  await c.env.DB.batch([
+    c.env.DB.prepare(`INSERT INTO households(id,organization_id,event_id,name,created_by)
+      SELECT ?,?,?,?,? WHERE EXISTS(SELECT 1 FROM events WHERE id=? AND organization_id=? AND archived_at IS NULL)`)
+      .bind(id,auth.organizationId,event.id,name,auth.actorId,event.id,auth.organizationId),
+    c.env.DB.prepare(`INSERT INTO audit_logs(id,organization_id,actor_id,action,target_type,target_id,metadata_json)
+      SELECT ?,?,?, 'household.created','household',?,? WHERE EXISTS(SELECT 1 FROM households WHERE id=?)`)
+      .bind(auditId,auth.organizationId,auth.actorId,id,JSON.stringify({eventId:event.id}),id),
+  ]);
+  const created=await c.env.DB.prepare("SELECT id,name FROM households WHERE id=? AND organization_id=? AND event_id=?").bind(id,auth.organizationId,event.id).first();
+  return created?c.json({household:created},201):c.json({error:"not_found"},404);
+});
+
+app.get("/api/events/:eventId/households/:householdId", requireScope("roster:read"), async (c) => {
+  const event=await eventForAuth(c); if(!event)return c.json({error:"not_found"},404);
+  const auth=c.get("auth"), householdId=c.req.param("householdId"), venueId=c.req.query("venueId")??"", distributionId=c.req.query("distributionId")??"";
+  if(auth.role==="staff"){
+    if(!venueId)return c.json({error:"venue_required"},403);
+    const err=await checkInVenueError(c,event.id,venueId);if(err)return c.json({error:err},403);
+  }
+  if(distributionId&&!await c.env.DB.prepare("SELECT 1 FROM distributions WHERE id=? AND event_id=? AND organization_id=?").bind(distributionId,event.id,auth.organizationId).first())return c.json({error:"not_found"},404);
+  const household=await c.env.DB.prepare("SELECT id,name FROM households WHERE id=? AND event_id=? AND organization_id=? AND archived_at IS NULL").bind(householdId,event.id,auth.organizationId).first<Record<string,unknown>>();
+  if(!household)return c.json({error:"not_found"},404);
+  const members=await c.env.DB.prepare(`SELECT a.id AS attendeeId,a.name,a.affiliation,a.venue_id AS venueId,t.status AS ticketStatus,
+      CASE WHEN ?='' THEN NULL ELSE COALESCE((SELECT SUM(dc.quantity) FROM distribution_claims dc WHERE dc.distribution_id=? AND dc.attendee_id=a.id AND dc.outcome='accepted' AND dc.reversed_at IS NULL),0) END AS used,
+      CASE WHEN ?='' THEN NULL ELSE (SELECT d.max_per_attendee-COALESCE((SELECT SUM(dc.quantity) FROM distribution_claims dc WHERE dc.distribution_id=d.id AND dc.attendee_id=a.id AND dc.outcome='accepted' AND dc.reversed_at IS NULL),0) FROM distributions d WHERE d.id=?) END AS remaining
+    FROM household_memberships m JOIN attendees a ON a.id=m.attendee_id JOIN tickets t ON t.attendee_id=a.id AND t.event_id=a.event_id
+    LEFT JOIN attendee_presence p ON p.event_id=a.event_id AND p.attendee_id=a.id
+    WHERE m.household_id=? AND m.removed_at IS NULL AND a.event_id=? AND a.organization_id=? AND a.status='active'
+      AND (?!='staff' OR COALESCE(CASE WHEN p.state='in' THEN p.venue_id END,a.venue_id)=?) ORDER BY a.name COLLATE NOCASE,a.id LIMIT 50`)
+    .bind(distributionId,distributionId,distributionId,distributionId,householdId,event.id,auth.organizationId,auth.role,venueId).all<Record<string,unknown>>();
+  const hasVisible=auth.role!=="staff"||members.results.length>0;
+  return hasVisible?c.json({household:{...household,members:members.results}}):c.json({error:"not_found"},404);
+});
+
+app.patch("/api/events/:eventId/households/:householdId", requireScope("admin"), async (c)=>{
+  const event=await eventForAuth(c);if(!event)return c.json({error:"not_found"},404);
+  const auth=c.get("auth"),householdId=c.req.param("householdId"),body=await jsonBody(c),name=requiredString(body,"name")?.trim();
+  if(!name||name.length>120||Object.keys(body).some(k=>k!=="name"))return badRequest(c,"invalid household name");
+  const changeId=crypto.randomUUID(),auditId=crypto.randomUUID();
+  await c.env.DB.batch([
+    c.env.DB.prepare("UPDATE households SET name=?,updated_at=CURRENT_TIMESTAMP,last_change_id=? WHERE id=? AND event_id=? AND organization_id=? AND archived_at IS NULL AND EXISTS(SELECT 1 FROM events WHERE id=? AND organization_id=? AND archived_at IS NULL)").bind(name,changeId,householdId,event.id,auth.organizationId,event.id,auth.organizationId),
+    c.env.DB.prepare(`INSERT INTO audit_logs(id,organization_id,actor_id,action,target_type,target_id,metadata_json)
+      SELECT ?,?,?, 'household.updated','household',?,? WHERE EXISTS(SELECT 1 FROM households WHERE id=? AND name=? AND last_change_id=? AND event_id=? AND organization_id=? AND archived_at IS NULL)`)
+      .bind(auditId,auth.organizationId,auth.actorId,householdId,JSON.stringify({name}),householdId,name,changeId,event.id,auth.organizationId),
+  ]);
+  const changed=await c.env.DB.prepare("SELECT id FROM households WHERE id=? AND event_id=? AND organization_id=? AND last_change_id=? AND name=?").bind(householdId,event.id,auth.organizationId,changeId,name).first();
+  return changed?c.json({updated:true}):c.json({error:"not_found"},404);
+});
+
+app.delete("/api/events/:eventId/households/:householdId",requireScope("admin"),async(c)=>{
+  const event=await eventForAuth(c);if(!event)return c.json({error:"not_found"},404);
+  const auth=c.get("auth"),householdId=c.req.param("householdId"),opId=crypto.randomUUID(),auditId=crypto.randomUUID();
+  await c.env.DB.batch([
+    c.env.DB.prepare(`UPDATE households SET archived_at=CURRENT_TIMESTAMP,updated_at=CURRENT_TIMESTAMP,last_change_id=?
+      WHERE id=? AND event_id=? AND organization_id=? AND archived_at IS NULL
+        AND EXISTS(SELECT 1 FROM events WHERE id=? AND organization_id=? AND archived_at IS NULL)`)
+      .bind(opId,householdId,event.id,auth.organizationId,event.id,auth.organizationId),
+    c.env.DB.prepare(`INSERT INTO audit_logs(id,organization_id,actor_id,action,target_type,target_id,metadata_json)
+      SELECT ?,?,?, 'household.archived','household',?,? FROM households WHERE id=? AND event_id=? AND organization_id=? AND last_change_id=? AND archived_at IS NOT NULL`)
+      .bind(auditId,auth.organizationId,auth.actorId,householdId,JSON.stringify({eventId:event.id}),householdId,event.id,auth.organizationId,opId),
+  ]);
+  const archived=await c.env.DB.prepare("SELECT id FROM households WHERE id=? AND event_id=? AND organization_id=? AND last_change_id=? AND archived_at IS NOT NULL")
+    .bind(householdId,event.id,auth.organizationId,opId).first();
+  return archived?c.json({archived:true}):c.json({error:"not_found"},404);
+});
+
+app.post("/api/events/:eventId/households/:householdId/members", requireScope("admin"), async (c)=>{
+  const event=await eventForAuth(c);if(!event)return c.json({error:"not_found"},404);
+  const auth=c.get("auth"),householdId=c.req.param("householdId"),body=await jsonBody(c),attendeeId=requiredString(body,"attendeeId");
+  if(!attendeeId||!isUuid(attendeeId)||Object.keys(body).some(k=>k!=="attendeeId"))return badRequest(c,"invalid household member");
+  const existing=await c.env.DB.prepare(`SELECT m.id FROM household_memberships m JOIN households h ON h.id=m.household_id
+    WHERE m.household_id=? AND m.attendee_id=? AND m.removed_at IS NULL AND h.event_id=? AND h.organization_id=? AND h.archived_at IS NULL`)
+    .bind(householdId,attendeeId,event.id,auth.organizationId).first();
+  if(existing)return c.json({added:true},200);
+  const membershipId=crypto.randomUUID(),auditId=crypto.randomUUID();
+  try{
+    await c.env.DB.batch([
+      c.env.DB.prepare(`INSERT INTO household_memberships(id,organization_id,event_id,household_id,attendee_id,added_by)
+        SELECT ?,h.organization_id,h.event_id,h.id,a.id,? FROM households h JOIN attendees a ON a.id=? AND a.event_id=h.event_id AND a.organization_id=h.organization_id AND a.status='active'
+        WHERE h.id=? AND h.event_id=? AND h.organization_id=? AND h.archived_at IS NULL
+          AND EXISTS(SELECT 1 FROM events e WHERE e.id=h.event_id AND e.organization_id=h.organization_id AND e.archived_at IS NULL)
+          AND (SELECT COUNT(*) FROM household_memberships WHERE household_id=h.id AND removed_at IS NULL)<50`)
+        .bind(membershipId,auth.actorId,attendeeId,householdId,event.id,auth.organizationId),
+      c.env.DB.prepare(`INSERT INTO audit_logs(id,organization_id,actor_id,action,target_type,target_id,metadata_json)
+        SELECT ?,?,?, 'household.member_added','household',?,? WHERE EXISTS(SELECT 1 FROM household_memberships WHERE id=?)`)
+        .bind(auditId,auth.organizationId,auth.actorId,householdId,JSON.stringify({attendeeId}),membershipId),
+    ]);
+  }catch(e){
+    const now=await c.env.DB.prepare(`SELECT m.id FROM household_memberships m JOIN households h ON h.id=m.household_id
+      WHERE m.household_id=? AND m.attendee_id=? AND m.removed_at IS NULL AND h.event_id=? AND h.organization_id=? AND h.archived_at IS NULL`)
+      .bind(householdId,attendeeId,event.id,auth.organizationId).first();
+    if(now)return c.json({error:"attendee_already_in_household"},409);
+    const elsewhere=await c.env.DB.prepare("SELECT household_id FROM household_memberships WHERE attendee_id=? AND event_id=? AND organization_id=? AND removed_at IS NULL")
+      .bind(attendeeId,event.id,auth.organizationId).first();
+    if(elsewhere)return c.json({error:"attendee_already_in_household"},409);
+    throw e;
+  }
+  const added=await c.env.DB.prepare("SELECT id FROM household_memberships WHERE id=?").bind(membershipId).first();
+  return added?c.json({added:true},201):c.json({error:"not_found_or_household_full"},409);
+});
+
+app.delete("/api/events/:eventId/households/:householdId/members/:attendeeId", requireScope("admin"), async(c)=>{
+  const event=await eventForAuth(c);if(!event)return c.json({error:"not_found"},404);
+  const auth=c.get("auth"),householdId=c.req.param("householdId"),attendeeId=c.req.param("attendeeId"),opId=crypto.randomUUID(),auditId=crypto.randomUUID();
+  await c.env.DB.batch([
+    c.env.DB.prepare(`UPDATE household_memberships SET removed_at=CURRENT_TIMESTAMP,removed_by=?,removed_operation_id=? WHERE household_id=? AND attendee_id=? AND event_id=? AND organization_id=? AND removed_at IS NULL
+      AND EXISTS(SELECT 1 FROM households h JOIN events e ON e.id=h.event_id WHERE h.id=household_id AND h.event_id=? AND h.organization_id=? AND h.archived_at IS NULL AND e.archived_at IS NULL)`)
+      .bind(auth.actorId,opId,householdId,attendeeId,event.id,auth.organizationId,event.id,auth.organizationId),
+    c.env.DB.prepare(`INSERT INTO audit_logs(id,organization_id,actor_id,action,target_type,target_id,metadata_json)
+      SELECT ?,?,?, 'household.member_removed','household',?,? WHERE EXISTS(SELECT 1 FROM household_memberships m JOIN households h ON h.id=m.household_id
+        WHERE m.household_id=? AND m.attendee_id=? AND m.removed_at IS NOT NULL AND m.removed_operation_id=? AND m.event_id=? AND m.organization_id=? AND h.archived_at IS NULL)`)
+      .bind(auditId,auth.organizationId,auth.actorId,householdId,JSON.stringify({attendeeId}),householdId,attendeeId,opId,event.id,auth.organizationId),
+  ]);
+  const removed=await c.env.DB.prepare("SELECT id FROM household_memberships WHERE household_id=? AND attendee_id=? AND removed_operation_id=? AND event_id=? AND organization_id=?").bind(householdId,attendeeId,opId,event.id,auth.organizationId).first();
+  return removed?c.json({removed:true}):c.json({error:"not_found"},404);
+});
+
+app.post("/api/events/:eventId/distributions/:distributionId/proxy-claims", requireScope("checkin:write"), async(c)=>{
+  const event=await eventForAuth(c);if(!event)return c.json({error:"not_found"},404);
+  const auth=c.get("auth"),distributionId=c.req.param("distributionId"),body=await jsonBody(c);
+  const requestId=requiredString(body,"requestId"),householdId=requiredString(body,"householdId"),collectorId=requiredString(body,"collectorId"),venueInput=optionalString(body.venueId);
+  const rawItems=body.items;
+  if(!requestId||!isUuid(requestId)||!householdId||!isUuid(householdId)||!collectorId||!isUuid(collectorId)||!Array.isArray(rawItems)||rawItems.length<1||rawItems.length>20
+      ||(body.venueId!==undefined&&body.venueId!==null&&!venueInput)||Object.keys(body).some(k=>!["requestId","householdId","collectorId","venueId","items"].includes(k)))return badRequest(c,"invalid proxy claim");
+  const items:{attendeeId:string;quantity:number;claimId:string;childRequestId:string;itemId:string}[]=[];
+  const seen=new Set<string>();
+  for(const item of rawItems){
+    if(!item||typeof item!=="object"||Array.isArray(item))return badRequest(c,"invalid proxy item");
+    const attendeeId=requiredString(item as JsonRecord,"attendeeId"),quantity=(item as JsonRecord).quantity;
+    if(!attendeeId||!isUuid(attendeeId)||!Number.isInteger(quantity)||Number(quantity)<1||Number(quantity)>1000||Object.keys(item as JsonRecord).some(k=>!["attendeeId","quantity"].includes(k))||seen.has(attendeeId))return badRequest(c,"invalid proxy item");
+    seen.add(attendeeId);items.push({attendeeId,quantity:Number(quantity),claimId:crypto.randomUUID(),childRequestId:crypto.randomUUID(),itemId:crypto.randomUUID()});
+  }
+  const payloadHash=await sha256(JSON.stringify({actorId:auth.actorId,distributionId,householdId,collectorId,venueId:venueInput??null,items:items.map(i=>({attendeeId:i.attendeeId,quantity:i.quantity}))}));
+  const priorActor=await c.env.DB.prepare("SELECT created_by FROM distribution_proxy_claims WHERE organization_id=? AND event_id=? AND distribution_id=? AND request_id=?")
+    .bind(auth.organizationId,event.id,distributionId,requestId).first<{created_by:string}>();
+  if(priorActor&&priorActor.created_by!==auth.actorId)return c.json({error:"idempotency_conflict"},409);
+  const replay=await c.env.DB.prepare("SELECT id,payload_hash,venue_id FROM distribution_proxy_claims WHERE organization_id=? AND event_id=? AND distribution_id=? AND request_id=? AND created_by=?")
+    .bind(auth.organizationId,event.id,distributionId,requestId,auth.actorId).first<{id:string;payload_hash:string;venue_id:string|null}>();
+  if(replay){if(replay.payload_hash!==payloadHash)return c.json({error:"idempotency_conflict"},409);const scope=await checkInVenueError(c,event.id,replay.venue_id??undefined);if(scope)return c.json({error:scope},403);return c.json(await proxyClaimResponse(c.env.DB,replay.id),200);}
+  const distribution=await c.env.DB.prepare("SELECT id,active FROM distributions WHERE id=? AND event_id=? AND organization_id=?")
+    .bind(distributionId,event.id,auth.organizationId).first<{id:string;active:number}>();
+  const household=await c.env.DB.prepare("SELECT id,name FROM households WHERE id=? AND event_id=? AND organization_id=? AND archived_at IS NULL")
+    .bind(householdId,event.id,auth.organizationId).first<{id:string;name:string}>();
+  if(!distribution||!household)return c.json({error:"not_found"},404);
+  if(distribution.active!==1)return c.json({error:"distribution_inactive"},409);
+  const itemJson=JSON.stringify(items.map(({attendeeId,quantity,claimId,childRequestId,itemId})=>({attendeeId,quantity,claimId,childRequestId,itemId})));
+  const targetRows=await c.env.DB.prepare(`SELECT a.id,a.name,a.affiliation,a.venue_id,t.id AS ticket_id,t.status AS ticket_status,
+      COALESCE(CASE WHEN p.state='in' THEN p.venue_id END,a.venue_id) AS operation_venue_id
+    FROM json_each(?) j JOIN attendees a ON a.id=json_extract(j.value,'$.attendeeId') AND a.event_id=? AND a.organization_id=?
+    JOIN tickets t ON t.attendee_id=a.id AND t.event_id=a.event_id
+    LEFT JOIN attendee_presence p ON p.event_id=a.event_id AND p.attendee_id=a.id
+    JOIN household_memberships hm ON hm.attendee_id=a.id AND hm.household_id=? AND hm.event_id=a.event_id AND hm.organization_id=a.organization_id AND hm.removed_at IS NULL
+    WHERE a.status='active' AND t.status IN ('issued','checked_in')`).bind(itemJson,event.id,auth.organizationId,householdId).all<Record<string,unknown>>();
+  const collector=await c.env.DB.prepare(`SELECT a.id,a.status,t.status AS ticket_status,COALESCE(CASE WHEN p.state='in' THEN p.venue_id END,a.venue_id) AS operation_venue_id
+    FROM attendees a JOIN tickets t ON t.attendee_id=a.id AND t.event_id=a.event_id LEFT JOIN attendee_presence p ON p.event_id=a.event_id AND p.attendee_id=a.id
+    JOIN household_memberships hm ON hm.attendee_id=a.id AND hm.household_id=? AND hm.event_id=a.event_id AND hm.organization_id=a.organization_id AND hm.removed_at IS NULL
+    WHERE a.id=? AND a.event_id=? AND a.organization_id=? AND a.status='active' AND t.status IN ('issued','checked_in')`)
+    .bind(householdId,collectorId,event.id,auth.organizationId).first<{id:string;status:string;ticket_status:string;operation_venue_id:string|null}>();
+  if(targetRows.results.length!==items.length||!collector)return c.json({error:"household_member_unavailable"},404);
+  let venueId:string|null=venueInput??null;
+  for(const target of [...targetRows.results,collector]){
+    const resolved=await distributionVenueForActor(c,event.id,target.operation_venue_id as string|null,venueInput);
+    if(resolved instanceof Response)return resolved;
+    if(venueId!==null&&resolved!==venueId)return c.json({error:"mixed_venue"},400);
+    if(venueId===null)venueId=resolved;
+  }
+  if(auth.role==="staff"&&!venueId)return c.json({error:"venue_required"},403);
+  const storedItems=JSON.stringify(items.map(i=>({...i})));
+  const proxyId=crypto.randomUUID(),auditId=crypto.randomUUID();
+  const guards=`EXISTS(SELECT 1 FROM events e WHERE e.id=? AND e.organization_id=? AND e.archived_at IS NULL)
+    AND EXISTS(SELECT 1 FROM distributions d WHERE d.id=? AND d.event_id=? AND d.organization_id=? AND d.active=1)
+    AND EXISTS(SELECT 1 FROM households h WHERE h.id=? AND h.event_id=? AND h.organization_id=? AND h.archived_at IS NULL)
+    AND EXISTS(SELECT 1 FROM household_memberships hm JOIN attendees ca ON ca.id=hm.attendee_id JOIN tickets ct ON ct.attendee_id=ca.id
+      LEFT JOIN attendee_presence cp ON cp.event_id=ca.event_id AND cp.attendee_id=ca.id
+      WHERE hm.household_id=? AND hm.attendee_id=? AND hm.event_id=? AND hm.organization_id=? AND hm.removed_at IS NULL AND ca.status='active' AND ct.status IN ('issued','checked_in')
+        AND (? IS NULL OR COALESCE(CASE WHEN cp.state='in' THEN cp.venue_id END,ca.venue_id) IS NULL OR COALESCE(CASE WHEN cp.state='in' THEN cp.venue_id END,ca.venue_id)=?))
+    AND (SELECT COUNT(*) FROM json_each(?) j JOIN attendees a ON a.id=json_extract(j.value,'$.attendeeId') AND a.event_id=? AND a.organization_id=?
+      JOIN tickets t ON t.attendee_id=a.id AND t.event_id=a.event_id
+      JOIN household_memberships hm ON hm.attendee_id=a.id AND hm.household_id=? AND hm.event_id=a.event_id AND hm.organization_id=a.organization_id AND hm.removed_at IS NULL
+      LEFT JOIN attendee_presence p ON p.event_id=a.event_id AND p.attendee_id=a.id
+      WHERE a.status='active' AND t.status IN ('issued','checked_in') AND (? IS NULL OR COALESCE(CASE WHEN p.state='in' THEN p.venue_id END,a.venue_id) IS NULL OR COALESCE(CASE WHEN p.state='in' THEN p.venue_id END,a.venue_id)=?))=?
+    AND (? IS NULL OR EXISTS(SELECT 1 FROM venues v WHERE v.id=? AND v.event_id=?))
+    AND (?!='staff' OR EXISTS(SELECT 1 FROM venue_staff_assignments s WHERE s.venue_id=? AND s.user_id=?))`;
+  const common=[event.id,auth.organizationId,distributionId,event.id,auth.organizationId,householdId,event.id,auth.organizationId,
+    householdId,collectorId,event.id,auth.organizationId,venueId,venueId,storedItems,event.id,auth.organizationId,householdId,venueId,venueId,items.length,
+    venueId,venueId,event.id,auth.role,venueId,auth.actorId];
+  // Collector display name is obtained and bound separately, avoiding client-provided snapshots.
+  const collectorName=await c.env.DB.prepare("SELECT name FROM attendees WHERE id=? AND event_id=? AND organization_id=?").bind(collectorId,event.id,auth.organizationId).first<{name:string}>();
+  const statements=[c.env.DB.prepare(`INSERT INTO distribution_proxy_claims(id,organization_id,event_id,distribution_id,request_id,payload_hash,household_id,household_name_snapshot,collector_id,collector_name_snapshot,venue_id,outcome,created_by)
+    SELECT ?,?,?,?,?,?,?,?,?,?,?,CASE WHEN EXISTS(SELECT 1 FROM json_each(?) j JOIN attendees a ON a.id=json_extract(j.value,'$.attendeeId')
+      JOIN distributions d ON d.id=? WHERE COALESCE((SELECT SUM(dc.quantity) FROM distribution_claims dc WHERE dc.distribution_id=d.id AND dc.attendee_id=a.id AND dc.outcome='accepted' AND dc.reversed_at IS NULL),0)+CAST(json_extract(j.value,'$.quantity') AS INTEGER)>d.max_per_attendee) THEN 'limit_reached' ELSE 'accepted' END,?
+    WHERE ${guards}`)
+    .bind(proxyId,auth.organizationId,event.id,distributionId,requestId,payloadHash,householdId,household.name,collectorId,(collectorName?.name ?? ""),venueId,storedItems,distributionId,auth.actorId,...common)];
+  // Child claims are inserted before their immutable snapshot rows because the
+  // snapshot optionally references each claim by foreign key.
+  statements.push(c.env.DB.prepare(`INSERT INTO distribution_claims(id,organization_id,event_id,distribution_id,request_id,payload_hash,attendee_id,ticket_id,venue_id,quantity,outcome,used_after,remaining_after,created_by,proxy_group_id)
+    SELECT json_extract(j.value,'$.claimId'),g.organization_id,g.event_id,g.distribution_id,json_extract(j.value,'$.childRequestId'),g.payload_hash,a.id,t.id,g.venue_id,
+      CAST(json_extract(j.value,'$.quantity') AS INTEGER),'accepted',
+      (SELECT COALESCE(SUM(dc.quantity),0) FROM distribution_claims dc WHERE dc.distribution_id=g.distribution_id AND dc.attendee_id=a.id AND dc.outcome='accepted' AND dc.reversed_at IS NULL)+CAST(json_extract(j.value,'$.quantity') AS INTEGER),
+      d.max_per_attendee-(SELECT COALESCE(SUM(dc.quantity),0) FROM distribution_claims dc WHERE dc.distribution_id=g.distribution_id AND dc.attendee_id=a.id AND dc.outcome='accepted' AND dc.reversed_at IS NULL)-CAST(json_extract(j.value,'$.quantity') AS INTEGER),
+      g.created_by,g.id
+    FROM json_each(?) j JOIN distribution_proxy_claims g ON g.id=? AND g.outcome='accepted'
+    JOIN attendees a ON a.id=json_extract(j.value,'$.attendeeId') JOIN tickets t ON t.attendee_id=a.id AND t.event_id=a.event_id
+    JOIN distributions d ON d.id=g.distribution_id`)
+    .bind(storedItems,proxyId));
+  statements.push(c.env.DB.prepare(`INSERT INTO distribution_proxy_items(id,proxy_claim_id,claim_id,attendee_id,attendee_name_snapshot,affiliation_snapshot,quantity,used_after,remaining_after,outcome)
+    SELECT json_extract(j.value,'$.itemId'),g.id,dc.id,a.id,a.name,a.affiliation,CAST(json_extract(j.value,'$.quantity') AS INTEGER),dc.used_after,dc.remaining_after,'accepted'
+    FROM json_each(?) j JOIN distribution_proxy_claims g ON g.id=? AND g.outcome='accepted'
+    JOIN attendees a ON a.id=json_extract(j.value,'$.attendeeId') JOIN distribution_claims dc ON dc.id=json_extract(j.value,'$.claimId') AND dc.proxy_group_id=g.id`)
+    .bind(storedItems,proxyId));
+  statements.push(c.env.DB.prepare(`INSERT INTO distribution_proxy_items(id,proxy_claim_id,attendee_id,attendee_name_snapshot,affiliation_snapshot,quantity,used_after,remaining_after,outcome)
+    SELECT json_extract(j.value,'$.itemId'),g.id,a.id,a.name,a.affiliation,CAST(json_extract(j.value,'$.quantity') AS INTEGER),
+      (SELECT COALESCE(SUM(dc.quantity),0) FROM distribution_claims dc WHERE dc.distribution_id=g.distribution_id AND dc.attendee_id=a.id AND dc.outcome='accepted' AND dc.reversed_at IS NULL),
+      d.max_per_attendee-(SELECT COALESCE(SUM(dc.quantity),0) FROM distribution_claims dc WHERE dc.distribution_id=g.distribution_id AND dc.attendee_id=a.id AND dc.outcome='accepted' AND dc.reversed_at IS NULL),
+      'limit_reached'
+    FROM json_each(?) j JOIN distribution_proxy_claims g ON g.id=? AND g.outcome='limit_reached'
+    JOIN attendees a ON a.id=json_extract(j.value,'$.attendeeId') JOIN distributions d ON d.id=g.distribution_id`)
+    .bind(storedItems,proxyId));
+  statements.push(c.env.DB.prepare(`INSERT INTO audit_logs(id,organization_id,actor_id,action,target_type,target_id,metadata_json)
+    SELECT ?,?,?,CASE WHEN outcome='accepted' THEN 'distribution.proxy_claimed' ELSE 'distribution.proxy_limit_reached' END,'distribution_proxy_claim',id,?
+    FROM distribution_proxy_claims WHERE id=?`)
+    .bind(auditId,auth.organizationId,auth.actorId,JSON.stringify({distributionId,householdId,collectorId,requestId,beneficiaryCount:items.length}),proxyId));
+  try{await c.env.DB.batch(statements);}catch(error){
+    const retry=await c.env.DB.prepare("SELECT id,payload_hash FROM distribution_proxy_claims WHERE organization_id=? AND event_id=? AND distribution_id=? AND request_id=? AND created_by=?")
+      .bind(auth.organizationId,event.id,distributionId,requestId,auth.actorId).first<{id:string;payload_hash:string}>();
+    if(retry){if(retry.payload_hash!==payloadHash)return c.json({error:"idempotency_conflict"},409);const scope=await checkInVenueError(c,event.id,(await c.env.DB.prepare("SELECT venue_id FROM distribution_proxy_claims WHERE id=?").bind(retry.id).first<{venue_id:string|null}>())?.venue_id??undefined);if(scope)return c.json({error:scope},403);return c.json(await proxyClaimResponse(c.env.DB,retry.id),200);}
+    const otherActor=await c.env.DB.prepare("SELECT created_by FROM distribution_proxy_claims WHERE organization_id=? AND event_id=? AND distribution_id=? AND request_id=?")
+      .bind(auth.organizationId,event.id,distributionId,requestId).first<{created_by:string}>();
+    if(otherActor)return c.json({error:"idempotency_conflict"},409);
+    throw error;
+  }
+  const created=await c.env.DB.prepare("SELECT id FROM distribution_proxy_claims WHERE id=? AND created_by=?").bind(proxyId,auth.actorId).first<{id:string}>();
+  if(!created)return c.json({error:"proxy_claim_unavailable"},409);
+  return c.json(await proxyClaimResponse(c.env.DB,proxyId),201);
+});
+
+app.get("/api/events/:eventId/distributions/:distributionId/proxy-claims/by-request/:requestId",requireScope("checkin:write"),async(c)=>{
+  const event=await eventForAuth(c);if(!event)return c.json({error:"not_found"},404);
+  const auth=c.get("auth"),distributionId=c.req.param("distributionId"),requestId=c.req.param("requestId");if(!requestId||!isUuid(requestId))return badRequest(c,"invalid request id");
+  const row=await c.env.DB.prepare(`SELECT id,venue_id FROM distribution_proxy_claims WHERE organization_id=? AND event_id=? AND distribution_id=? AND request_id=? AND created_by=?`)
+    .bind(auth.organizationId,event.id,distributionId,requestId,auth.actorId).first<{id:string;venue_id:string|null}>();
+  if(!row)return c.json({error:"not_found"},404);
+  const scope=await checkInVenueError(c,event.id,row.venue_id??undefined);if(scope)return c.json({error:scope},403);
+  return c.json(await proxyClaimResponse(c.env.DB,row.id));
+});
+
+app.get("/api/events/:eventId/distributions/:distributionId/proxy-claims",requireScope("roster:read"),async(c)=>{
+  const event=await eventForAuth(c);if(!event)return c.json({error:"not_found"},404);
+  const auth=c.get("auth"),distributionId=c.req.param("distributionId"),limit=Number(c.req.query("limit")??50),after=c.req.query("after")??"",householdId=c.req.query("householdId")??"",venueId=c.req.query("venueId")??"";
+  if(!Number.isInteger(limit)||limit<1||limit>100||(after&&!isUuid(after))||(householdId&&!isUuid(householdId)))return badRequest(c,"invalid proxy pagination");
+  if(auth.role==="staff"){if(!venueId)return c.json({error:"venue_required"},403);const err=await checkInVenueError(c,event.id,venueId);if(err)return c.json({error:err},403);}
+  const parents=await c.env.DB.prepare(`SELECT g.id,g.request_id,g.household_id,g.household_name_snapshot AS household_name,g.collector_id,g.collector_name_snapshot AS collector_name,g.venue_id,g.outcome,g.created_at,g.reversed_at
+    FROM distribution_proxy_claims g WHERE g.organization_id=? AND g.event_id=? AND g.distribution_id=? AND (?='' OR g.household_id=?)
+      AND (?='' OR g.venue_id=?) AND (?!='staff' OR EXISTS(SELECT 1 FROM venue_staff_assignments s WHERE s.venue_id=g.venue_id AND s.user_id=?))
+      AND (?='' OR (g.created_at,g.id)<(SELECT created_at,id FROM distribution_proxy_claims WHERE id=? AND distribution_id=?))
+    ORDER BY g.created_at DESC,g.id DESC LIMIT ?`)
+    .bind(auth.organizationId,event.id,distributionId,householdId,householdId,venueId,venueId,auth.role,auth.actorId,after,after,distributionId,limit+1).all<Record<string,unknown>>();
+  const page=parents.results.slice(0,limit);
+  const items=page.length?await c.env.DB.prepare(`SELECT i.proxy_claim_id,i.claim_id AS claimId,i.attendee_id AS attendeeId,
+      i.attendee_name_snapshot AS attendeeName,i.affiliation_snapshot AS affiliation,i.quantity,
+      i.outcome,CASE WHEN g.reversed_at IS NOT NULL THEN 'reversed' ELSE i.outcome END AS status,i.used_after,i.remaining_after
+    FROM distribution_proxy_items i JOIN distribution_proxy_claims g ON g.id=i.proxy_claim_id
+    WHERE i.proxy_claim_id IN (${page.map(()=>"?").join(",")}) ORDER BY i.attendee_name_snapshot COLLATE NOCASE,i.attendee_id`).bind(...page.map(p=>p.id)).all<Record<string,unknown>>():{results:[]};
+  return c.json({proxyClaims:page.map(parent=>({...parent,items:items.results.filter(item=>item.proxy_claim_id===parent.id).map(({proxy_claim_id,outcome,used_after,remaining_after,...item})=>({...item,used:used_after,remaining:remaining_after}))})),nextCursor:parents.results.length>limit?page.at(-1)?.id??null:null});
+});
+
+app.post("/api/events/:eventId/distributions/:distributionId/proxy-claims/:proxyClaimId/reverse",requireScope("admin"),async(c)=>{
+  const event=await eventForAuth(c);if(!event)return c.json({error:"not_found"},404);
+  const auth=c.get("auth"),distributionId=c.req.param("distributionId"),proxyClaimId=c.req.param("proxyClaimId"),body=await jsonBody(c),reason=typeof body.reason==="string"?body.reason.trim():"";
+  if(!reason||reason.length>500||Object.keys(body).some(k=>k!=="reason"))return badRequest(c,"reason is required and must be at most 500 characters");
+  const parent=await c.env.DB.prepare("SELECT id,outcome,reversed_at FROM distribution_proxy_claims WHERE id=? AND organization_id=? AND event_id=? AND distribution_id=?")
+    .bind(proxyClaimId,auth.organizationId,event.id,distributionId).first<{id:string;outcome:string;reversed_at:string|null}>();
+  if(!parent)return c.json({error:"not_found"},404);if(parent.reversed_at)return c.json({error:"claim_already_reversed"},409);if(parent.outcome!=="accepted")return c.json({error:"claim_not_reversible"},409);
+  const claims=await c.env.DB.prepare("SELECT id FROM distribution_claims WHERE proxy_group_id=? AND outcome='accepted' AND reversed_at IS NULL ORDER BY id LIMIT 20").bind(proxyClaimId).all<{id:string}>();
+  if(!claims.results.length)return c.json({error:"claim_not_reversible"},409);
+  const reversalId=crypto.randomUUID(),auditId=crypto.randomUUID();
+  const statements=[c.env.DB.prepare(`UPDATE distribution_proxy_claims SET reversed_at=CURRENT_TIMESTAMP,reversal_id=?,reversed_by=?,reverse_reason=?
+    WHERE id=? AND organization_id=? AND event_id=? AND distribution_id=? AND outcome='accepted' AND reversed_at IS NULL
+      AND EXISTS(SELECT 1 FROM events WHERE id=? AND organization_id=? AND archived_at IS NULL)`)
+    .bind(reversalId,auth.actorId,reason,proxyClaimId,auth.organizationId,event.id,distributionId,event.id,auth.organizationId)];
+  for(const claim of claims.results){
+    statements.push(c.env.DB.prepare(`UPDATE distribution_claims SET reversed_at=CURRENT_TIMESTAMP,reversal_id=?,reversed_by=?,reverse_reason=?
+      WHERE id=? AND proxy_group_id=? AND outcome='accepted' AND reversed_at IS NULL
+        AND EXISTS(SELECT 1 FROM distribution_proxy_claims g WHERE g.id=? AND g.reversal_id=?)`)
+      .bind(crypto.randomUUID(),auth.actorId,reason,claim.id,proxyClaimId,proxyClaimId,reversalId));
+  }
+  statements.push(c.env.DB.prepare(`INSERT INTO audit_logs(id,organization_id,actor_id,action,target_type,target_id,metadata_json)
+    SELECT ?,?,?, 'distribution.proxy_claim_reversed','distribution_proxy_claim',id,? FROM distribution_proxy_claims WHERE id=? AND reversal_id=?`)
+    .bind(auditId,auth.organizationId,auth.actorId,JSON.stringify({distributionId,proxyClaimId,reversalId,reason,childCount:claims.results.length}),proxyClaimId,reversalId));
+  await c.env.DB.batch(statements);
+  const reversed=await c.env.DB.prepare("SELECT id,reversed_at FROM distribution_proxy_claims WHERE id=? AND reversal_id=?").bind(proxyClaimId,reversalId).first();
+  return reversed?c.json({reversed:true,proxyClaimId}):c.json({error:"claim_already_reversed"},409);
 });
 
 app.get("/api/events/:eventId/roster", requireScope("roster:read"), async (c) => {
@@ -2953,6 +3307,141 @@ async function issueQrToken(db: D1Database, ticketId: string, lifetime: string) 
   await db.prepare("INSERT INTO ticket_qr_tokens (id, ticket_id, token_hash, expires_at) VALUES (?, ?, ?, datetime('now', ?))")
     .bind(crypto.randomUUID(), ticketId, await sha256(token), lifetime).run();
   return token;
+}
+async function issuePaperQrCard(c: Context<AppEnv>, kind: "additional" | "replacement") {
+  const event = await eventForAuth(c);
+  if (!event) return c.json({ error: "not_found" }, 404);
+  const auth = c.get("auth"), attendeeId = c.req.param("attendeeId");
+  const body = await jsonBody(c), requestId = requiredString(body, "requestId"), qrToken = requiredString(body, "qrToken");
+  const reason = kind === "replacement" ? (typeof body.reason === "string" ? body.reason.trim() : "") : null;
+  const requestedVenueId = optionalString(body.venueId);
+  if (!requestId || !isUuid(requestId) || !qrToken || !isCanonicalQrToken(qrToken)
+    || (kind === "replacement" && (!reason || reason.length > 500))
+    || (kind === "additional" && body.reason !== undefined)
+    || (body.venueId !== undefined && body.venueId !== null && !requestedVenueId)
+    || Object.keys(body).some(k => !["requestId", "qrToken", "venueId", ...(kind === "replacement" ? ["reason"] : [])].includes(k))) return badRequest(c, "invalid QR card request");
+
+  const attendee = await c.env.DB.prepare(`SELECT a.id,a.venue_id,a.status,t.id AS ticket_id,t.status AS ticket_status,t.token_key_id,
+      COALESCE(CASE WHEN p.state='in' THEN p.venue_id END,a.venue_id) AS operation_venue_id
+    FROM attendees a JOIN tickets t ON t.attendee_id=a.id AND t.event_id=a.event_id
+    LEFT JOIN attendee_presence p ON p.event_id=a.event_id AND p.attendee_id=a.id
+    WHERE a.id=? AND a.event_id=? AND a.organization_id=? AND t.event_id=?`)
+    .bind(attendeeId,event.id,auth.organizationId,event.id).first<{id:string;venue_id:string|null;operation_venue_id:string|null;status:string;ticket_id:string;ticket_status:string;token_key_id:string}>();
+  if (!attendee) return c.json({ error: "not_found" },404);
+  const venueId = await distributionVenueForActor(c,event.id,attendee.operation_venue_id,requestedVenueId);
+  if (venueId instanceof Response) return venueId;
+  if (attendee.status !== "active" || !["issued","checked_in"].includes(attendee.ticket_status)) return c.json({error:"credential_unavailable"},409);
+  const qrHash = await sha256(qrToken);
+  const payloadHash = await sha256(JSON.stringify({actorId:auth.actorId,kind,attendeeId:attendee.id,ticketId:attendee.ticket_id,qrHash,venueId,reason}));
+  const occupiedRequest = await c.env.DB.prepare("SELECT created_by FROM ticket_qr_card_requests WHERE organization_id=? AND event_id=? AND request_id=?")
+    .bind(auth.organizationId,event.id,requestId).first<{created_by:string}>();
+  if(occupiedRequest&&occupiedRequest.created_by!==auth.actorId)return c.json({error:"idempotency_conflict"},409);
+  const existing = await getPaperCardRequest(c.env.DB,auth.organizationId,event.id,requestId,auth.actorId);
+  if(existing) {
+    if(existing.payload_hash!==payloadHash||existing.attendee_id!==attendee.id||existing.action!==kind) return c.json({error:"idempotency_conflict"},409);
+    return buildPaperCardResponse(c,existing,qrToken,200);
+  }
+
+  const requestDbId=crypto.randomUUID(),cardId=crypto.randomUUID(),qrTokenId=crypto.randomUUID(),auditId=crypto.randomUUID();
+  const insertRequest=c.env.DB.prepare(`INSERT INTO ticket_qr_card_requests(id,organization_id,event_id,request_id,payload_hash,created_by,action,attendee_id,ticket_id,venue_id,revoked_count,legacy_credential_invalidated)
+    SELECT ?,?,?,?,?,?,?,?,?,?,CASE WHEN ?='replacement' THEN (SELECT COUNT(*) FROM ticket_qr_tokens WHERE ticket_id=? AND expires_at>CURRENT_TIMESTAMP) ELSE 0 END,
+      CASE WHEN ?='replacement' AND t.token_key_id='v1' THEN 1 ELSE 0 END
+    FROM attendees a JOIN events e ON e.id=a.event_id JOIN tickets t ON t.attendee_id=a.id
+    LEFT JOIN attendee_presence p ON p.event_id=a.event_id AND p.attendee_id=a.id
+    WHERE a.id=? AND a.event_id=? AND a.organization_id=? AND a.status='active' AND e.archived_at IS NULL AND t.id=? AND t.status IN ('issued','checked_in')
+      AND (COALESCE(CASE WHEN p.state='in' THEN p.venue_id END,a.venue_id) IS NULL OR COALESCE(CASE WHEN p.state='in' THEN p.venue_id END,a.venue_id) IS ?)
+      AND (? IS NULL OR EXISTS(SELECT 1 FROM venues requested WHERE requested.id=? AND requested.event_id=e.id))
+      AND (?!='staff' OR EXISTS(SELECT 1 FROM venue_staff_assignments s JOIN venues v ON v.id=s.venue_id WHERE s.user_id=? AND s.venue_id=? AND v.event_id=e.id))
+      AND (?='replacement' OR (SELECT COUNT(*) FROM ticket_qr_tokens WHERE ticket_id=t.id AND expires_at>CURRENT_TIMESTAMP)<25)`)
+    .bind(requestDbId,auth.organizationId,event.id,requestId,payloadHash,auth.actorId,kind,attendee.id,attendee.ticket_id,venueId,kind,attendee.ticket_id,kind,
+      attendee.id,event.id,auth.organizationId,attendee.ticket_id,venueId,venueId,venueId,auth.role,auth.actorId,venueId,kind);
+  const sql=[insertRequest];
+  if(kind==="replacement") {
+    sql.push(c.env.DB.prepare(`UPDATE ticket_qr_tokens SET expires_at=CURRENT_TIMESTAMP WHERE ticket_id=? AND EXISTS(
+      SELECT 1 FROM ticket_qr_card_requests r WHERE r.id=? AND r.card_id IS NULL AND r.created_by=? AND r.payload_hash=?)`)
+      .bind(attendee.ticket_id,requestDbId,auth.actorId,payloadHash));
+    sql.push(c.env.DB.prepare(`UPDATE tickets SET token_hash=?,token_key_id='possession-v2' WHERE id=? AND token_key_id='v1' AND EXISTS(
+      SELECT 1 FROM ticket_qr_card_requests r WHERE r.id=? AND r.card_id IS NULL AND r.created_by=? AND r.payload_hash=?)`)
+      .bind(await sha256(randomToken()),attendee.ticket_id,requestDbId,auth.actorId,payloadHash));
+  }
+  sql.push(c.env.DB.prepare(`INSERT INTO ticket_qr_tokens(id,ticket_id,token_hash,expires_at)
+    SELECT ?,?,?,datetime('now','+1 year') WHERE EXISTS(SELECT 1 FROM ticket_qr_card_requests r WHERE r.id=? AND r.card_id IS NULL AND r.created_by=? AND r.payload_hash=?)`)
+    .bind(qrTokenId,attendee.ticket_id,qrHash,requestDbId,auth.actorId,payloadHash));
+  sql.push(c.env.DB.prepare(`INSERT INTO ticket_qr_cards(id,organization_id,event_id,attendee_id,ticket_id,qr_token_id,venue_id,request_id,kind,reason,issued_by,expires_at)
+    SELECT ?,?,?,?,?,?,?,?,?,?,?,datetime('now','+1 year') WHERE EXISTS(SELECT 1 FROM ticket_qr_tokens q JOIN ticket_qr_card_requests r ON r.id=?
+      WHERE q.id=? AND r.card_id IS NULL AND r.created_by=? AND r.payload_hash=?)`)
+    .bind(cardId,auth.organizationId,event.id,attendee.id,attendee.ticket_id,qrTokenId,venueId,requestId,kind,reason,auth.actorId,
+      requestDbId,qrTokenId,auth.actorId,payloadHash));
+  sql.push(c.env.DB.prepare("UPDATE ticket_qr_card_requests SET card_id=? WHERE id=? AND card_id IS NULL AND created_by=? AND payload_hash=? AND EXISTS(SELECT 1 FROM ticket_qr_cards WHERE id=?)")
+    .bind(cardId,requestDbId,auth.actorId,payloadHash,cardId));
+  sql.push(c.env.DB.prepare(`INSERT INTO audit_logs(id,organization_id,actor_id,action,target_type,target_id,metadata_json)
+    SELECT ?,?,?,?, 'ticket_qr_card',?,? WHERE EXISTS(SELECT 1 FROM ticket_qr_card_requests WHERE id=? AND card_id=?)`)
+    .bind(auditId,auth.organizationId,auth.actorId,kind==="replacement"?"ticket.qr_replaced":"ticket.qr_card_issued",cardId,
+      JSON.stringify({eventId:event.id,attendeeId:attendee.id,ticketId:attendee.ticket_id,requestId,kind,reason}),requestDbId,cardId));
+  try { await c.env.DB.batch(sql); }
+  catch(error) {
+    const replay=await getPaperCardRequest(c.env.DB,auth.organizationId,event.id,requestId,auth.actorId);
+    if(replay) {
+      if(replay.payload_hash!==payloadHash||replay.action!==kind||replay.attendee_id!==attendee.id)return c.json({error:"idempotency_conflict"},409);
+      return buildPaperCardResponse(c,replay,qrToken,200);
+    }
+    const otherActor=await c.env.DB.prepare("SELECT created_by FROM ticket_qr_card_requests WHERE organization_id=? AND event_id=? AND request_id=?")
+      .bind(auth.organizationId,event.id,requestId).first<{created_by:string}>();
+    if(otherActor)return c.json({error:"idempotency_conflict"},409);
+    const duplicateToken=await c.env.DB.prepare("SELECT 1 FROM ticket_qr_tokens WHERE token_hash=?").bind(qrHash).first();
+    if(duplicateToken)return c.json({error:"qr_token_reused"},409);
+    throw error;
+  }
+  const created=await getPaperCardRequest(c.env.DB,auth.organizationId,event.id,requestId,auth.actorId);
+  if(!created)return c.json({error:"not_found"},404);
+  return buildPaperCardResponse(c,created,qrToken,201);
+}
+type PaperCardRequest = { id:string; request_id:string; payload_hash:string; created_by:string; action:string; attendee_id:string; ticket_id:string; card_id:string|null; card_kind:string|null; issued_at:string|null; expires_at:string|null; revoked_at:string|null; token_active:number; ticket_status:string; attendee_status:string; token_key_id:string; revoked_count:number; legacy_credential_invalidated:number; venue_id:string|null };
+async function getPaperCardRequest(db:D1Database,organizationId:string,eventId:string,requestId:string,actorId:string) {
+  return db.prepare(`SELECT r.id,r.request_id,r.payload_hash,r.created_by,r.action,r.attendee_id,r.ticket_id,r.card_id,
+      r.revoked_count,r.legacy_credential_invalidated,card.kind AS card_kind,card.issued_at,card.expires_at,card.revoked_at,
+      CASE WHEN q.id IS NOT NULL AND card.revoked_at IS NULL AND card.expires_at>CURRENT_TIMESTAMP THEN 1 ELSE 0 END AS token_active,
+      t.status AS ticket_status,a.status AS attendee_status,t.token_key_id,r.venue_id
+    FROM ticket_qr_card_requests r LEFT JOIN ticket_qr_cards card ON card.id=r.card_id
+    JOIN attendees a ON a.id=r.attendee_id JOIN tickets t ON t.id=r.ticket_id
+    LEFT JOIN attendee_presence p ON p.event_id=a.event_id AND p.attendee_id=a.id
+    LEFT JOIN ticket_qr_tokens q ON q.id=card.qr_token_id AND q.expires_at>CURRENT_TIMESTAMP
+    WHERE r.organization_id=? AND r.event_id=? AND r.request_id=? AND r.created_by=?`)
+    .bind(organizationId,eventId,requestId,actorId).first<PaperCardRequest>();
+}
+async function buildPaperCardResponse(c:Context<AppEnv>,row:PaperCardRequest,qrToken:string,status:number) {
+  if(!row.card_id||!row.card_kind||!row.issued_at||!row.expires_at)return c.json({error:"issuance_incomplete"},409);
+  const url=`${c.env.APP_ORIGIN.replace(/\/$/,"")}/public/tickets/${row.ticket_id}/check-in/${encodeURIComponent(qrToken)}`;
+  const png=await QRCodeServer.toBuffer(url,{type:"png",errorCorrectionLevel:"M",margin:4,width:640,color:{dark:"#000000",light:"#FFFFFF"}});
+  const active=Boolean(row.token_active&&row.ticket_status!=="cancelled"&&row.ticket_status!=="voided"&&row.attendee_status==="active");
+  return c.json({card:{id:row.card_id,kind:row.card_kind,url,qrPngDataUrl:pngDataUrl(new Uint8Array(png)),issued_at:row.issued_at,expires_at:row.expires_at,active},
+    ...(row.action==="replacement"?{revokedCount:row.revoked_count,legacyCredentialInvalidated:row.legacy_credential_invalidated===1}:{} )},status as ContentfulStatusCode);
+}
+async function proxyClaimResponse(db:D1Database,proxyClaimId:string) {
+  const parent=await db.prepare(`SELECT id,request_id,household_id,household_name_snapshot AS household_name,collector_id,
+      collector_name_snapshot AS collector_name,venue_id,outcome,created_at,reversed_at,reverse_reason
+    FROM distribution_proxy_claims WHERE id=?`).bind(proxyClaimId).first<Record<string,unknown>>();
+  if(!parent)return {error:"not_found"};
+  const rows=await db.prepare(`SELECT i.claim_id AS claimId,i.attendee_id AS attendeeId,i.attendee_name_snapshot AS attendeeName,
+      i.affiliation_snapshot AS affiliation,i.quantity,
+      CASE WHEN g.reversed_at IS NOT NULL THEN 'reversed' ELSE i.outcome END AS status,
+      i.used_after AS used,i.remaining_after AS remaining
+    FROM distribution_proxy_items i JOIN distribution_proxy_claims g ON g.id=i.proxy_claim_id
+    WHERE i.proxy_claim_id=? ORDER BY i.attendee_name_snapshot COLLATE NOCASE,i.attendee_id`).bind(proxyClaimId).all<Record<string,unknown>>();
+  return {outcome:parent.outcome,proxyClaim:{...parent,items:rows.results}};
+}
+function pngDataUrl(bytes:Uint8Array) {
+  let binary="";
+  for(let i=0;i<bytes.length;i+=0x8000)binary+=String.fromCharCode(...bytes.subarray(i,i+0x8000));
+  return `data:image/png;base64,${btoa(binary)}`;
+}
+function isCanonicalQrToken(value:string) {
+  if(!/^[A-Za-z0-9_-]{43}$/.test(value)||!/[AEIMQUYcgkosw048]$/.test(value))return false;
+  try{
+    const raw=atob(value.replace(/-/g,"+").replace(/_/g,"/")+"=");
+    const encoded=btoa(raw).replace(/\+/g,"-").replace(/\//g,"_").replace(/=+$/g,"");
+    return raw.length===32&&encoded===value;
+  }catch{return false;}
 }
 async function checkInVenueError(c: Context<AppEnv>, eventId: string, venueId: string | undefined) {
   if (venueId && !await c.env.DB.prepare("SELECT id FROM venues WHERE id = ? AND event_id = ?").bind(venueId, eventId).first()) return "invalid_venue";
