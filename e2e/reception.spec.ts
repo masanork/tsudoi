@@ -2,6 +2,7 @@ import { expect, test, type Locator } from "@playwright/test";
 import { verifyDistributionFlow } from "./operations-flow";
 import { verifyPresenceFlow } from "./presence-flow";
 import { verifyHouseholdFlow } from "./household-flow";
+import { verifyOfflineFlow } from "./offline-flow";
 
 async function fillAnswers(form: Locator, company: string) {
   await form.getByLabel("所属（必須）", { exact: true }).fill(company);
@@ -293,7 +294,8 @@ test("completes Passkey setup, registration, roster reception, duplicate detecti
     } finally { await viewerContext.close(); }
     const operationsFixture = await verifyDistributionFlow(page, context);
     const presenceFixture = await verifyPresenceFlow(page, context, operationsFixture);
-    await verifyHouseholdFlow(page, context, presenceFixture);
+    const householdFixture = await verifyHouseholdFlow(page, context, presenceFixture);
+    await verifyOfflineFlow(page, context, householdFixture);
     expect(runtimeErrors).toEqual([]);
   } finally { await participantContext.close(); }
 });

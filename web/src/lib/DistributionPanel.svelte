@@ -115,6 +115,10 @@
     try {
       const person = await api(`/events/${eventId}/credentials/resolve`, { method: "POST", body: JSON.stringify({ qrLink: value.trim(), venueId: selectedVenueId || undefined }) });
       selectedPerson = { attendee_id: person.attendee_id, name: person.name, affiliation: person.affiliation, venue_id: person.venue_id, venue_name: person.venue_name };
+      // The resolver returns the server-authoritative operation venue (current
+      // presence venue first, registration venue otherwise). Do not carry over
+      // a venue chosen for the previous attendee.
+      selectedVenueId = person.venue_id ?? "";
       selectedAttendeeId = person.attendee_id;
       selectedByQr = true;
       statusMessage = "本人を確認しました。配布内容を確認して確定してください。";
@@ -283,10 +287,10 @@
           <option value="">参加者を選択</option>
           {#each filteredAttendees as attendee (attendee.id)}<option value={attendee.id}>{attendee.name}{attendee.affiliation ? ` · ${attendee.affiliation}` : ""}</option>{/each}
         </select></label>
-        {#if venues.length}<label>受け渡し会場<select bind:value={selectedVenueId} disabled={Boolean(pendingRetry)}><option value="">参加者の会場割当を使用</option>{#each venues as venue}<option value={venue.id}>{venue.name}</option>{/each}</select></label>{/if}
+        {#if venues.length}<label>受け渡し会場<select bind:value={selectedVenueId} disabled={Boolean(pendingRetry)}><option value="">在館中は現在の会場、退館中は登録時の会場を使用</option>{#each venues as venue}<option value={venue.id}>{venue.name}</option>{/each}</select></label>{/if}
         <details class="distribution-qr">
           <summary>チケットQRから参加者を確認</summary>
-          <p class="muted">配布専用スキャンです。受付処理は実行しません。会場割当がある参加者はその会場を使い、未割当の場合は確認前に配布会場を選択してください。</p>
+          <p class="muted">配布専用スキャンです。受付処理は実行しません。在館中は現在の会場、退館中は登録時の会場を使います。未割当の場合は配布会場を選択してください。</p>
           <button type="button" class="quiet" disabled={submitting} onclick={scanning ? stopScanner : startScanner}>{scanning ? "カメラを閉じる" : "配布用カメラを開く"}</button>
           {#if scanning}<video bind:this={video} playsinline aria-label="配布用QR読み取りカメラ"></video>{/if}
           <form onsubmit={(event) => { event.preventDefault(); void resolveQr(); }}>

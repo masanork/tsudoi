@@ -23,6 +23,10 @@ Snapshot: [`stats/stats.md`](stats/stats.md)
 - Configurable registration fields and roster data model
 - Administrator roster editing with revision checks and before/after audit records; CSV column mapping, duplicate preview, and one-time import confirmation
 - Individual ticket tokens and atomic duplicate-safe check-in
+- Separate entry, exit, reentry and current occupancy records
+- Multiple later-added distribution rounds, per-person cumulative limits, and reasoned reversals
+- Printable PNG QR cards, lost-card replacement, and household proxy distribution with atomic group reversal
+- Opt-in offline rosters, queued entry/exit and distribution records, and authenticated reconciliation after reconnecting
 - Attendee Passkey registration and session issuance
 - E2EE message ciphertext, key-envelope, and encrypted attachment storage boundaries
 - Date polls and OAuth/MCP scheduling connections, availability overlap suggestions, and confirmed iCalendar events
@@ -32,6 +36,8 @@ See [`docs/release-readiness.md`](docs/release-readiness.md) for the reviewed ch
 Use [`docs/deployment-runbook.md`](docs/deployment-runbook.md) for an existing production database, commit/version tracking, rollback, and device/mail/OAuth acceptance checks. `npm run check:deployed -- --origin https://your-host` checks public deployed endpoints without credentials or remote data writes; `--output report.json` saves a local report. It does not verify organizer login, mail delivery, or the supplied deployment identity. `npm run test:operations` tests this checker.
 
 See the full product and technical requirements in [`docs/specification.md`](docs/specification.md).
+
+See [`docs/field-operations.md`](docs/field-operations.md) for everyday event use and shelter operations, the ordered implementation milestones, acceptance checks, and offline limits. These new features require migrations `0005`–`0007`; the production deployment recorded above still has `0001`–`0004` until a separate rollout is recorded.
 
 ## Configuration and deployment
 

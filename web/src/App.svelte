@@ -6,6 +6,8 @@
   import PaperCardPanel from "./lib/PaperCardPanel.svelte";
   import HouseholdPanel from "./lib/HouseholdPanel.svelte";
   import PresencePanel from "./lib/PresencePanel.svelte";
+  import OfflinePanel from "./lib/OfflinePanel.svelte";
+  import { disableServiceWorker, purgeOfflineData, quarantineIfIdentityChanged, readOfflineState } from "./lib/offline-store";
   import FieldInputs from "./lib/FieldInputs.svelte";
   import type { FormAnswers, FormField } from "./lib/form-fields";
 
@@ -30,6 +32,7 @@
   let inviteMessage = "招待を確認しています。";
   let initialSetupRequired = false;
   let workspaceReady = false;
+  let offlineMode = false;
   let isAdministrator = false;
   let currentRole = "";
   let checkinBusy = false;
@@ -80,6 +83,7 @@
   let walkInSaving = false;
   let selectedStaffId = "";
   let selectedEventId = "";
+  let currentActorId = "";
   let schedule: { enabled: boolean; status: string; date: string | null; startsAt?: string | null; endsAt?: string | null; allDay?: boolean; timeZone?: string; readyToConfirm?: string[]; participants?: Array<{ displayName: string; role: string; answered: boolean }>; options: Array<{ id: string; date: string; note: string; yes: number; maybe: number; no: number; start?: string | null; end?: string | null; allDay?: boolean }> } | null = null;
   let scheduleInviteUrl = "";
   let scheduleDate = "";
@@ -173,9 +177,7 @@
     else if (ticketPage) void loadParticipantTicket();
     else if (registrationEventId) void loadRegistration();
     else if (scheduleEventId) { scheduleRespondentId = localStorage.getItem(`tsudoi-schedule-${scheduleEventId}`) ?? crypto.randomUUID(); localStorage.setItem(`tsudoi-schedule-${scheduleEventId}`, scheduleRespondentId); void loadPublicSchedule(); }
-    else {
-      void initializeOrganizer();
-    }
+    else { void bootOrganizer(); }
   });
   onDestroy(() => stopScanner());
 
@@ -241,9 +243,17 @@
       const setup = await status.json();
       if (setup.initialSetupRequired) { initialSetupRequired = true; screen = "setup"; return; }
       const session = await api("/session");
-      organizationId = session.organizationId; currentRole = session.role; isAdministrator = session.role === "owner" || session.role === "admin";
+      currentActorId = session.actorId ?? ""; organizationId = session.organizationId; currentRole = session.role; isAdministrator = session.role === "owner" || session.role === "admin";
+      if (currentActorId && organizationId) await quarantineIfIdentityChanged(currentActorId, organizationId);
       workspaceReady = true; screen = "home"; await Promise.all([loadEvents(), loadProfile(), loadApiTokens()]);
     } catch { screen = "setup"; setupMessage = "Passkey でログインしてください。"; }
+  }
+  async function bootOrganizer() {
+    try {
+      const offline = await readOfflineState();
+      if (offline.snapshot || offline.operations.length || offline.quarantinedIdentity) { offlineMode = true; return; }
+    } catch { /* regular online initialization can still continue */ }
+    await initializeOrganizer();
   }
   async function registerInitialAdministrator() {
     try {
@@ -257,6 +267,8 @@
       const response = await fetch("/api/setup/initial-admin/verify", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ challengeId: optionBody.challengeId, response: credential }) });
       const session = await response.json();
       if (!response.ok) throw new Error(session.message ?? session.error ?? "初期設定に失敗しました。");
+      const authenticated = await api("/session"); currentActorId = authenticated.actorId ?? ""; organizationId = authenticated.organizationId ?? session.organizationId ?? ""; currentRole = authenticated.role ?? session.role ?? "owner";
+      if (currentActorId && organizationId) await quarantineIfIdentityChanged(currentActorId, organizationId);
       isAdministrator = true; workspaceReady = true; screen = "home";
       await Promise.all([loadEvents(), loadProfile()]); message = "初期管理者を登録しました。まずはイベントを作成しましょう。";
     } catch (error) { setupMessage = error instanceof Error ? error.message : "Passkey を登録できませんでした。"; }
@@ -273,11 +285,23 @@
       const response = await fetch("/api/session/verify", { method: "POST", credentials: "same-origin", headers: { "content-type": "application/json" }, body: JSON.stringify({ challengeId: optionBody.challengeId, response: credential }) });
       const session = await response.json();
       if (!response.ok) throw new Error(session.message ?? session.error ?? "Passkey を確認できませんでした。");
-      organizationId = session.organizationId ?? organizationId; currentRole = session.role; isAdministrator = session.role === "owner" || session.role === "admin";
+      const authenticated = await api("/session"); currentActorId = authenticated.actorId ?? ""; organizationId = authenticated.organizationId ?? session.organizationId ?? organizationId; currentRole = authenticated.role ?? session.role; isAdministrator = currentRole === "owner" || currentRole === "admin";
+      if (currentActorId && organizationId) await quarantineIfIdentityChanged(currentActorId, organizationId);
       workspaceReady = true; screen = "home"; await Promise.all([loadEvents(), loadProfile()]);
     } catch (error) { setupMessage = error instanceof Error ? error.message : "Passkey でログインできませんでした。"; }
   }
-  async function signOut() { stopScanner(); await fetch("/api/session/logout", { method: "POST", credentials: "same-origin" }); workspaceReady = false; isAdministrator = false; currentRole = ""; events = []; screen = "setup"; setupMessage = "Passkey でログインしてください。"; }
+  async function signOut() {
+    try {
+      const offline = await readOfflineState();
+      if (offline.operations.length) { message = "未同期操作があります。オフライン受付画面で結果を同期するか、書き出してから明示的に消去してください。"; offlineMode = true; return; }
+      stopScanner(); await purgeOfflineData(); await disableServiceWorker();
+      const response = await fetch("/api/session/logout", { method: "POST", credentials: "same-origin" });
+      if (!response.ok) throw new Error("オンラインでログアウトを完了できませんでした。通信を確認して再試行してください。");
+      workspaceReady = false; isAdministrator = false; currentRole = ""; currentActorId = ""; organizationId = ""; events = []; screen = "setup"; offlineMode = false; setupMessage = "Passkey でログインしてください。";
+    } catch (error) { message = error instanceof Error ? error.message : "ログアウトできませんでした。"; }
+  }
+  function closeOfflinePanel() { offlineMode = false; if (!workspaceReady) void initializeOrganizer(); }
+  function openOfflinePanel() { offlineMode = true; }
   function goHome() { stopScanner(); confirmAttendee = null; editingAttendeeId = ""; screen = "home"; }
   async function loadParticipantTicket() {
     try {
@@ -678,6 +702,8 @@
   {#if registrationMessage}<p class="notice" aria-live="polite">{registrationMessage}</p>{/if}
   {#if ticketQr}<section aria-labelledby="ticket-qr"><h2 id="ticket-qr">あなたの受付QR</h2><p>会場で提示してください。安全のため、他者へ転送しないでください。</p><img src={ticketQr} alt="受付用QRコード" width="320" height="320" /></section>{/if}
   {#if issuedTicket}<section aria-labelledby="passkey-registration"><h2 id="passkey-registration">Passkey を登録する</h2><p>この端末でチケットを安全に再表示できるようにします。PRF対応Passkeyでは、E2EE鍵の保護にも使用します。</p><button onclick={registerPasskey}>Passkey を登録</button>{#if passkeyMessage}<p class="notice" aria-live="polite">{passkeyMessage}</p>{/if}</section>{/if}
+{:else if offlineMode}
+  <OfflinePanel {api} onclose={closeOfflinePanel} onlogout={signOut} context={selectedEventId && currentActorId && organizationId ? { eventId: selectedEventId, eventName: events.find((event) => event.id === selectedEventId)?.name ?? "イベント", actorId: currentActorId, organizationId, role: currentRole, venues: venues.map(({ id, name }) => ({ id, name })) } : null} />
 {:else}
   {#if !workspaceReady || screen === "setup"}
     <header><p class="eyebrow">WELCOME TO TSUDOI</p><h1>tsudoi</h1><p>{initialSetupRequired ? "最初に、初期管理者を登録します。" : "Passkey でログインします。"}</p></header>
@@ -727,6 +753,7 @@
       </section>
     {:else}
       <section class="event-title"><h2>{events.find((event) => event.id === selectedEventId)?.name ?? "イベント管理"}</h2><p>必要な作業を選んでください。</p></section>
+      <button type="button" class="quiet" onclick={openOfflinePanel}>オフライン受付を開く</button>
       {#if schedule?.enabled && schedule.status !== "confirmed"}
         <section aria-labelledby="schedule-management"><h2 id="schedule-management">日程を調整</h2><p>候補日を選んで、参加者に回答してもらいます。</p>
           <p class="muted">共有用URL: <a href={`/events/${selectedEventId}/schedule`} target="_blank" rel="noreferrer">日程調整ページを開く</a></p>
