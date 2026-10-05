@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { formatUtcTimestamp } from "./time";
   import { onDestroy, onMount, tick } from "svelte";
 
   type Api = (path: string, init?: RequestInit) => Promise<any>;
@@ -315,7 +316,7 @@
                 {:else}
                   <strong>{claim.attendee_name}</strong><span>配布数量 {claim.quantity} {selectedDistribution.unit}</span>
                 {/if}
-                <small>{claim.affiliation ?? "所属未登録"}{claim.venue_name ? ` · ${claim.venue_name}` : ""} · {new Date(claim.created_at).toLocaleString()}</small>
+                <small>{claim.affiliation ?? "所属未登録"}{claim.venue_name ? ` · ${claim.venue_name}` : ""} · {formatUtcTimestamp(claim.created_at)}</small>
                 {#if claim.status === "accepted" && !claim.reversed_at && claim.used_now !== undefined}<small>この配布回: 使用 {claim.used_now}/{selectedDistribution.max_per_attendee}、残り {claim.remaining_now ?? Math.max(0, selectedDistribution.max_per_attendee - claim.used_now)} {selectedDistribution.unit}</small>{/if}
                 {#if (claim.status === "reversed" || claim.reversed_at) && claim.reverse_reason}<small>取消理由: {claim.reverse_reason}</small>{/if}
               </div>

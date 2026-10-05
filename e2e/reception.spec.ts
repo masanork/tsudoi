@@ -1,5 +1,6 @@
 import { expect, test, type Locator } from "@playwright/test";
 import { verifyDistributionFlow } from "./operations-flow";
+import { verifyPresenceFlow } from "./presence-flow";
 
 async function fillAnswers(form: Locator, company: string) {
   await form.getByLabel("所属（必須）", { exact: true }).fill(company);
@@ -287,6 +288,7 @@ test("completes Passkey setup, registration, roster reception, duplicate detecti
         await expect(viewer.getByRole("button", { name: label, exact: true })).toHaveCount(0);
       }
     } finally { await viewerContext.close(); }
-    await verifyDistributionFlow(page, context);
+    const operationsFixture = await verifyDistributionFlow(page, context);
+    await verifyPresenceFlow(page, context, operationsFixture);
   } finally { await participantContext.close(); }
 });

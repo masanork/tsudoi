@@ -618,6 +618,304 @@ app.post("/api/events/:eventId/credentials/resolve", requireScope("checkin:write
   return c.json({ attendee_id: attendee.id, name: attendee.name, affiliation: attendee.affiliation, venue_id: venueId, venue_name: attendee.venue_name });
 });
 
+app.get("/api/events/:eventId/presence", requireScope("roster:read"), async (c) => {
+  const event = await eventForAuth(c);
+  if (!event) return c.json({ error: "not_found" }, 404);
+  const auth = c.get("auth");
+  const venueId = c.req.query("venueId") ?? "";
+  const attendeeId = c.req.query("attendeeId") ?? "";
+  const q = c.req.query("q")?.trim() ?? "";
+  const after = c.req.query("after") ?? "";
+  const rawLimit = c.req.query("limit");
+  const limit = rawLimit === undefined ? 50 : Number(rawLimit);
+  if ((venueId && !isUuid(venueId)) || (attendeeId && !isUuid(attendeeId)) || q.length > 100 || (after && !isUuid(after)) || !Number.isInteger(limit) || limit < 1 || limit > 100) {
+    return badRequest(c, "invalid presence filters");
+  }
+  const venueError = await checkInVenueError(c, event.id, venueId || undefined);
+  if (venueError) return c.json({ error: venueError }, venueError === "invalid_venue" ? 400 : 403);
+  if (after && !await c.env.DB.prepare("SELECT id FROM attendees WHERE id = ? AND event_id = ? AND organization_id = ?")
+    .bind(after, event.id, auth.organizationId).first()) return badRequest(c, "invalid presence cursor");
+
+  const rows = await c.env.DB.prepare(`SELECT a.id AS attendee_id, a.name, a.affiliation, a.venue_id AS registration_venue_id,
+      COALESCE(p.state, 'out') AS state, CASE WHEN p.state = 'in' THEN p.venue_id ELSE NULL END AS venue_id,
+      v.name AS venue_name, COALESCE(p.revision, 0) AS revision, COALESCE(p.updated_at, a.created_at) AS updated_at
+    FROM attendees a JOIN tickets t ON t.attendee_id = a.id AND t.event_id = a.event_id
+    LEFT JOIN attendee_presence p ON p.event_id = a.event_id AND p.attendee_id = a.id
+    LEFT JOIN venues v ON v.id = p.venue_id
+    WHERE a.event_id = ? AND a.organization_id = ? AND ((a.status = 'active' AND t.status IN ('issued', 'checked_in')) OR p.state = 'in')
+      AND (? = '' OR COALESCE(p.venue_id, a.venue_id) = ?)
+      AND (? != 'staff' OR COALESCE(p.venue_id, a.venue_id) = ?)
+      AND (? = '' OR a.id = ?)
+      AND (? = '' OR a.name LIKE ? OR a.affiliation LIKE ?)
+      AND (? = '' OR (a.created_at, a.id) < (SELECT created_at, id FROM attendees WHERE id = ? AND event_id = ?))
+    ORDER BY a.created_at DESC, a.id DESC LIMIT ?`)
+    .bind(event.id, auth.organizationId, venueId, venueId, auth.role, venueId, attendeeId, attendeeId, q, `%${q}%`, `%${q}%`, after, after, event.id, limit + 1)
+    .all<Record<string, unknown>>();
+  const page = rows.results.slice(0, limit);
+  const summaryRow = await c.env.DB.prepare(`SELECT COUNT(*) AS total_attendees,
+      COALESCE(SUM(CASE WHEN p.state = 'in' THEN 1 ELSE 0 END), 0) AS total_in,
+      COALESCE(SUM(CASE WHEN COALESCE(p.state, 'out') = 'out' THEN 1 ELSE 0 END), 0) AS total_out
+    FROM attendees a JOIN tickets t ON t.attendee_id = a.id AND t.event_id = a.event_id
+    LEFT JOIN attendee_presence p ON p.event_id = a.event_id AND p.attendee_id = a.id
+    WHERE a.event_id = ? AND a.organization_id = ? AND ((a.status = 'active' AND t.status IN ('issued', 'checked_in')) OR p.state = 'in')
+      AND (? = '' OR COALESCE(p.venue_id, a.venue_id) = ?)
+      AND (? != 'staff' OR COALESCE(p.venue_id, a.venue_id) = ?)`)
+    .bind(event.id, auth.organizationId, venueId, venueId, auth.role, venueId)
+    .first<{ total_attendees: number; total_in: number; total_out: number }>();
+  const venueCounts = await c.env.DB.prepare(`SELECT p.venue_id, v.name AS venue_name, COUNT(*) AS count
+    FROM attendee_presence p JOIN attendees a ON a.id = p.attendee_id AND a.event_id = p.event_id
+    JOIN venues v ON v.id = p.venue_id AND v.event_id = p.event_id
+    WHERE p.event_id = ? AND p.organization_id = ? AND p.state = 'in'
+      AND (? = '' OR p.venue_id = ?)
+      AND (? != 'staff' OR p.venue_id = ?)
+    GROUP BY p.venue_id, v.name ORDER BY v.name COLLATE NOCASE, p.venue_id`)
+    .bind(event.id, auth.organizationId, venueId, venueId, auth.role, venueId)
+    .all<{ venue_id: string; venue_name: string; count: number }>();
+  const totalEntries = await c.env.DB.prepare(`SELECT COUNT(*) AS count FROM presence_movements m
+    WHERE m.event_id = ? AND m.organization_id = ? AND m.action = 'enter'
+      AND (? != 'staff' OR EXISTS (SELECT 1 FROM venue_staff_assignments s WHERE s.venue_id = m.venue_id AND s.user_id = ?))`)
+    .bind(event.id, auth.organizationId, auth.role, auth.actorId)
+    .first<{ count: number }>();
+  return c.json({
+    presence: page,
+    nextCursor: rows.results.length > limit ? page.at(-1)?.attendee_id ?? null : null,
+    summary: { ...summaryRow, total_entries: totalEntries?.count ?? 0, venue_in: venueCounts.results },
+  });
+});
+
+app.post("/api/events/:eventId/presence/resolve", requireScope("checkin:write"), async (c) => {
+  const event = await eventForAuth(c);
+  if (!event) return c.json({ error: "not_found" }, 404);
+  const body = await jsonBody(c);
+  const qrLink = requiredString(body, "qrLink");
+  const venueId = requiredString(body, "venueId");
+  if (!qrLink || qrLink.length > 2048 || !venueId || !isUuid(venueId)
+    || Object.keys(body).some((key) => !["qrLink", "venueId"].includes(key))) return badRequest(c, "QR link and operation venue are required");
+  const venueError = await checkInVenueError(c, event.id, venueId);
+  if (venueError) return c.json({ error: venueError }, venueError === "invalid_venue" ? 400 : 403);
+  const attendee = await findDistributionAttendeeByQr(c, event.id, qrLink);
+  if (!attendee) return c.json({ error: "not_found" }, 404);
+  const presence = await c.env.DB.prepare("SELECT state, venue_id, revision, updated_at FROM attendee_presence WHERE event_id = ? AND attendee_id = ?")
+    .bind(event.id, attendee.id).first<{ state: "in" | "out"; venue_id: string | null; revision: number; updated_at: string }>();
+  if (presence?.state === "in" && presence.venue_id) {
+    if (presence.venue_id !== venueId) {
+      const currentVenueError = await checkInVenueError(c, event.id, presence.venue_id);
+      return c.json({ error: currentVenueError ?? "wrong_current_venue" }, currentVenueError === "venue_not_assigned" ? 403 : 409);
+    }
+  }
+  return c.json({
+    attendee_id: attendee.id,
+    name: attendee.name,
+    affiliation: attendee.affiliation,
+    registration_venue_id: attendee.venue_id,
+    presence: { state: presence?.state ?? "out", venue_id: presence?.venue_id ?? null, revision: presence?.revision ?? 0, updated_at: presence?.updated_at ?? null },
+    operation_venue_id: venueId,
+    operation_venue_name: await c.env.DB.prepare("SELECT name FROM venues WHERE id = ? AND event_id = ?").bind(venueId, event.id).first<string>("name"),
+  });
+});
+
+app.post("/api/events/:eventId/presence/movements", requireScope("checkin:write"), async (c) => {
+  const event = await eventForAuth(c);
+  if (!event) return c.json({ error: "not_found" }, 404);
+  const auth = c.get("auth");
+  const body = await jsonBody(c);
+  const requestId = requiredString(body, "requestId");
+  const attendeeId = optionalString(body.attendeeId);
+  const qrLink = optionalString(body.qrLink);
+  const action = body.action;
+  const venueId = requiredString(body, "venueId");
+  const expectedRevision = body.expectedRevision === undefined || body.expectedRevision === null ? null : body.expectedRevision;
+  const occurredAt = body.occurredAt === undefined || body.occurredAt === null ? null : normalizeOccurredAt(body.occurredAt);
+  if (!requestId || !isUuid(requestId) || (!!attendeeId === !!qrLink) || !["enter", "exit"].includes(String(action))
+    || !venueId || !isUuid(venueId)
+    || (expectedRevision !== null && (!Number.isInteger(expectedRevision) || (expectedRevision as number) < 0))
+    || (body.occurredAt !== undefined && body.occurredAt !== null && !occurredAt)
+    || Object.keys(body).some((key) => !["requestId", "attendeeId", "qrLink", "action", "venueId", "expectedRevision", "occurredAt"].includes(key))) return badRequest(c, "invalid presence movement");
+
+  const venueError = await checkInVenueError(c, event.id, venueId);
+  if (venueError) return c.json({ error: venueError }, venueError === "invalid_venue" ? 400 : 403);
+  const parsedQr = qrLink ? parseTicketQrLink(c.env.APP_ORIGIN, qrLink) : null;
+  if (qrLink && !parsedQr) return badRequest(c, "invalid QR link");
+  const qrTokenHash = parsedQr ? await sha256(parsedQr.token) : null;
+  const existing = await c.env.DB.prepare(`SELECT id, organization_id, event_id, request_id, payload_hash, attendee_id, ticket_id,
+      action, venue_id, expected_revision, created_by, outcome, movement_id, result_state, result_venue_id, result_revision,
+      result_updated_at, occurred_at FROM presence_requests WHERE organization_id = ? AND event_id = ? AND request_id = ?`)
+    .bind(auth.organizationId, event.id, requestId).first<PresenceRequestRow>();
+  if (existing) {
+    if (existing.created_by !== auth.actorId) return c.json({ error: "idempotency_conflict" }, 409);
+    if (existing.venue_id !== venueId) return c.json({ error: "idempotency_conflict" }, 409);
+    const targetMatches = parsedQr ? parsedQr.ticketId === existing.ticket_id : attendeeId === existing.attendee_id;
+    const payloadHash = await sha256(JSON.stringify({ actorId: auth.actorId, attendeeId: existing.attendee_id, ticketId: existing.ticket_id, action, venueId, expectedRevision, qrTokenHash, occurredAt }));
+    if (!targetMatches || existing.payload_hash !== payloadHash) return c.json({ error: "idempotency_conflict" }, 409);
+    const response = await presenceRequestResponse(c.env.DB, existing);
+    return response ? c.json(response, 200) : c.json({ error: "not_found" }, 404);
+  }
+
+  const attendee = parsedQr
+    ? await findDistributionAttendeeByQr(c, event.id, qrLink!)
+    : await findDistributionAttendeeById(c, event.id, attendeeId!);
+  if (!attendee || (attendeeId && attendee.id !== attendeeId) || (parsedQr && parsedQr.ticketId !== attendee.ticket_id)) return c.json({ error: "not_found" }, 404);
+  const currentPresence = await c.env.DB.prepare("SELECT state, venue_id FROM attendee_presence WHERE event_id = ? AND attendee_id = ?")
+    .bind(event.id, attendee.id).first<{ state: "in" | "out"; venue_id: string | null }>();
+  if (auth.role === "staff" && currentPresence?.state === "in" && currentPresence.venue_id) {
+    const currentVenueError = await checkInVenueError(c, event.id, currentPresence.venue_id);
+    if (currentVenueError) return c.json({ error: currentVenueError }, 403);
+    if (currentPresence.venue_id !== venueId) return c.json({ error: "wrong_current_venue" }, 409);
+  }
+  const payloadHash = await sha256(JSON.stringify({ actorId: auth.actorId, attendeeId: attendee.id, ticketId: attendee.ticket_id, action, venueId, expectedRevision, qrTokenHash, occurredAt }));
+  const operationId = crypto.randomUUID();
+  const movementId = crypto.randomUUID();
+  const db = c.env.DB;
+  const qrCheck = `(? IS NULL OR EXISTS (SELECT 1 FROM ticket_qr_tokens q WHERE q.ticket_id = t.id AND q.token_hash = ? AND q.expires_at > CURRENT_TIMESTAMP) OR (t.token_key_id = 'v1' AND t.token_hash = ?))`;
+  const scopeCheck = `(? != 'staff' OR EXISTS (SELECT 1 FROM venue_staff_assignments s WHERE s.venue_id = ? AND s.user_id = ?))`;
+  try {
+    await db.batch([
+      db.prepare(`INSERT OR IGNORE INTO attendee_presence (id, organization_id, event_id, attendee_id, state, venue_id, revision)
+        SELECT ?, a.organization_id, a.event_id, a.id, 'out', NULL, 0
+        FROM attendees a JOIN tickets t ON t.attendee_id = a.id AND t.event_id = a.event_id
+        JOIN events e ON e.id = a.event_id JOIN venues v ON v.id = ? AND v.event_id = e.id
+        WHERE a.id = ? AND a.event_id = ? AND a.organization_id = ? AND a.status = 'active' AND t.id = ? AND t.status IN ('issued','checked_in')
+          AND e.archived_at IS NULL AND ${qrCheck} AND ${scopeCheck}`)
+        .bind(crypto.randomUUID(), venueId, attendee.id, event.id, auth.organizationId, attendee.ticket_id,
+          qrTokenHash, qrTokenHash, qrTokenHash, auth.role, venueId, auth.actorId),
+      db.prepare(`INSERT OR IGNORE INTO presence_requests (id, organization_id, event_id, request_id, payload_hash, attendee_id, ticket_id,
+          action, venue_id, expected_revision, created_by, outcome, movement_id, result_state, result_venue_id, result_revision, result_updated_at, occurred_at)
+        SELECT ?, ?, ?, ?, ?, a.id, t.id, ?, ?, ?, ?, 'pending', NULL, p.state, p.venue_id, p.revision, p.updated_at, COALESCE(?, CURRENT_TIMESTAMP)
+        FROM attendees a JOIN tickets t ON t.attendee_id = a.id AND t.event_id = a.event_id
+        JOIN events e ON e.id = a.event_id JOIN venues v ON v.id = ? AND v.event_id = e.id
+        JOIN attendee_presence p ON p.event_id = a.event_id AND p.attendee_id = a.id
+        WHERE a.id = ? AND a.event_id = ? AND a.organization_id = ? AND a.status = 'active' AND t.id = ? AND t.status IN ('issued','checked_in')
+          AND e.archived_at IS NULL AND ${qrCheck} AND ${scopeCheck}
+          AND (? != 'staff' OR p.state != 'in' OR EXISTS (SELECT 1 FROM venue_staff_assignments current_assignment
+            WHERE current_assignment.user_id = ? AND current_assignment.venue_id = p.venue_id))`)
+        .bind(operationId, auth.organizationId, event.id, requestId, payloadHash, action, venueId, expectedRevision, auth.actorId, occurredAt,
+          venueId, attendee.id, event.id, auth.organizationId, attendee.ticket_id,
+          qrTokenHash, qrTokenHash, qrTokenHash, auth.role, venueId, auth.actorId, auth.role, auth.actorId),
+      db.prepare(`UPDATE attendee_presence SET state = CASE WHEN ? = 'enter' THEN 'in' ELSE 'out' END,
+          venue_id = CASE WHEN ? = 'enter' THEN ? ELSE NULL END, revision = revision + 1,
+          updated_at = CURRENT_TIMESTAMP, last_request_id = ?
+        WHERE event_id = ? AND organization_id = ? AND attendee_id = ?
+          AND (? IS NULL OR revision = ?)
+          AND ((? = 'enter' AND state = 'out') OR (? = 'exit' AND state = 'in' AND venue_id = ?))
+          AND EXISTS (SELECT 1 FROM presence_requests r WHERE r.id = ? AND r.organization_id = ? AND r.event_id = ? AND r.request_id = ?
+            AND r.created_by = ? AND r.payload_hash = ? AND r.outcome = 'pending')
+          AND EXISTS (SELECT 1 FROM attendees a JOIN tickets t ON t.attendee_id = a.id AND t.event_id = a.event_id
+            JOIN events e ON e.id = a.event_id JOIN venues v ON v.id = ? AND v.event_id = e.id
+            WHERE a.id = attendee_presence.attendee_id AND a.status = 'active' AND t.id = ? AND t.status IN ('issued','checked_in')
+              AND e.id = ? AND e.organization_id = ? AND e.archived_at IS NULL
+              AND ${qrCheck} AND ${scopeCheck})
+          AND (? != 'staff' OR state != 'in' OR EXISTS (SELECT 1 FROM venue_staff_assignments current_assignment
+            WHERE current_assignment.user_id = ? AND current_assignment.venue_id = attendee_presence.venue_id))`)
+        .bind(action, action, venueId, requestId, event.id, auth.organizationId, attendee.id,
+          expectedRevision, expectedRevision, action, action, venueId,
+          operationId, auth.organizationId, event.id, requestId, auth.actorId, payloadHash,
+          venueId, attendee.ticket_id, event.id, auth.organizationId,
+          qrTokenHash, qrTokenHash, qrTokenHash, auth.role, venueId, auth.actorId, auth.role, auth.actorId),
+      db.prepare(`INSERT INTO presence_movements (id, organization_id, event_id, attendee_id, request_id, action, venue_id, revision, actor_id, occurred_at)
+        SELECT ?, r.organization_id, r.event_id, r.attendee_id, r.request_id, r.action, r.venue_id, p.revision, r.created_by, r.occurred_at
+        FROM presence_requests r JOIN attendee_presence p ON p.event_id = r.event_id AND p.attendee_id = r.attendee_id
+        WHERE r.id = ? AND r.organization_id = ? AND r.event_id = ? AND r.request_id = ? AND r.created_by = ? AND r.payload_hash = ?
+          AND r.outcome = 'pending' AND r.movement_id IS NULL AND p.last_request_id = r.request_id`)
+        .bind(movementId, operationId, auth.organizationId, event.id, requestId, auth.actorId, payloadHash),
+      db.prepare(`UPDATE presence_requests SET
+          outcome = CASE WHEN EXISTS (SELECT 1 FROM presence_movements m WHERE m.request_id = presence_requests.request_id AND m.event_id = presence_requests.event_id) THEN 'accepted'
+            WHEN expected_revision IS NOT NULL AND expected_revision != (SELECT revision FROM attendee_presence p WHERE p.event_id = presence_requests.event_id AND p.attendee_id = presence_requests.attendee_id) THEN 'revision_conflict'
+            ELSE 'state_conflict' END,
+          movement_id = (SELECT m.id FROM presence_movements m WHERE m.request_id = presence_requests.request_id AND m.event_id = presence_requests.event_id),
+          result_state = (SELECT state FROM attendee_presence p WHERE p.event_id = presence_requests.event_id AND p.attendee_id = presence_requests.attendee_id),
+          result_venue_id = (SELECT venue_id FROM attendee_presence p WHERE p.event_id = presence_requests.event_id AND p.attendee_id = presence_requests.attendee_id),
+          result_revision = (SELECT revision FROM attendee_presence p WHERE p.event_id = presence_requests.event_id AND p.attendee_id = presence_requests.attendee_id),
+          result_updated_at = (SELECT updated_at FROM attendee_presence p WHERE p.event_id = presence_requests.event_id AND p.attendee_id = presence_requests.attendee_id)
+        WHERE id = ? AND organization_id = ? AND event_id = ? AND request_id = ? AND created_by = ? AND payload_hash = ? AND outcome = 'pending'`)
+        .bind(operationId, auth.organizationId, event.id, requestId, auth.actorId, payloadHash),
+      db.prepare(`INSERT INTO audit_logs (id, organization_id, actor_id, action, target_type, target_id, metadata_json)
+        SELECT ?, r.organization_id, r.created_by, CASE WHEN r.action = 'enter' THEN 'presence.entered' ELSE 'presence.exited' END,
+          'presence_movement', m.id, ? FROM presence_requests r JOIN presence_movements m ON m.id = r.movement_id
+        WHERE r.id = ? AND r.organization_id = ? AND r.event_id = ? AND r.request_id = ? AND r.created_by = ? AND r.payload_hash = ? AND r.outcome = 'accepted'`)
+        .bind(crypto.randomUUID(), JSON.stringify({ requestId, venueId, action }), operationId, auth.organizationId, event.id, requestId, auth.actorId, payloadHash),
+    ]);
+  } catch (error) {
+    const raced = await db.prepare(`SELECT id, organization_id, event_id, request_id, payload_hash, attendee_id, ticket_id,
+        action, venue_id, expected_revision, created_by, outcome, movement_id, result_state, result_venue_id, result_revision,
+        result_updated_at, occurred_at FROM presence_requests WHERE organization_id = ? AND event_id = ? AND request_id = ?`)
+      .bind(auth.organizationId, event.id, requestId).first<PresenceRequestRow>();
+    if (raced) return raced.created_by === auth.actorId && raced.payload_hash === payloadHash
+      ? c.json(await presenceRequestResponse(db, raced), 200)
+      : c.json({ error: "idempotency_conflict" }, 409);
+    throw error;
+  }
+  const result = await db.prepare(`SELECT id, organization_id, event_id, request_id, payload_hash, attendee_id, ticket_id,
+      action, venue_id, expected_revision, created_by, outcome, movement_id, result_state, result_venue_id, result_revision,
+      result_updated_at, occurred_at FROM presence_requests WHERE organization_id = ? AND event_id = ? AND request_id = ?`)
+    .bind(auth.organizationId, event.id, requestId).first<PresenceRequestRow>();
+  if (!result) {
+    const latestVenueError = await checkInVenueError(c, event.id, venueId);
+    return latestVenueError ? c.json({ error: latestVenueError }, latestVenueError === "invalid_venue" ? 400 : 403) : c.json({ error: "not_found" }, 404);
+  }
+  if (result.created_by !== auth.actorId || result.payload_hash !== payloadHash) return c.json({ error: "idempotency_conflict" }, 409);
+  return c.json(await presenceRequestResponse(db, result), result.id === operationId ? 201 : 200);
+});
+
+app.get("/api/events/:eventId/presence/movements/by-request/:requestId", requireScope("checkin:write"), async (c) => {
+  const event = await eventForAuth(c);
+  if (!event) return c.json({ error: "not_found" }, 404);
+  const auth = c.get("auth");
+  const requestId = c.req.param("requestId");
+  if (!requestId || !isUuid(requestId)) return badRequest(c, "invalid request id");
+  const row = await c.env.DB.prepare(`SELECT id, organization_id, event_id, request_id, payload_hash, attendee_id, ticket_id,
+      action, venue_id, expected_revision, created_by, outcome, movement_id, result_state, result_venue_id, result_revision,
+      result_updated_at, occurred_at FROM presence_requests
+    WHERE organization_id = ? AND event_id = ? AND request_id = ? AND created_by = ?
+      AND (? != 'staff' OR EXISTS (SELECT 1 FROM venue_staff_assignments s JOIN venues v ON v.id = s.venue_id
+        WHERE s.user_id = ? AND s.venue_id = presence_requests.venue_id AND v.event_id = presence_requests.event_id))`)
+    .bind(auth.organizationId, event.id, requestId, auth.actorId, auth.role, auth.actorId).first<PresenceRequestRow>();
+  if (!row) return c.json({ error: "not_found" }, 404);
+  return c.json(await presenceRequestResponse(c.env.DB, row));
+});
+
+app.get("/api/events/:eventId/presence/history", requireScope("roster:read"), async (c) => {
+  const event = await eventForAuth(c);
+  if (!event) return c.json({ error: "not_found" }, 404);
+  const auth = c.get("auth");
+  const attendeeId = c.req.query("attendeeId") ?? "";
+  const venueId = c.req.query("venueId") ?? "";
+  const after = c.req.query("after") ?? "";
+  const rawLimit = c.req.query("limit");
+  const limit = rawLimit === undefined ? 50 : Number(rawLimit);
+  if ((attendeeId && !isUuid(attendeeId)) || (venueId && !isUuid(venueId)) || (after && !isUuid(after))
+    || !Number.isInteger(limit) || limit < 1 || limit > 100) return badRequest(c, "invalid movement history filters");
+  const venueError = await checkInVenueError(c, event.id, venueId || undefined);
+  if (venueError) return c.json({ error: venueError }, venueError === "invalid_venue" ? 400 : 403);
+  if (after && !await c.env.DB.prepare(`SELECT 1 FROM presence_movements WHERE id = ? AND event_id = ? AND organization_id = ?
+      UNION ALL SELECT 1 FROM presence_requests WHERE id = ? AND event_id = ? AND organization_id = ? AND outcome IN ('state_conflict','revision_conflict') LIMIT 1`)
+    .bind(after, event.id, auth.organizationId, after, event.id, auth.organizationId).first()) return badRequest(c, "invalid movement history cursor");
+  const rows = await c.env.DB.prepare(`WITH history AS (
+      SELECT m.id, m.request_id, m.attendee_id, a.name AS attendee_name, a.affiliation,
+        m.action, m.venue_id, v.name AS venue_name, m.revision, m.actor_id, COALESCE(u.display_name, '') AS actor_display_name,
+        m.recorded_at, m.occurred_at, 'accepted' AS outcome, 'accepted' AS status, m.id AS movement_id
+      FROM presence_movements m JOIN attendees a ON a.id = m.attendee_id
+      JOIN venues v ON v.id = m.venue_id LEFT JOIN users u ON u.id = m.actor_id
+      WHERE m.event_id = ? AND m.organization_id = ?
+      UNION ALL
+      SELECT r.id, r.request_id, r.attendee_id, a.name AS attendee_name, a.affiliation,
+        r.action, r.venue_id, v.name AS venue_name, r.result_revision AS revision, r.created_by AS actor_id,
+        COALESCE(u.display_name, '') AS actor_display_name, r.created_at AS recorded_at, r.occurred_at,
+        r.outcome, 'unsuccessful' AS status, NULL AS movement_id
+      FROM presence_requests r JOIN attendees a ON a.id = r.attendee_id
+      JOIN venues v ON v.id = r.venue_id LEFT JOIN users u ON u.id = r.created_by
+      WHERE r.event_id = ? AND r.organization_id = ? AND r.outcome IN ('state_conflict','revision_conflict')
+    )
+    SELECT h.* FROM history h
+    WHERE (? = '' OR h.attendee_id = ?) AND (? = '' OR h.venue_id = ?)
+      AND (? != 'staff' OR EXISTS (SELECT 1 FROM venue_staff_assignments s WHERE s.venue_id = h.venue_id AND s.user_id = ?))
+      AND (? = '' OR (h.recorded_at, h.revision, h.id) < (SELECT recorded_at, revision, id FROM history WHERE id = ?))
+    ORDER BY h.recorded_at DESC, h.revision DESC, h.id DESC LIMIT ?`)
+    .bind(event.id, auth.organizationId, event.id, auth.organizationId, attendeeId, attendeeId, venueId, venueId, auth.role, auth.actorId, after, after, limit + 1)
+    .all<Record<string, unknown>>();
+  const page = rows.results.slice(0, limit);
+  return c.json({ movements: page, nextCursor: rows.results.length > limit ? page.at(-1)?.id ?? null : null });
+});
+
 app.post("/api/events/:eventId/distributions/:distributionId/claims", requireScope("checkin:write"), async (c) => {
   const event = await eventForAuth(c);
   if (!event) return c.json({ error: "not_found" }, 404);
@@ -1293,12 +1591,16 @@ app.post("/api/participant/ticket/cancel", async (c) => {
       SELECT ?, a.organization_id, 'ticket.cancelled_by_participant', 'ticket', t.id, '{}'
       FROM tickets t JOIN attendees a ON a.id = t.attendee_id JOIN events e ON e.id = t.event_id
       WHERE a.id = ? AND t.status = 'issued'
+      AND NOT EXISTS (SELECT 1 FROM attendee_presence p WHERE p.event_id = t.event_id AND p.attendee_id = a.id AND p.state = 'in')
       AND (e.cancellation_closes_at IS NULL OR datetime(e.cancellation_closes_at) > CURRENT_TIMESTAMP)`)
       .bind(auditId, attendeeId),
     c.env.DB.prepare("UPDATE tickets SET status = 'cancelled' WHERE attendee_id = ? AND EXISTS (SELECT 1 FROM audit_logs WHERE id = ?)").bind(attendeeId, auditId),
     c.env.DB.prepare("UPDATE attendees SET status = 'cancelled', cancelled_at = CURRENT_TIMESTAMP WHERE id = ? AND EXISTS (SELECT 1 FROM audit_logs WHERE id = ?)").bind(attendeeId, auditId),
   ]);
-  if (!results[0].meta.changes) return c.json({ error: "cancellation_unavailable" }, 409);
+  if (!results[0].meta.changes) {
+    const presence = await c.env.DB.prepare("SELECT state FROM attendee_presence WHERE attendee_id = ? AND state = 'in'").bind(attendeeId).first();
+    return presence ? c.json({ error: "attendee_present" }, 409) : c.json({ error: "cancellation_unavailable" }, 409);
+  }
   return c.json({ cancelled: true });
 });
 
@@ -2492,6 +2794,21 @@ function distributionClaimResponse(row: DistributionClaimRow) {
     },
   };
 }
+async function presenceRequestResponse(db: D1Database, row: PresenceRequestRow) {
+  const movement = row.movement_id ? await db.prepare(`SELECT id, request_id, action, attendee_id, venue_id, revision, recorded_at, occurred_at
+    FROM presence_movements WHERE id = ? AND event_id = ? AND organization_id = ?`)
+    .bind(row.movement_id, row.event_id, row.organization_id).first<Record<string, unknown>>() : null;
+  return {
+    outcome: row.outcome,
+    movement,
+    presence: { state: row.result_state, venue_id: row.result_venue_id, revision: row.result_revision, updated_at: row.result_updated_at },
+  };
+}
+function normalizeOccurredAt(value: unknown): string | null {
+  if (typeof value !== "string" || value.length > 64 || !value.trim()) return null;
+  const timestamp = Date.parse(value);
+  return Number.isFinite(timestamp) ? new Date(timestamp).toISOString() : null;
+}
 function parseTicketQrLink(appOrigin: string, qrLink: string) {
   try {
     const url = new URL(qrLink);
@@ -2662,6 +2979,12 @@ type EventRow = { id: string; organization_id: string; name: string; status: str
 type FieldRow = { id: string; field_key: string; field_type: string; required: number; options_json: string };
 type DistributionAttendee = { id: string; name: string; affiliation: string; venue_id: string | null; venue_name: string | null; ticket_id: string; qr_token_hash: string | null };
 type DistributionClaimRow = { id: string; request_id: string; payload_hash: string; outcome: "accepted" | "limit_reached"; used_after: number; remaining_after: number; quantity: number; attendee_id: string; venue_id: string | null; created_at: string };
+type PresenceRequestRow = {
+  id: string; organization_id: string; event_id: string; request_id: string; payload_hash: string;
+  attendee_id: string; ticket_id: string; action: "enter" | "exit"; venue_id: string; expected_revision: number | null;
+  created_by: string; outcome: "pending" | "accepted" | "state_conflict" | "revision_conflict"; movement_id: string | null;
+  result_state: "in" | "out"; result_venue_id: string | null; result_revision: number; result_updated_at: string; occurred_at: string;
+};
 
 export default {
   fetch: app.fetch,

@@ -3,6 +3,7 @@
   import { startAuthentication, startRegistration } from "@simplewebauthn/browser";
   import QRCode from "qrcode";
   import DistributionPanel from "./lib/DistributionPanel.svelte";
+  import PresencePanel from "./lib/PresencePanel.svelte";
   import FieldInputs from "./lib/FieldInputs.svelte";
   import type { FormAnswers, FormField } from "./lib/form-fields";
 
@@ -312,7 +313,9 @@
       const body = await response.json();
       if (!response.ok) throw new Error(body.error ?? "cancellation_unavailable");
       participantMessage = "参加をキャンセルしました。"; await loadParticipantTicket();
-    } catch { participantMessage = "このチケットは現在キャンセルできません。"; }
+    } catch (error) { participantMessage = error instanceof Error && error.message === "attendee_present"
+      ? "在館中のためキャンセルできません。スタッフに退館の記録を依頼してください。"
+      : "このチケットは現在キャンセルできません。"; }
   }
   async function checkInTicketLink() {
     if (checkinBusy) return;
@@ -733,7 +736,7 @@
         <section class="notice"><strong>日程確定済み</strong><p>{schedule.startsAt ? scheduleOptionLabel({ date: schedule.date ?? "", start: schedule.startsAt, end: schedule.endsAt, allDay: schedule.allDay }) : ""}</p><p class="muted">{schedule.allDay === false ? "この時刻を参加者へ案内できます。" : "時刻は参加者へ別途ご連絡ください。"}</p></section>
       {/if}
       {#if schedule?.enabled && schedule.status === "confirmed" && isAdministrator}<section aria-labelledby="announcement"><h2 id="announcement">参加者へ案内</h2><p>確定した日程や、時刻・場所の連絡をメールでまとめて送れます。</p><form onsubmit={(event) => { event.preventDefault(); void sendAnnouncement(); }}><label>件名<input bind:value={announcementSubject} placeholder="集合時刻と場所のご案内" required /></label><label>本文<textarea bind:value={announcementBody} placeholder="確定日、集合時刻、場所、持ち物など" required></textarea></label><button>参加者へ送信</button></form>{#if announcementMessage}<p class="notice">{announcementMessage}</p>{/if}</section>{/if}
-      <div class="management-grid"><a href="#roster">名簿を管理</a><a href="#distribution">物品配布</a>{#if currentRole !== "viewer"}<a href="#check-in">QR 受付</a>{/if}{#if isAdministrator}<a href="#settings">申込フォーム設定</a>{/if}</div>
+      <div class="management-grid"><a href="#roster">名簿を管理</a><a href="#distribution">物品配布</a><a href="#presence">入退館管理</a>{#if currentRole !== "viewer"}<a href="#check-in">QR 受付</a>{/if}{#if isAdministrator}<a href="#settings">申込フォーム設定</a>{/if}</div>
       {#if isAdministrator}
         {@const currentEvent = events.find((event) => event.id === selectedEventId)}
         {#if currentEvent?.status === "draft"}<button class="quiet action" onclick={() => publishEvent(selectedEventId)}>イベントを公開する</button>{:else if currentEvent?.status === "published"}<button class="quiet action" onclick={() => closeEvent(selectedEventId)}>イベントを終了する</button>{/if}
@@ -748,6 +751,7 @@
         </section>
       {/if}
       {#key selectedEventId}<div id="distribution"><DistributionPanel eventId={selectedEventId} role={currentRole} {venues} attendees={rosterAttendees} {api} /></div>{/key}
+      {#key selectedEventId}<div id="presence"><PresencePanel eventId={selectedEventId} role={currentRole} {venues} {api} /></div>{/key}
       <section aria-labelledby="roster"><h2 id="roster">名簿を管理</h2><p class="muted">申込者と受付状態を確認できます。</p><form onsubmit={(event) => { event.preventDefault(); void loadRoster(selectedEventId); }}><label>検索<input bind:value={rosterQuery} placeholder="氏名またはメール" /></label><label>状態<select bind:value={rosterStatus}><option value="">すべて</option><option value="active">有効</option><option value="cancelled">取消</option></select></label><label>申込経路<select bind:value={rosterSource}><option value="">すべて</option><option value="public_form">事前申込</option><option value="walk_in">当日登録</option></select></label><label>会場<select bind:value={rosterVenueId}><option value="">すべて</option>{#each venues as venue}<option value={venue.id}>{venue.name}</option>{/each}</select></label><button>絞り込む</button></form>
       {#if ticketLinkMessage}<p class="notice" aria-live="polite">{ticketLinkMessage}</p>{/if}
       {#if isAdministrator}<section aria-labelledby="roster-import"><h3 id="roster-import">CSVから名簿を取り込む</h3><p class="muted">UTF-8 CSV、1 MB以下、データ100行・107列以下にしてください。CSV取込ではメールを送信しません。メールのない参加者は名簿から本人確認して受付してください。会場列は同じイベント内の会場名またはID、複数選択は「|」区切り、チェック項目は true / false、数値は有限の数で指定します。</p><label>CSVファイル<input type="file" accept=".csv,text/csv" disabled={!rosterReady} onchange={(event) => readCsvFile(event.currentTarget.files?.[0])} /></label>
