@@ -76,7 +76,7 @@
     }, 1000);
     try {
       channel = new BroadcastChannel("tsudoi-offline");
-      channel.onmessage = (event) => { if (["purged", "quarantined", "expired", "prepared"].includes(event.data?.type)) void reloadState(); };
+      channel.onmessage = (event) => { if (["purged", "quarantined", "expired", "prepared", "operation-added"].includes(event.data?.type)) void reloadState(); };
     } catch { channel = null; }
     if (navigator.onLine) void validateCurrentSession().finally(() => reloadState());
     else void reloadState();
@@ -178,15 +178,20 @@
   function setAttendee(personId: string, proof = "") { attendeeId = personId; credentialHash = proof; statusMessage = ""; errorMessage = ""; }
   async function resolveQr() {
     const raw = qrInput.trim(); qrInput = "";
-    if (!raw || !snapshot) return;
+    if (!raw) return;
     try {
+      // A different tab may have committed a quota reservation since this
+      // panel last rendered; use the durable snapshot and queue for projection.
+      const latest = await readOfflineState();
+      if (!latest.snapshot || latest.quarantinedIdentity) throw new Error("準備データを確認できません。画面を再読み込みしてください。");
+      localState = latest;
       const parsed = new URL(raw, location.origin);
       const match = parsed.pathname.match(/^\/public\/tickets\/([^/]+)\/check-in\/([^/]+)\/?$/);
       if (!match || parsed.origin !== location.origin) throw new Error("受付QRリンクの形式を確認してください。");
       const token = decodeURIComponent(match[2]);
       const digest = new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(token)));
       const hash = [...digest].map((byte) => byte.toString(16).padStart(2, "0")).join("");
-      const person = snapshot.attendees.find((attendee) => attendee.ticket.id === decodeURIComponent(match[1]) && attendee.credentials.some((credential) => credential.credentialHash === hash && utcTimestampMillis(credential.expiresAt) > Date.now()));
+      const person = latest.snapshot.attendees.find((attendee) => attendee.ticket.id === decodeURIComponent(match[1]) && attendee.credentials.some((credential) => credential.credentialHash === hash && utcTimestampMillis(credential.expiresAt) > Date.now()));
       if (!person) throw new Error("このQRは準備データに含まれていないか、有効期限が切れています。オンラインで本人確認してください。");
       setAttendee(person.id, hash);
       statusMessage = `${person.name}さんを確認しました。記録する操作を選んでください。`;
@@ -251,7 +256,10 @@
     if (!readyForWrites) return;
     busy = true; errorMessage = "";
     try { await appendOfflineOperation(operation); localState = await readOfflineState(); quantity = 1; statusMessage = success; }
-    catch (error) { errorMessage = friendly(error); statusMessage = "操作を保存できませんでした。記録済みとは扱っていません。紙に控えてオンライン復旧後に確認してください。"; }
+    catch (error) {
+      try { localState = await readOfflineState(); } catch { /* preserve current view when storage is unavailable */ }
+      errorMessage = friendly(error); statusMessage = "操作を保存できませんでした。記録済みとは扱っていません。紙に控えてオンライン復旧後に確認してください。";
+    }
     finally { busy = false; }
   }
 

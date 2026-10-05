@@ -172,6 +172,7 @@ export async function appendOfflineOperation(operation: OfflineOperation) {
     meta.put({ ...control, key: CONTROL_KEY, generation: validGeneration(control), nextSequence, disabled: false, quarantinedIdentity: control?.quarantinedIdentity ?? null });
     await done(tx);
   } finally { db.close(); }
+  try { const channel = new BroadcastChannel("tsudoi-offline"); channel.postMessage({ type: "operation-added" }); channel.close(); } catch { /* optional */ }
 }
 
 export async function recordOfflineOutcome(
