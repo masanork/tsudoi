@@ -29,6 +29,9 @@ export async function verifyOfflineFlow(page: Page, context: BrowserContext, fix
   const roundResponse = await context.request.post(`/api/events/${eventId}/distributions`, { data: { name: "通信断用の配布", unit: "個", maxPerAttendee: 1 } });
   expect(roundResponse.status()).toBe(201);
   const roundId = (await roundResponse.json()).id;
+  const projectionRoundResponse = await context.request.post(`/api/events/${eventId}/distributions`, { data: { name: "別タブ反映確認用", unit: "個", maxPerAttendee: 1 } });
+  expect(projectionRoundResponse.status()).toBe(201);
+  const projectionRoundId = (await projectionRoundResponse.json()).id;
   const expiryPersonResponse = await context.request.post(`/api/events/${eventId}/attendees`, { data: { name: "期限検証用の参加者", venueId } });
   expect(expiryPersonResponse.status()).toBe(201);
   const expiryPerson = await expiryPersonResponse.json();
@@ -145,24 +148,49 @@ export async function verifyOfflineFlow(page: Page, context: BrowserContext, fix
         panel.getByRole("button", { name: "配布を記録", exact: true }).click(),
         siblingPanel.getByRole("button", { name: "配布を記録", exact: true }).click(),
       ]);
-      await expect(panel).toContainText(/配布操作を未同期として保存|操作を保存できません/);
-      await expect(siblingPanel).toContainText(/配布操作を未同期として保存|操作を保存できません/);
+      await expect.poll(async () => (await storedState(page)).operations.length).toBe(1);
+      await expect(panel.getByRole("button", { name: "配布を記録", exact: true })).toBeDisabled();
+      await expect(siblingPanel.getByRole("button", { name: "配布を記録", exact: true })).toBeDisabled();
+      await expect.poll(async () => {
+        const [mainText, siblingText] = await Promise.all([panel.innerText(), siblingPanel.innerText()]);
+        return `${mainText}\n${siblingText}`.includes("配布操作を未同期として保存しました");
+      }).toBe(true);
     } finally { await sibling.close(); }
     await expect.poll(async () => (await storedState(page)).operations.length).toBe(1);
     // Re-reading a QR does not reset this terminal's provisional quota.
     await panel.getByLabel("受付QRリンク", { exact: true }).fill(qrLink);
     await panel.getByRole("button", { name: "QRから参加者を確認", exact: true }).click();
     await expect(panel.getByRole("button", { name: "配布を記録", exact: true })).toBeDisabled();
+    // A sibling tab can win a different round while this panel still has a stale
+    // projection. QR confirmation must refresh IndexedDB before enabling another claim.
+    await panel.getByRole("combobox", { name: "配布回", exact: true }).selectOption(projectionRoundId);
+    const projectionSibling = await context.newPage();
+    try {
+      await projectionSibling.goto("/");
+      const projectionPanel = projectionSibling.getByRole("region", { name: "オフライン受付", exact: true });
+      await projectionPanel.getByRole("combobox", { name: "参加者を選択", exact: true }).selectOption(person.attendeeId);
+      await projectionPanel.getByRole("combobox", { name: "配布回", exact: true }).selectOption(projectionRoundId);
+      await projectionPanel.getByLabel("数量", { exact: true }).fill("1");
+      await projectionPanel.getByRole("button", { name: "配布を記録", exact: true }).click();
+      await expect(projectionPanel).toContainText("配布操作を未同期として保存しました");
+      await expect.poll(async () => (await storedState(page)).operations.length).toBe(2);
+      await panel.getByLabel("受付QRリンク", { exact: true }).fill(qrLink);
+      await panel.getByRole("button", { name: "QRから参加者を確認", exact: true }).click();
+      await expect(panel.getByRole("button", { name: "配布を記録", exact: true })).toBeDisabled();
+    } finally { await projectionSibling.close(); }
     await panel.getByRole("button", { name: "入館を記録", exact: true }).click();
     await panel.getByRole("button", { name: "退館を記録", exact: true }).click();
     await panel.getByRole("combobox", { name: "参加者を選択", exact: true }).selectOption(familyMember.attendeeId);
+    await panel.getByRole("combobox", { name: "配布回", exact: true }).selectOption(roundId);
     await panel.getByRole("button", { name: "配布を記録", exact: true }).click();
     await panel.getByRole("button", { name: "入館を記録", exact: true }).click();
     await panel.getByRole("button", { name: "退館を記録", exact: true }).click();
-    await expect.poll(async () => (await storedState(page)).operations.length).toBe(6);
+    await expect.poll(async () => (await storedState(page)).operations.length).toBe(7);
     const queued = await storedState(page);
     const operationIds = queued.operations.map((operation: { requestId: string }) => operation.requestId).sort();
-    expect(new Set(operationIds).size).toBe(6);
+    expect(new Set(operationIds).size).toBe(7);
+    const projectionOperationId = queued.operations.find((operation: { distributionId?: string }) => operation.distributionId === projectionRoundId)?.requestId;
+    expect(projectionOperationId).toBeTruthy();
     expect(JSON.stringify(queued)).not.toContain(qrSecret);
     await page.reload();
     await expect(panel).toBeVisible();
@@ -190,13 +218,19 @@ export async function verifyOfflineFlow(page: Page, context: BrowserContext, fix
     await panel.getByRole("button", { name: "未同期操作を同期", exact: true }).click();
     await expect.poll(() => committedFamilyId).not.toBe("");
     await expect(panel.getByRole("button", { name: "未同期操作を同期", exact: true })).toBeEnabled();
+    const afterInitialSync = await storedState(page);
+    const unresolvedOperationIds = operationIds.filter((id) => id !== projectionOperationId);
+    expect(afterInitialSync.operations.map((operation: { requestId: string }) => operation.requestId).sort()).toEqual(unresolvedOperationIds);
+    expect(afterInitialSync.receipts).toContainEqual(expect.objectContaining({ requestId: projectionOperationId, outcome: "accepted" }));
+    const projectionClaims = await (await anotherTerminal.request.get(`/api/events/${eventId}/distributions/${projectionRoundId}/claims`)).json();
+    expect(projectionClaims.claims.some((claim: { attendee_id: string; status: string }) => claim.attendee_id === person.attendeeId && claim.status === "accepted")).toBe(true);
     const currentSession = await (await anotherTerminal.request.get("/api/session")).json();
     await page.route("**/api/session", (route) => route.fulfill({
       status: 200, contentType: "application/json", body: JSON.stringify({ ...currentSession, actorId: crypto.randomUUID() }),
     }), { times: 1 });
     await panel.getByRole("button", { name: "未同期操作を同期", exact: true }).click();
     await expect.poll(async () => (await storedState(page)).snapshot).toBeNull();
-    expect((await storedState(page)).operations.map((operation: { requestId: string }) => operation.requestId).sort()).toEqual(operationIds);
+    expect((await storedState(page)).operations.map((operation: { requestId: string }) => operation.requestId).sort()).toEqual(unresolvedOperationIds);
     await expect(panel).not.toContainText("配布確認者");
     await expect(panel).not.toContainText("世帯の同伴者");
     await panel.getByRole("button", { name: "元のアカウントを確認", exact: true }).click();

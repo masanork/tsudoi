@@ -37,7 +37,7 @@ Use [`docs/deployment-runbook.md`](docs/deployment-runbook.md) for an existing p
 
 See the full product and technical requirements in [`docs/specification.md`](docs/specification.md).
 
-See [`docs/field-operations.md`](docs/field-operations.md) for everyday event use and shelter operations, the ordered implementation milestones, acceptance checks, and offline limits. These new features require migrations `0005`–`0007`; the production deployment recorded above still has `0001`–`0004` until a separate rollout is recorded.
+See [`docs/field-operations.md`](docs/field-operations.md) for everyday event use and shelter operations, the ordered implementation milestones, acceptance checks, and offline limits. These features and migrations `0005`–`0007` were deployed to production on 2026-10-06 JST; see the [rollout record](docs/releases/2026-10-06-field-operations.md).
 
 ## Configuration and deployment
 
