@@ -530,6 +530,317 @@ app.post("/api/events/:eventId/form-fields", requireScope("admin"), async (c) =>
   return c.json({ id }, 201);
 });
 
+app.get("/api/events/:eventId/distributions", requireScope("roster:read"), async (c) => {
+  const event = await eventForAuth(c);
+  if (!event) return c.json({ error: "not_found" }, 404);
+  const rows = await c.env.DB.prepare(`SELECT id, name, unit, max_per_attendee, active, created_at
+    FROM distributions WHERE event_id = ? AND organization_id = ? ORDER BY created_at, id`)
+    .bind(event.id, c.get("auth").organizationId)
+    .all<{ id: string; name: string; unit: string; max_per_attendee: number; active: number; created_at: string }>();
+  return c.json({ distributions: rows.results.map((row) => ({ ...row, active: row.active === 1 })) });
+});
+
+app.post("/api/events/:eventId/distributions", requireScope("admin"), async (c) => {
+  const event = await eventForAuth(c);
+  if (!event) return c.json({ error: "not_found" }, 404);
+  const body = await jsonBody(c);
+  const name = typeof body.name === "string" ? body.name.trim() : "";
+  const unit = typeof body.unit === "string" ? body.unit.trim() : "";
+  const maxPerAttendee = body.maxPerAttendee;
+  if (!name || name.length > 100 || !unit || unit.length > 40 || !Number.isInteger(maxPerAttendee) || (maxPerAttendee as number) < 1 || (maxPerAttendee as number) > 1000) {
+    return badRequest(c, "name, unit, and maxPerAttendee (1-1000) are required");
+  }
+  const auth = c.get("auth");
+  const distributionId = crypto.randomUUID();
+  const auditId = crypto.randomUUID();
+  try {
+    await c.env.DB.batch([
+      c.env.DB.prepare(`INSERT INTO distributions (id, organization_id, event_id, name, unit, max_per_attendee, created_by)
+        SELECT ?, ?, ?, ?, ?, ?, ? WHERE EXISTS (SELECT 1 FROM events WHERE id = ? AND organization_id = ? AND archived_at IS NULL)`)
+        .bind(distributionId, auth.organizationId, event.id, name, unit, maxPerAttendee as number, auth.actorId, event.id, auth.organizationId),
+      c.env.DB.prepare(`INSERT INTO audit_logs (id, organization_id, actor_id, action, target_type, target_id, metadata_json)
+        SELECT ?, ?, ?, 'distribution.created', 'distribution', ?, ? WHERE EXISTS (SELECT 1 FROM distributions WHERE id = ?)`)
+        .bind(auditId, auth.organizationId, auth.actorId, distributionId, JSON.stringify({ name, unit, maxPerAttendee }), distributionId),
+    ]);
+  } catch (error) {
+    if (isUniqueConstraintError(error, "distributions.event_id, distributions.name")) return c.json({ error: "distribution_name_exists" }, 409);
+    throw error;
+  }
+  const created = await c.env.DB.prepare("SELECT id FROM distributions WHERE id = ? AND event_id = ? AND organization_id = ?")
+    .bind(distributionId, event.id, auth.organizationId).first();
+  if (!created) return c.json({ error: "not_found" }, 404);
+  return c.json({ id: distributionId }, 201);
+});
+
+app.patch("/api/events/:eventId/distributions/:distributionId", requireScope("admin"), async (c) => {
+  const event = await eventForAuth(c);
+  if (!event) return c.json({ error: "not_found" }, 404);
+  const body = await jsonBody(c);
+  if (typeof body.active !== "boolean" || Object.keys(body).some((key) => key !== "active")) return badRequest(c, "active boolean is required");
+  const auth = c.get("auth");
+  const distributionId = c.req.param("distributionId");
+  const current = await c.env.DB.prepare("SELECT active FROM distributions WHERE id = ? AND event_id = ? AND organization_id = ?")
+    .bind(distributionId, event.id, auth.organizationId).first<{ active: number }>();
+  if (!current) return c.json({ error: "not_found" }, 404);
+  if ((current.active === 1) === body.active) return c.json({ updated: false, active: current.active === 1 });
+
+  const changeId = crypto.randomUUID();
+  const auditId = crypto.randomUUID();
+  await c.env.DB.batch([
+    c.env.DB.prepare(`UPDATE distributions SET active = ?, updated_at = CURRENT_TIMESTAMP, last_change_id = ?
+      WHERE id = ? AND event_id = ? AND organization_id = ? AND active != ?
+        AND EXISTS (SELECT 1 FROM events WHERE id = ? AND organization_id = ? AND archived_at IS NULL)`)
+      .bind(body.active ? 1 : 0, changeId, distributionId, event.id, auth.organizationId, body.active ? 1 : 0, event.id, auth.organizationId),
+    c.env.DB.prepare(`INSERT INTO audit_logs (id, organization_id, actor_id, action, target_type, target_id, metadata_json)
+      SELECT ?, ?, ?, 'distribution.status_changed', 'distribution', ?, ?
+      WHERE EXISTS (SELECT 1 FROM distributions WHERE id = ? AND last_change_id = ?)`)
+      .bind(auditId, auth.organizationId, auth.actorId, distributionId, JSON.stringify({ active: body.active }), distributionId, changeId),
+  ]);
+  const updated = await c.env.DB.prepare(`SELECT d.active FROM distributions d JOIN events e ON e.id = d.event_id
+    WHERE d.id = ? AND d.event_id = ? AND d.organization_id = ? AND e.archived_at IS NULL`)
+    .bind(distributionId, event.id, auth.organizationId).first<{ active: number }>();
+  if (!updated) return c.json({ error: "not_found" }, 404);
+  return c.json({ updated: true, active: updated.active === 1 });
+});
+
+app.post("/api/events/:eventId/credentials/resolve", requireScope("checkin:write"), async (c) => {
+  const event = await eventForAuth(c);
+  if (!event) return c.json({ error: "not_found" }, 404);
+  const body = await jsonBody(c);
+  const qrLink = requiredString(body, "qrLink");
+  const requestedVenueId = optionalString(body.venueId);
+  if (!qrLink || qrLink.length > 2048 || (body.venueId !== undefined && body.venueId !== null && !requestedVenueId)
+    || Object.keys(body).some((key) => !["qrLink", "venueId"].includes(key))) return badRequest(c, "invalid QR link or venue");
+  const attendee = await findDistributionAttendeeByQr(c, event.id, qrLink);
+  if (!attendee) return c.json({ error: "not_found" }, 404);
+  const venueId = await distributionVenueForActor(c, event.id, attendee.venue_id, requestedVenueId);
+  if (venueId instanceof Response) return venueId;
+  return c.json({ attendee_id: attendee.id, name: attendee.name, affiliation: attendee.affiliation, venue_id: venueId, venue_name: attendee.venue_name });
+});
+
+app.post("/api/events/:eventId/distributions/:distributionId/claims", requireScope("checkin:write"), async (c) => {
+  const event = await eventForAuth(c);
+  if (!event) return c.json({ error: "not_found" }, 404);
+  const auth = c.get("auth");
+  const distributionId = c.req.param("distributionId");
+  const distribution = await c.env.DB.prepare(`SELECT id, active FROM distributions
+    WHERE id = ? AND event_id = ? AND organization_id = ?`)
+    .bind(distributionId, event.id, auth.organizationId).first<{ id: string; active: number }>();
+  if (!distribution) return c.json({ error: "not_found" }, 404);
+
+  const body = await jsonBody(c);
+  const requestId = requiredString(body, "requestId");
+  const attendeeId = optionalString(body.attendeeId);
+  const qrLink = requiredString(body, "qrLink");
+  const requestedVenueId = optionalString(body.venueId);
+  const quantity = body.quantity;
+  if (!requestId || !isUuid(requestId) || (!attendeeId && !qrLink) || !Number.isInteger(quantity) || (quantity as number) < 1 || (quantity as number) > 1000
+    || (body.venueId !== undefined && body.venueId !== null && !requestedVenueId)
+    || Object.keys(body).some((key) => !["requestId", "attendeeId", "qrLink", "quantity", "venueId"].includes(key))) return badRequest(c, "invalid claim request");
+
+  const attendee = qrLink
+    ? await findDistributionAttendeeByQr(c, event.id, qrLink)
+    : await findDistributionAttendeeById(c, event.id, attendeeId!);
+  if (!attendee) return c.json({ error: "not_found" }, 404);
+  if (attendeeId && attendee.id !== attendeeId) return c.json({ error: "credential_attendee_mismatch" }, 409);
+  const venueId = await distributionVenueForActor(c, event.id, attendee.venue_id, requestedVenueId);
+  if (venueId instanceof Response) return venueId;
+  const payloadHash = await sha256(JSON.stringify({ actorId: auth.actorId, attendeeId: attendee.id, ticketId: attendee.ticket_id, quantity, venueId }));
+  const replay = await c.env.DB.prepare(`SELECT id, request_id, payload_hash, outcome, used_after, remaining_after,
+      quantity, attendee_id, venue_id, created_at FROM distribution_claims
+    WHERE distribution_id = ? AND request_id = ? AND event_id = ? AND organization_id = ?`)
+    .bind(distributionId, requestId, event.id, auth.organizationId).first<DistributionClaimRow>();
+  if (replay) {
+    if (replay.payload_hash !== payloadHash) return c.json({ error: "idempotency_conflict" }, 409);
+    return c.json(distributionClaimResponse(replay), 200);
+  }
+  if (distribution.active !== 1) return c.json({ error: "distribution_inactive" }, 409);
+
+  const claimId = crypto.randomUUID();
+  const auditId = crypto.randomUUID();
+  const qrTokenHash = attendee.qr_token_hash;
+  const usageStatement = c.env.DB.prepare(`WITH quota AS (
+      SELECT d.max_per_attendee,
+        COALESCE(SUM(CASE WHEN dc.outcome = 'accepted' AND dc.reversed_at IS NULL THEN dc.quantity ELSE 0 END), 0) AS used
+      FROM distributions d
+      LEFT JOIN distribution_claims dc ON dc.distribution_id = d.id AND dc.attendee_id = ?
+      WHERE d.id = ? AND d.event_id = ? AND d.organization_id = ? AND d.active = 1
+      GROUP BY d.id
+    ), decision AS (
+      SELECT max_per_attendee, used, ? AS quantity,
+        CASE WHEN used + ? <= max_per_attendee THEN 'accepted' ELSE 'limit_reached' END AS outcome
+      FROM quota
+    )
+    INSERT INTO distribution_claims (id, organization_id, event_id, distribution_id, request_id, payload_hash,
+      attendee_id, ticket_id, venue_id, quantity, outcome, used_after, remaining_after, created_by)
+    SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, decision.quantity, decision.outcome,
+      CASE WHEN decision.outcome = 'accepted' THEN decision.used + decision.quantity ELSE decision.used END,
+      CASE WHEN decision.outcome = 'accepted' THEN decision.max_per_attendee - decision.used - decision.quantity ELSE decision.max_per_attendee - decision.used END,
+      ?
+    FROM attendees a JOIN tickets t ON t.attendee_id = a.id CROSS JOIN decision
+    WHERE a.id = ? AND a.event_id = ? AND a.organization_id = ? AND a.status = 'active'
+      AND t.id = ? AND t.status IN ('issued', 'checked_in')
+      AND (? IS NULL OR EXISTS (SELECT 1 FROM ticket_qr_tokens q WHERE q.ticket_id = t.id AND q.token_hash = ? AND q.expires_at > CURRENT_TIMESTAMP)
+        OR (t.token_key_id = 'v1' AND t.token_hash = ?))
+      AND (? IS NULL OR EXISTS (SELECT 1 FROM venues v WHERE v.id = ? AND v.event_id = a.event_id))
+      AND a.venue_id IS ?
+      AND EXISTS (SELECT 1 FROM distributions current_distribution WHERE current_distribution.id = ?
+        AND current_distribution.event_id = a.event_id AND current_distribution.organization_id = a.organization_id AND current_distribution.active = 1)
+      AND EXISTS (SELECT 1 FROM events current_event WHERE current_event.id = a.event_id AND current_event.organization_id = a.organization_id AND current_event.archived_at IS NULL)
+      AND (? != 'staff' OR EXISTS (SELECT 1 FROM venue_staff_assignments assignment JOIN venues assigned_venue ON assigned_venue.id = assignment.venue_id
+        WHERE assignment.user_id = ? AND assignment.venue_id = ? AND assigned_venue.event_id = a.event_id))`)
+    .bind(
+      attendee.id, distributionId, event.id, auth.organizationId,
+      quantity as number, quantity as number,
+      claimId, auth.organizationId, event.id, distributionId, requestId, payloadHash,
+      attendee.id, attendee.ticket_id, venueId, auth.actorId,
+      attendee.id, event.id, auth.organizationId, attendee.ticket_id,
+      qrTokenHash, qrTokenHash, qrTokenHash, venueId, venueId, attendee.venue_id, distributionId, auth.role, auth.actorId, venueId,
+    );
+  const auditMetadata = JSON.stringify({ distributionId, claimId, requestId, quantity });
+  try {
+    const results = await c.env.DB.batch([
+      usageStatement,
+      c.env.DB.prepare(`INSERT INTO audit_logs (id, organization_id, actor_id, action, target_type, target_id, metadata_json)
+        SELECT ?, ?, ?, 'distribution.claim_attempted', 'distribution_claim', ?, ?
+        WHERE EXISTS (SELECT 1 FROM distribution_claims WHERE id = ? AND request_id = ?)`)
+        .bind(auditId, auth.organizationId, auth.actorId, claimId, auditMetadata, claimId, requestId),
+    ]);
+    if (!results[0]?.meta.changes) {
+      const existingAfterRace = await c.env.DB.prepare(`SELECT id, request_id, payload_hash, outcome, used_after, remaining_after,
+          quantity, attendee_id, venue_id, created_at FROM distribution_claims
+        WHERE distribution_id = ? AND request_id = ? AND event_id = ? AND organization_id = ?`)
+        .bind(distributionId, requestId, event.id, auth.organizationId).first<DistributionClaimRow>();
+      if (existingAfterRace) {
+        if (existingAfterRace.payload_hash !== payloadHash) return c.json({ error: "idempotency_conflict" }, 409);
+        return c.json(distributionClaimResponse(existingAfterRace), 200);
+      }
+      const latestDistribution = await c.env.DB.prepare("SELECT active FROM distributions WHERE id = ? AND event_id = ? AND organization_id = ?")
+        .bind(distributionId, event.id, auth.organizationId).first<{ active: number }>();
+      return latestDistribution?.active === 0 ? c.json({ error: "distribution_inactive" }, 409) : c.json({ error: "not_found" }, 404);
+    }
+  } catch (error) {
+    const existingAfterConflict = await c.env.DB.prepare(`SELECT id, request_id, payload_hash, outcome, used_after, remaining_after,
+        quantity, attendee_id, venue_id, created_at FROM distribution_claims
+      WHERE distribution_id = ? AND request_id = ? AND event_id = ? AND organization_id = ?`)
+      .bind(distributionId, requestId, event.id, auth.organizationId).first<DistributionClaimRow>();
+    if (existingAfterConflict) {
+      if (existingAfterConflict.payload_hash !== payloadHash) return c.json({ error: "idempotency_conflict" }, 409);
+      return c.json(distributionClaimResponse(existingAfterConflict), 200);
+    }
+    throw error;
+  }
+
+  const created = await c.env.DB.prepare(`SELECT id, request_id, payload_hash, outcome, used_after, remaining_after,
+      quantity, attendee_id, venue_id, created_at FROM distribution_claims WHERE id = ?`)
+    .bind(claimId).first<DistributionClaimRow>();
+  return created ? c.json(distributionClaimResponse(created), 201) : c.json({ error: "not_found" }, 404);
+});
+
+app.get("/api/events/:eventId/distributions/:distributionId/claims", requireScope("roster:read"), async (c) => {
+  const event = await eventForAuth(c);
+  if (!event) return c.json({ error: "not_found" }, 404);
+  const auth = c.get("auth");
+  const distributionId = c.req.param("distributionId");
+  const exists = await c.env.DB.prepare("SELECT id FROM distributions WHERE id = ? AND event_id = ? AND organization_id = ?")
+    .bind(distributionId, event.id, auth.organizationId).first();
+  if (!exists) return c.json({ error: "not_found" }, 404);
+  const rawLimit = c.req.query("limit");
+  const limit = rawLimit === undefined ? 50 : Number(rawLimit);
+  const after = c.req.query("after") ?? "";
+  if (!Number.isInteger(limit) || limit < 1 || limit > 100 || (after && !isUuid(after))) return badRequest(c, "invalid claims pagination");
+  if (after) {
+    const cursor = await c.env.DB.prepare("SELECT id FROM distribution_claims WHERE id = ? AND distribution_id = ? AND event_id = ?")
+      .bind(after, distributionId, event.id).first();
+    if (!cursor) return badRequest(c, "invalid claims cursor");
+  }
+  const rows = await c.env.DB.prepare(`SELECT dc.id, dc.request_id, dc.quantity, dc.attendee_id,
+      a.name AS attendee_name, a.affiliation, dc.venue_id, v.name AS venue_name,
+      CASE WHEN dc.reversed_at IS NOT NULL THEN 'reversed' ELSE dc.outcome END AS status,
+      dc.created_at, dc.reversed_at, dc.reverse_reason,
+      (SELECT COALESCE(SUM(current_claim.quantity), 0) FROM distribution_claims current_claim
+        WHERE current_claim.distribution_id = dc.distribution_id AND current_claim.attendee_id = dc.attendee_id
+          AND current_claim.outcome = 'accepted' AND current_claim.reversed_at IS NULL) AS used_now,
+      (SELECT d.max_per_attendee - COALESCE(SUM(current_claim.quantity), 0) FROM distributions d
+        LEFT JOIN distribution_claims current_claim ON current_claim.distribution_id = d.id
+          AND current_claim.attendee_id = dc.attendee_id AND current_claim.outcome = 'accepted' AND current_claim.reversed_at IS NULL
+        WHERE d.id = dc.distribution_id GROUP BY d.id) AS remaining_now
+    FROM distribution_claims dc JOIN attendees a ON a.id = dc.attendee_id
+    LEFT JOIN venues v ON v.id = dc.venue_id
+    WHERE dc.distribution_id = ? AND dc.event_id = ? AND dc.organization_id = ?
+      AND (? = '' OR (dc.created_at, dc.id) < (SELECT created_at, id FROM distribution_claims WHERE id = ? AND distribution_id = ?))
+      AND (? != 'staff' OR dc.venue_id IN (SELECT venue_id FROM venue_staff_assignments WHERE user_id = ?))
+    ORDER BY dc.created_at DESC, dc.id DESC LIMIT ?`)
+    .bind(distributionId, event.id, auth.organizationId, after, after, distributionId, auth.role, auth.actorId, limit + 1)
+    .all<Record<string, unknown>>();
+  const page = rows.results.slice(0, limit);
+  return c.json({ claims: page, nextCursor: rows.results.length > limit ? page.at(-1)?.id ?? null : null });
+});
+
+app.get("/api/events/:eventId/distributions/:distributionId/claims/by-request/:requestId", requireScope("checkin:write"), async (c) => {
+  const event = await eventForAuth(c);
+  if (!event) return c.json({ error: "not_found" }, 404);
+  const auth = c.get("auth");
+  const distributionId = c.req.param("distributionId");
+  const requestId = c.req.param("requestId");
+  if (!requestId || !isUuid(requestId)) return badRequest(c, "invalid request id");
+  const row = await c.env.DB.prepare(`SELECT dc.id, dc.request_id, dc.payload_hash, dc.outcome, dc.used_after, dc.remaining_after,
+      dc.quantity, dc.attendee_id, dc.venue_id, dc.created_at
+    FROM distribution_claims dc JOIN distributions d ON d.id = dc.distribution_id
+    WHERE dc.distribution_id = ? AND dc.request_id = ? AND dc.event_id = ? AND dc.organization_id = ?
+      AND d.event_id = ? AND d.organization_id = ? AND dc.created_by = ?
+      AND (? != 'staff' OR EXISTS (SELECT 1 FROM venue_staff_assignments assignment JOIN venues assigned_venue ON assigned_venue.id = assignment.venue_id
+        WHERE assignment.user_id = ? AND assignment.venue_id = dc.venue_id AND assigned_venue.event_id = dc.event_id))`)
+    .bind(distributionId, requestId, event.id, auth.organizationId, event.id, auth.organizationId, auth.actorId,
+      auth.role, auth.actorId)
+    .first<DistributionClaimRow>();
+  return row ? c.json({ claim: {
+    ...distributionClaimResponse(row).claim,
+    outcome: row.outcome,
+    used: row.used_after,
+    remaining: row.remaining_after,
+  } }) : c.json({ error: "not_found" }, 404);
+});
+
+app.post("/api/events/:eventId/distributions/:distributionId/claims/:claimId/reverse", requireScope("admin"), async (c) => {
+  const event = await eventForAuth(c);
+  if (!event) return c.json({ error: "not_found" }, 404);
+  const auth = c.get("auth");
+  const distributionId = c.req.param("distributionId");
+  const claimId = c.req.param("claimId");
+  const body = await jsonBody(c);
+  const reason = typeof body.reason === "string" ? body.reason.trim() : "";
+  if (!reason || reason.length > 500 || Object.keys(body).some((key) => key !== "reason")) return badRequest(c, "reason is required and must be at most 500 characters");
+  const claim = await c.env.DB.prepare(`SELECT id, outcome, reversed_at FROM distribution_claims
+    WHERE id = ? AND distribution_id = ? AND event_id = ? AND organization_id = ?`)
+    .bind(claimId, distributionId, event.id, auth.organizationId).first<{ id: string; outcome: string; reversed_at: string | null }>();
+  if (!claim) return c.json({ error: "not_found" }, 404);
+  if (claim.reversed_at) return c.json({ error: "claim_already_reversed" }, 409);
+  if (claim.outcome !== "accepted") return c.json({ error: "claim_not_reversible" }, 409);
+
+  const reversalId = crypto.randomUUID();
+  const auditId = crypto.randomUUID();
+  await c.env.DB.batch([
+    c.env.DB.prepare(`UPDATE distribution_claims SET reversed_at = CURRENT_TIMESTAMP, reversal_id = ?, reversed_by = ?, reverse_reason = ?
+      WHERE id = ? AND distribution_id = ? AND event_id = ? AND organization_id = ? AND outcome = 'accepted' AND reversed_at IS NULL
+        AND EXISTS (SELECT 1 FROM events WHERE id = ? AND organization_id = ? AND archived_at IS NULL)`)
+      .bind(reversalId, auth.actorId, reason, claimId, distributionId, event.id, auth.organizationId, event.id, auth.organizationId),
+    c.env.DB.prepare(`INSERT INTO audit_logs (id, organization_id, actor_id, action, target_type, target_id, metadata_json)
+      SELECT ?, ?, ?, 'distribution.claim_reversed', 'distribution_claim', ?, ?
+      WHERE EXISTS (SELECT 1 FROM distribution_claims WHERE id = ? AND reversal_id = ?)`)
+      .bind(auditId, auth.organizationId, auth.actorId, claimId, JSON.stringify({ distributionId, claimId, reversalId }), claimId, reversalId),
+  ]);
+  const reversed = await c.env.DB.prepare(`SELECT dc.id, dc.request_id, dc.quantity, dc.attendee_id, dc.venue_id, dc.reversed_at, dc.reverse_reason
+    FROM distribution_claims dc JOIN events e ON e.id = dc.event_id
+    WHERE dc.id = ? AND dc.reversal_id = ? AND e.archived_at IS NULL`)
+    .bind(claimId, reversalId).first<Record<string, unknown>>();
+  if (!reversed) {
+    const eventActive = await c.env.DB.prepare("SELECT 1 FROM events WHERE id = ? AND organization_id = ? AND archived_at IS NULL").bind(event.id, auth.organizationId).first();
+    return eventActive ? c.json({ error: "claim_already_reversed" }, 409) : c.json({ error: "not_found" }, 404);
+  }
+  return c.json({ reversed: true, claim: { ...reversed, status: "reversed" } });
+});
+
 app.get("/api/events/:eventId/roster", requireScope("roster:read"), async (c) => {
   const event = await eventForAuth(c);
   if (!event) return c.json({ error: "not_found" }, 404);
@@ -2164,6 +2475,69 @@ function scheduleSummary(event: EventRow) {
   const allDay = !starts || canonicalDate(starts) === starts;
   return { enabled: event.scheduling_enabled === 1, status: event.schedule_status, date: !starts ? null : allDay ? starts : calendarDate(starts, timeZone), startsAt: starts || null, endsAt: event.ends_at || null, allDay, timeZone };
 }
+function isUuid(value: string) { return /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(value); }
+function isUniqueConstraintError(error: unknown, columns: string) { return error instanceof Error && error.message.includes(`UNIQUE constraint failed: ${columns}`); }
+function distributionClaimResponse(row: DistributionClaimRow) {
+  return {
+    outcome: row.outcome,
+    used: row.used_after,
+    remaining: row.remaining_after,
+    claim: {
+      id: row.id,
+      request_id: row.request_id,
+      quantity: row.quantity,
+      attendee_id: row.attendee_id,
+      venue_id: row.venue_id,
+      created_at: row.created_at,
+    },
+  };
+}
+function parseTicketQrLink(appOrigin: string, qrLink: string) {
+  try {
+    const url = new URL(qrLink);
+    if (url.origin !== new URL(appOrigin).origin || url.search || url.hash || url.username || url.password) return null;
+    const match = url.pathname.match(/^\/public\/tickets\/([^/]+)\/check-in\/([^/]+)$/);
+    if (!match) return null;
+    const ticketId = decodeURIComponent(match[1]!);
+    const token = decodeURIComponent(match[2]!);
+    if (!isUuid(ticketId) || !token || token.length > 512) return null;
+    return { ticketId, token };
+  } catch { return null; }
+}
+async function findDistributionAttendeeByQr(c: Context<AppEnv>, eventId: string, qrLink: string): Promise<DistributionAttendee | null> {
+  const parsed = parseTicketQrLink(c.env.APP_ORIGIN, qrLink);
+  if (!parsed) return null;
+  const qrTokenHash = await sha256(parsed.token);
+  return c.env.DB.prepare(`SELECT a.id, a.name, a.affiliation, a.venue_id, v.name AS venue_name,
+      t.id AS ticket_id, COALESCE(q.token_hash, t.token_hash) AS qr_token_hash
+    FROM tickets t LEFT JOIN ticket_qr_tokens q ON q.ticket_id = t.id AND q.token_hash = ? AND q.expires_at > CURRENT_TIMESTAMP
+    JOIN attendees a ON a.id = t.attendee_id JOIN events e ON e.id = a.event_id
+    LEFT JOIN venues v ON v.id = a.venue_id
+    WHERE t.id = ? AND e.id = ? AND e.organization_id = ? AND e.archived_at IS NULL
+      AND a.organization_id = e.organization_id AND a.status = 'active'
+      AND t.event_id = e.id AND t.status IN ('issued', 'checked_in')
+      AND (q.id IS NOT NULL OR (t.token_key_id = 'v1' AND t.token_hash = ?))`)
+    .bind(qrTokenHash, parsed.ticketId, eventId, c.get("auth").organizationId, qrTokenHash)
+    .first<DistributionAttendee>();
+}
+async function findDistributionAttendeeById(c: Context<AppEnv>, eventId: string, attendeeId: string): Promise<DistributionAttendee | null> {
+  return c.env.DB.prepare(`SELECT a.id, a.name, a.affiliation, a.venue_id, v.name AS venue_name,
+      t.id AS ticket_id, NULL AS qr_token_hash
+    FROM attendees a JOIN tickets t ON t.attendee_id = a.id
+    LEFT JOIN venues v ON v.id = a.venue_id
+    WHERE a.id = ? AND a.event_id = ? AND a.organization_id = ? AND a.status = 'active'
+      AND t.event_id = a.event_id AND t.status IN ('issued', 'checked_in')`)
+    .bind(attendeeId, eventId, c.get("auth").organizationId)
+    .first<DistributionAttendee>();
+}
+async function distributionVenueForActor(c: Context<AppEnv>, eventId: string, attendeeVenueId: string | null, requestedVenueId?: string): Promise<string | null | Response> {
+  if (attendeeVenueId && requestedVenueId && attendeeVenueId !== requestedVenueId) return c.json({ error: "wrong_venue" }, 403);
+  const venueId = requestedVenueId ?? attendeeVenueId ?? undefined;
+  const error = await checkInVenueError(c, eventId, venueId);
+  if (error) return c.json({ error }, error === "invalid_venue" ? 400 : 403);
+  return venueId ?? null;
+}
+
 async function eventForAuth(c: Context<AppEnv>) {
   const event = await c.env.DB.prepare("SELECT * FROM events WHERE id = ? AND organization_id = ? AND archived_at IS NULL").bind(c.req.param("eventId"), c.get("auth").organizationId).first<EventRow>();
   if (event && c.get("auth").role === "staff") {
@@ -2286,6 +2660,8 @@ async function audit(db: D1Database, auth: OrganizerAuth, action: string, target
 
 type EventRow = { id: string; organization_id: string; name: string; status: string; archived_at?: string | null; registration_mode: string; capacity: number | null; timezone?: string; scheduling_enabled?: number; schedule_status?: string; starts_at?: string; ends_at?: string };
 type FieldRow = { id: string; field_key: string; field_type: string; required: number; options_json: string };
+type DistributionAttendee = { id: string; name: string; affiliation: string; venue_id: string | null; venue_name: string | null; ticket_id: string; qr_token_hash: string | null };
+type DistributionClaimRow = { id: string; request_id: string; payload_hash: string; outcome: "accepted" | "limit_reached"; used_after: number; remaining_after: number; quantity: number; attendee_id: string; venue_id: string | null; created_at: string };
 
 export default {
   fetch: app.fetch,
