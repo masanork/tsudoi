@@ -148,8 +148,13 @@ export async function verifyOfflineFlow(page: Page, context: BrowserContext, fix
         panel.getByRole("button", { name: "配布を記録", exact: true }).click(),
         siblingPanel.getByRole("button", { name: "配布を記録", exact: true }).click(),
       ]);
-      await expect(panel).toContainText(/配布操作を未同期として保存|操作を保存できません/);
-      await expect(siblingPanel).toContainText(/配布操作を未同期として保存|操作を保存できません/);
+      await expect.poll(async () => (await storedState(page)).operations.length).toBe(1);
+      await expect(panel.getByRole("button", { name: "配布を記録", exact: true })).toBeDisabled();
+      await expect(siblingPanel.getByRole("button", { name: "配布を記録", exact: true })).toBeDisabled();
+      await expect.poll(async () => {
+        const [mainText, siblingText] = await Promise.all([panel.innerText(), siblingPanel.innerText()]);
+        return `${mainText}\n${siblingText}`.includes("配布操作を未同期として保存しました");
+      }).toBe(true);
     } finally { await sibling.close(); }
     await expect.poll(async () => (await storedState(page)).operations.length).toBe(1);
     // Re-reading a QR does not reset this terminal's provisional quota.
