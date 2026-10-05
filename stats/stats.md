@@ -1,6 +1,6 @@
 # tsudoi codebase snapshot
 
-Commit `4018bcd` · 2026-10-05
+Commit `a17e899` · 2026-10-05
 
 | Area | Files | Lines |
 | --- | ---: | ---: |
