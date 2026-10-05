@@ -46,7 +46,7 @@ app.get("/api/setup/status", async (c) => {
 
 app.get("/api/session", requireOrganizer, requireSession, (c) => {
   const auth = c.get("auth");
-  return c.json({ organizationId: auth.organizationId, role: auth.role, displayName: "" });
+  return c.json({ organizationId: auth.organizationId, actorId: auth.actorId, role: auth.role, displayName: "" });
 });
 
 app.get("/api/profile", requireOrganizer, requireSession, async (c) => {
@@ -530,6 +530,1041 @@ app.post("/api/events/:eventId/form-fields", requireScope("admin"), async (c) =>
   return c.json({ id }, 201);
 });
 
+app.get("/api/events/:eventId/distributions", requireScope("roster:read"), async (c) => {
+  const event = await eventForAuth(c);
+  if (!event) return c.json({ error: "not_found" }, 404);
+  const rows = await c.env.DB.prepare(`SELECT id, name, unit, max_per_attendee, active, created_at
+    FROM distributions WHERE event_id = ? AND organization_id = ? ORDER BY created_at, id`)
+    .bind(event.id, c.get("auth").organizationId)
+    .all<{ id: string; name: string; unit: string; max_per_attendee: number; active: number; created_at: string }>();
+  return c.json({ distributions: rows.results.map((row) => ({ ...row, active: row.active === 1 })) });
+});
+
+app.post("/api/events/:eventId/distributions", requireScope("admin"), async (c) => {
+  const event = await eventForAuth(c);
+  if (!event) return c.json({ error: "not_found" }, 404);
+  const body = await jsonBody(c);
+  const name = typeof body.name === "string" ? body.name.trim() : "";
+  const unit = typeof body.unit === "string" ? body.unit.trim() : "";
+  const maxPerAttendee = body.maxPerAttendee;
+  if (!name || name.length > 100 || !unit || unit.length > 40 || !Number.isInteger(maxPerAttendee) || (maxPerAttendee as number) < 1 || (maxPerAttendee as number) > 1000) {
+    return badRequest(c, "name, unit, and maxPerAttendee (1-1000) are required");
+  }
+  const auth = c.get("auth");
+  const distributionId = crypto.randomUUID();
+  const auditId = crypto.randomUUID();
+  try {
+    await c.env.DB.batch([
+      c.env.DB.prepare(`INSERT INTO distributions (id, organization_id, event_id, name, unit, max_per_attendee, created_by)
+        SELECT ?, ?, ?, ?, ?, ?, ? WHERE EXISTS (SELECT 1 FROM events WHERE id = ? AND organization_id = ? AND archived_at IS NULL)`)
+        .bind(distributionId, auth.organizationId, event.id, name, unit, maxPerAttendee as number, auth.actorId, event.id, auth.organizationId),
+      c.env.DB.prepare(`INSERT INTO audit_logs (id, organization_id, actor_id, action, target_type, target_id, metadata_json)
+        SELECT ?, ?, ?, 'distribution.created', 'distribution', ?, ? WHERE EXISTS (SELECT 1 FROM distributions WHERE id = ?)`)
+        .bind(auditId, auth.organizationId, auth.actorId, distributionId, JSON.stringify({ name, unit, maxPerAttendee }), distributionId),
+    ]);
+  } catch (error) {
+    if (isUniqueConstraintError(error, "distributions.event_id, distributions.name")) return c.json({ error: "distribution_name_exists" }, 409);
+    throw error;
+  }
+  const created = await c.env.DB.prepare("SELECT id FROM distributions WHERE id = ? AND event_id = ? AND organization_id = ?")
+    .bind(distributionId, event.id, auth.organizationId).first();
+  if (!created) return c.json({ error: "not_found" }, 404);
+  return c.json({ id: distributionId }, 201);
+});
+
+app.patch("/api/events/:eventId/distributions/:distributionId", requireScope("admin"), async (c) => {
+  const event = await eventForAuth(c);
+  if (!event) return c.json({ error: "not_found" }, 404);
+  const body = await jsonBody(c);
+  if (typeof body.active !== "boolean" || Object.keys(body).some((key) => key !== "active")) return badRequest(c, "active boolean is required");
+  const auth = c.get("auth");
+  const distributionId = c.req.param("distributionId");
+  const current = await c.env.DB.prepare("SELECT active FROM distributions WHERE id = ? AND event_id = ? AND organization_id = ?")
+    .bind(distributionId, event.id, auth.organizationId).first<{ active: number }>();
+  if (!current) return c.json({ error: "not_found" }, 404);
+  if ((current.active === 1) === body.active) return c.json({ updated: false, active: current.active === 1 });
+
+  const changeId = crypto.randomUUID();
+  const auditId = crypto.randomUUID();
+  await c.env.DB.batch([
+    c.env.DB.prepare(`UPDATE distributions SET active = ?, updated_at = CURRENT_TIMESTAMP, last_change_id = ?
+      WHERE id = ? AND event_id = ? AND organization_id = ? AND active != ?
+        AND EXISTS (SELECT 1 FROM events WHERE id = ? AND organization_id = ? AND archived_at IS NULL)`)
+      .bind(body.active ? 1 : 0, changeId, distributionId, event.id, auth.organizationId, body.active ? 1 : 0, event.id, auth.organizationId),
+    c.env.DB.prepare(`INSERT INTO audit_logs (id, organization_id, actor_id, action, target_type, target_id, metadata_json)
+      SELECT ?, ?, ?, 'distribution.status_changed', 'distribution', ?, ?
+      WHERE EXISTS (SELECT 1 FROM distributions WHERE id = ? AND last_change_id = ?)`)
+      .bind(auditId, auth.organizationId, auth.actorId, distributionId, JSON.stringify({ active: body.active }), distributionId, changeId),
+  ]);
+  const updated = await c.env.DB.prepare(`SELECT d.active FROM distributions d JOIN events e ON e.id = d.event_id
+    WHERE d.id = ? AND d.event_id = ? AND d.organization_id = ? AND e.archived_at IS NULL`)
+    .bind(distributionId, event.id, auth.organizationId).first<{ active: number }>();
+  if (!updated) return c.json({ error: "not_found" }, 404);
+  return c.json({ updated: true, active: updated.active === 1 });
+});
+
+app.post("/api/events/:eventId/credentials/resolve", requireScope("checkin:write"), async (c) => {
+  const event = await eventForAuth(c);
+  if (!event) return c.json({ error: "not_found" }, 404);
+  const body = await jsonBody(c);
+  const qrLink = requiredString(body, "qrLink");
+  const requestedVenueId = optionalString(body.venueId);
+  if (!qrLink || qrLink.length > 2048 || (body.venueId !== undefined && body.venueId !== null && !requestedVenueId)
+    || Object.keys(body).some((key) => !["qrLink", "venueId"].includes(key))) return badRequest(c, "invalid QR link or venue");
+  const attendee = await findDistributionAttendeeByQr(c, event.id, qrLink);
+  if (!attendee) return c.json({ error: "not_found" }, 404);
+  const venueId = await distributionVenueForActor(c, event.id, attendee.operation_venue_id, requestedVenueId);
+  if (venueId instanceof Response) return venueId;
+  return c.json({ attendee_id: attendee.id, name: attendee.name, affiliation: attendee.affiliation, venue_id: venueId, venue_name: attendee.venue_name });
+});
+
+app.get("/api/events/:eventId/offline-snapshot",requireSession,requireScope("checkin:write"),async(c)=>{
+  const event=await eventForAuth(c);if(!event)return c.json({error:"not_found"},404);
+  const auth=c.get("auth"),venueId=c.req.query("venueId")??"";
+  if(!isUuid(venueId))return badRequest(c,"venueId is required");
+  const venue=await c.env.DB.prepare("SELECT id,name FROM venues WHERE id=? AND event_id=?").bind(venueId,event.id).first<{id:string;name:string}>();
+  if(!venue)return c.json({error:"not_found"},404);
+  const venueError=await checkInVenueError(c,event.id,venueId);if(venueError)return c.json({error:venueError},403);
+  const preparedAtMs=Date.now(),preparedAt=new Date(preparedAtMs).toISOString(),expiresAt=new Date(preparedAtMs+12*60*60*1000).toISOString();
+  const attendeeRows=await c.env.DB.prepare(`SELECT a.id,a.name,a.venue_id AS registration_venue_id,
+      COALESCE(CASE WHEN p.state='in' THEN p.venue_id END,a.venue_id) AS operation_venue_id,
+      COALESCE(p.state,'out') AS presence_state,p.venue_id AS presence_venue_id,COALESCE(p.revision,0) AS revision,
+      t.id AS ticket_id,t.status AS ticket_status
+    FROM attendees a JOIN tickets t ON t.attendee_id=a.id AND t.event_id=a.event_id
+    LEFT JOIN attendee_presence p ON p.event_id=a.event_id AND p.attendee_id=a.id
+    WHERE a.organization_id=? AND a.event_id=? AND a.status='active' AND t.status IN ('issued','checked_in')
+      AND (COALESCE(CASE WHEN p.state='in' THEN p.venue_id END,a.venue_id)=? OR COALESCE(CASE WHEN p.state='in' THEN p.venue_id END,a.venue_id) IS NULL)
+    ORDER BY a.name COLLATE NOCASE,a.id LIMIT 1001`).bind(auth.organizationId,event.id,venueId).all<Record<string,unknown>>();
+  if(attendeeRows.results.length>1000)return c.json({error:"offline_snapshot_attendee_limit",limit:1000},413);
+  const distributions=await c.env.DB.prepare(`SELECT id,name,unit,max_per_attendee AS maxPerAttendee
+    FROM distributions WHERE event_id=? AND organization_id=? AND active=1 ORDER BY created_at,id LIMIT 101`)
+    .bind(event.id,auth.organizationId).all<{id:string;name:string;unit:string;maxPerAttendee:number}>();
+  if(distributions.results.length>100)return c.json({error:"offline_snapshot_distribution_limit",limit:100},413);
+  const attendeeIds=JSON.stringify(attendeeRows.results.map(row=>row.id));
+  let credentialsByAttendee=new Map<string,{credentialHash:string;expiresAt:string;kind:"qr"|"legacy_v1"}[]>();
+  if(attendeeRows.results.length){
+    const credentials=await c.env.DB.prepare(`WITH selected AS (
+        SELECT a.id AS attendee_id,t.id AS ticket_id,t.token_hash,t.token_key_id FROM json_each(?) x
+        JOIN attendees a ON a.id=x.value AND a.event_id=? AND a.organization_id=?
+        JOIN tickets t ON t.attendee_id=a.id AND t.event_id=a.event_id AND t.status IN ('issued','checked_in') AND a.status='active')
+      SELECT s.attendee_id,q.token_hash AS credential_hash,
+        CASE WHEN julianday(q.expires_at)<julianday(?) THEN strftime('%Y-%m-%dT%H:%M:%fZ',q.expires_at) ELSE ? END AS expires_at,'qr' AS kind
+        FROM selected s JOIN ticket_qr_tokens q ON q.ticket_id=s.ticket_id AND q.expires_at>CURRENT_TIMESTAMP
+      UNION ALL
+      SELECT s.attendee_id,s.token_hash,? AS expires_at,'legacy_v1' AS kind FROM selected s WHERE s.token_key_id='v1'
+      ORDER BY attendee_id,expires_at,credential_hash LIMIT 10001`)
+      .bind(attendeeIds,event.id,auth.organizationId,expiresAt,expiresAt,expiresAt).all<{attendee_id:string;credential_hash:string;expires_at:string;kind:"qr"|"legacy_v1"}>();
+    if(credentials.results.length>10000)return c.json({error:"offline_snapshot_credential_limit",totalLimit:10000,perAttendeeLimit:32},413);
+    for(const row of credentials.results){const list=credentialsByAttendee.get(row.attendee_id)??[];list.push({credentialHash:row.credential_hash,expiresAt:row.expires_at,kind:row.kind});credentialsByAttendee.set(row.attendee_id,list);}
+    if([...credentialsByAttendee.values()].some(list=>list.length>32))return c.json({error:"offline_snapshot_credential_limit",perAttendeeLimit:32},413);
+  }
+  const usageByAttendee=new Map<string,{distributionId:string;used:number;remaining:number}[]>();
+  if(attendeeRows.results.length&&distributions.results.length){
+    const usage=await c.env.DB.prepare(`SELECT a.id AS attendee_id,d.id AS distribution_id,d.max_per_attendee,
+        SUM(dc.quantity) AS used
+      FROM json_each(?) x JOIN attendees a ON a.id=x.value AND a.event_id=? AND a.organization_id=?
+      JOIN distribution_claims dc ON dc.attendee_id=a.id AND dc.event_id=a.event_id AND dc.outcome='accepted' AND dc.reversed_at IS NULL
+      JOIN distributions d ON d.id=dc.distribution_id AND d.event_id=a.event_id AND d.organization_id=a.organization_id AND d.active=1
+      WHERE d.event_id=? AND d.organization_id=? GROUP BY a.id,d.id HAVING SUM(dc.quantity)>0
+      ORDER BY a.id,d.created_at,d.id LIMIT 30001`)
+      .bind(attendeeIds,event.id,auth.organizationId,event.id,auth.organizationId).all<{attendee_id:string;distribution_id:string;max_per_attendee:number;used:number}>();
+    if(usage.results.length>30000)return c.json({error:"offline_snapshot_usage_limit",limit:30000},413);
+    for(const row of usage.results){const list=usageByAttendee.get(row.attendee_id)??[];list.push({distributionId:row.distribution_id,used:row.used,remaining:Math.max(0,row.max_per_attendee-row.used)});usageByAttendee.set(row.attendee_id,list);}
+  }
+  const finalVenueError=await checkInVenueError(c,event.id,venueId);if(finalVenueError)return c.json({error:finalVenueError},403);
+  return c.json({snapshot:{organizationId:auth.organizationId,eventId:event.id,eventName:event.name,actorId:auth.actorId,role:auth.role,
+    venueId:venue.id,venueName:venue.name,preparedAt,expiresAt,distributions:distributions.results,
+    attendees:attendeeRows.results.map(row=>({id:row.id,name:row.name,registrationVenueId:row.registration_venue_id,
+      presence:{state:row.presence_state,venueId:row.presence_venue_id,revision:row.revision},ticket:{id:row.ticket_id,status:row.ticket_status},
+      credentials:credentialsByAttendee.get(row.id as string)??[],distributionUsage:usageByAttendee.get(row.id as string)??[]}))}});
+});
+
+app.get("/api/events/:eventId/presence", requireScope("roster:read"), async (c) => {
+  const event = await eventForAuth(c);
+  if (!event) return c.json({ error: "not_found" }, 404);
+  const auth = c.get("auth");
+  const venueId = c.req.query("venueId") ?? "";
+  const attendeeId = c.req.query("attendeeId") ?? "";
+  const q = c.req.query("q")?.trim() ?? "";
+  const after = c.req.query("after") ?? "";
+  const rawLimit = c.req.query("limit");
+  const limit = rawLimit === undefined ? 50 : Number(rawLimit);
+  if ((venueId && !isUuid(venueId)) || (attendeeId && !isUuid(attendeeId)) || q.length > 100 || (after && !isUuid(after)) || !Number.isInteger(limit) || limit < 1 || limit > 100) {
+    return badRequest(c, "invalid presence filters");
+  }
+  const venueError = await checkInVenueError(c, event.id, venueId || undefined);
+  if (venueError) return c.json({ error: venueError }, venueError === "invalid_venue" ? 400 : 403);
+  if (after && !await c.env.DB.prepare("SELECT id FROM attendees WHERE id = ? AND event_id = ? AND organization_id = ?")
+    .bind(after, event.id, auth.organizationId).first()) return badRequest(c, "invalid presence cursor");
+
+  const rows = await c.env.DB.prepare(`SELECT a.id AS attendee_id, a.name, a.affiliation, a.venue_id AS registration_venue_id,
+      COALESCE(p.state, 'out') AS state, CASE WHEN p.state = 'in' THEN p.venue_id ELSE NULL END AS venue_id,
+      v.name AS venue_name, COALESCE(p.revision, 0) AS revision, COALESCE(p.updated_at, a.created_at) AS updated_at
+    FROM attendees a JOIN tickets t ON t.attendee_id = a.id AND t.event_id = a.event_id
+    LEFT JOIN attendee_presence p ON p.event_id = a.event_id AND p.attendee_id = a.id
+    LEFT JOIN venues v ON v.id = p.venue_id
+    WHERE a.event_id = ? AND a.organization_id = ? AND ((a.status = 'active' AND t.status IN ('issued', 'checked_in')) OR p.state = 'in')
+      AND (? = '' OR COALESCE(p.venue_id, a.venue_id) = ?)
+      AND (? != 'staff' OR COALESCE(p.venue_id, a.venue_id) = ?)
+      AND (? = '' OR a.id = ?)
+      AND (? = '' OR a.name LIKE ? OR a.affiliation LIKE ?)
+      AND (? = '' OR (a.created_at, a.id) < (SELECT created_at, id FROM attendees WHERE id = ? AND event_id = ?))
+    ORDER BY a.created_at DESC, a.id DESC LIMIT ?`)
+    .bind(event.id, auth.organizationId, venueId, venueId, auth.role, venueId, attendeeId, attendeeId, q, `%${q}%`, `%${q}%`, after, after, event.id, limit + 1)
+    .all<Record<string, unknown>>();
+  const page = rows.results.slice(0, limit);
+  const summaryRow = await c.env.DB.prepare(`SELECT COUNT(*) AS total_attendees,
+      COALESCE(SUM(CASE WHEN p.state = 'in' THEN 1 ELSE 0 END), 0) AS total_in,
+      COALESCE(SUM(CASE WHEN COALESCE(p.state, 'out') = 'out' THEN 1 ELSE 0 END), 0) AS total_out
+    FROM attendees a JOIN tickets t ON t.attendee_id = a.id AND t.event_id = a.event_id
+    LEFT JOIN attendee_presence p ON p.event_id = a.event_id AND p.attendee_id = a.id
+    WHERE a.event_id = ? AND a.organization_id = ? AND ((a.status = 'active' AND t.status IN ('issued', 'checked_in')) OR p.state = 'in')
+      AND (? = '' OR COALESCE(p.venue_id, a.venue_id) = ?)
+      AND (? != 'staff' OR COALESCE(p.venue_id, a.venue_id) = ?)`)
+    .bind(event.id, auth.organizationId, venueId, venueId, auth.role, venueId)
+    .first<{ total_attendees: number; total_in: number; total_out: number }>();
+  const venueCounts = await c.env.DB.prepare(`SELECT p.venue_id, v.name AS venue_name, COUNT(*) AS count
+    FROM attendee_presence p JOIN attendees a ON a.id = p.attendee_id AND a.event_id = p.event_id
+    JOIN venues v ON v.id = p.venue_id AND v.event_id = p.event_id
+    WHERE p.event_id = ? AND p.organization_id = ? AND p.state = 'in'
+      AND (? = '' OR p.venue_id = ?)
+      AND (? != 'staff' OR p.venue_id = ?)
+    GROUP BY p.venue_id, v.name ORDER BY v.name COLLATE NOCASE, p.venue_id`)
+    .bind(event.id, auth.organizationId, venueId, venueId, auth.role, venueId)
+    .all<{ venue_id: string; venue_name: string; count: number }>();
+  const totalEntries = await c.env.DB.prepare(`SELECT COUNT(*) AS count FROM presence_movements m
+    WHERE m.event_id = ? AND m.organization_id = ? AND m.action = 'enter'
+      AND (? != 'staff' OR EXISTS (SELECT 1 FROM venue_staff_assignments s WHERE s.venue_id = m.venue_id AND s.user_id = ?))`)
+    .bind(event.id, auth.organizationId, auth.role, auth.actorId)
+    .first<{ count: number }>();
+  return c.json({
+    presence: page,
+    nextCursor: rows.results.length > limit ? page.at(-1)?.attendee_id ?? null : null,
+    summary: { ...summaryRow, total_entries: totalEntries?.count ?? 0, venue_in: venueCounts.results },
+  });
+});
+
+app.post("/api/events/:eventId/presence/resolve", requireScope("checkin:write"), async (c) => {
+  const event = await eventForAuth(c);
+  if (!event) return c.json({ error: "not_found" }, 404);
+  const body = await jsonBody(c);
+  const qrLink = requiredString(body, "qrLink");
+  const venueId = requiredString(body, "venueId");
+  if (!qrLink || qrLink.length > 2048 || !venueId || !isUuid(venueId)
+    || Object.keys(body).some((key) => !["qrLink", "venueId"].includes(key))) return badRequest(c, "QR link and operation venue are required");
+  const venueError = await checkInVenueError(c, event.id, venueId);
+  if (venueError) return c.json({ error: venueError }, venueError === "invalid_venue" ? 400 : 403);
+  const attendee = await findDistributionAttendeeByQr(c, event.id, qrLink);
+  if (!attendee) return c.json({ error: "not_found" }, 404);
+  const presence = await c.env.DB.prepare("SELECT state, venue_id, revision, updated_at FROM attendee_presence WHERE event_id = ? AND attendee_id = ?")
+    .bind(event.id, attendee.id).first<{ state: "in" | "out"; venue_id: string | null; revision: number; updated_at: string }>();
+  if (presence?.state === "in" && presence.venue_id) {
+    if (presence.venue_id !== venueId) {
+      const currentVenueError = await checkInVenueError(c, event.id, presence.venue_id);
+      return c.json({ error: currentVenueError ?? "wrong_current_venue" }, currentVenueError === "venue_not_assigned" ? 403 : 409);
+    }
+  }
+  return c.json({
+    attendee_id: attendee.id,
+    name: attendee.name,
+    affiliation: attendee.affiliation,
+    registration_venue_id: attendee.venue_id,
+    presence: { state: presence?.state ?? "out", venue_id: presence?.venue_id ?? null, revision: presence?.revision ?? 0, updated_at: presence?.updated_at ?? null },
+    operation_venue_id: venueId,
+    operation_venue_name: await c.env.DB.prepare("SELECT name FROM venues WHERE id = ? AND event_id = ?").bind(venueId, event.id).first<string>("name"),
+  });
+});
+
+app.post("/api/events/:eventId/presence/movements", requireScope("checkin:write"), async (c) => {
+  const event = await eventForAuth(c);
+  if (!event) return c.json({ error: "not_found" }, 404);
+  const auth = c.get("auth");
+  const body = await jsonBody(c);
+  const requestId = requiredString(body, "requestId");
+  const attendeeId = optionalString(body.attendeeId);
+  const qrLink = optionalString(body.qrLink);
+  const credentialHash=optionalString(body.credentialHash);
+  const action = body.action;
+  const venueId = requiredString(body, "venueId");
+  const expectedRevision = body.expectedRevision === undefined || body.expectedRevision === null ? null : body.expectedRevision;
+  const occurredAt = body.occurredAt === undefined || body.occurredAt === null ? null : normalizeOccurredAt(body.occurredAt);
+  if (!requestId || !isUuid(requestId) || (!attendeeId && !qrLink) || (!!qrLink && (!!attendeeId || !!credentialHash))
+    || (!!credentialHash && (!attendeeId || !/^[0-9a-f]{64}$/.test(credentialHash))) || !["enter", "exit"].includes(String(action))
+    || !venueId || !isUuid(venueId)
+    || (expectedRevision !== null && (!Number.isInteger(expectedRevision) || (expectedRevision as number) < 0))
+    || (body.occurredAt !== undefined && body.occurredAt !== null && !occurredAt)
+    || Object.keys(body).some((key) => !["requestId", "attendeeId", "qrLink", "credentialHash", "action", "venueId", "expectedRevision", "occurredAt"].includes(key))) return badRequest(c, "invalid presence movement");
+
+  const venueError = await checkInVenueError(c, event.id, venueId);
+  if (venueError) return c.json({ error: venueError }, venueError === "invalid_venue" ? 400 : 403);
+  const parsedQr = qrLink ? parseTicketQrLink(c.env.APP_ORIGIN, qrLink) : null;
+  if (qrLink && !parsedQr) return badRequest(c, "invalid QR link");
+  const qrTokenHash = parsedQr ? await sha256(parsedQr.token) : credentialHash ?? null;
+  const existing = await c.env.DB.prepare(`SELECT id, organization_id, event_id, request_id, payload_hash, attendee_id, ticket_id,
+      action, venue_id, expected_revision, created_by, outcome, movement_id, result_state, result_venue_id, result_revision,
+      result_updated_at, occurred_at FROM presence_requests WHERE organization_id = ? AND event_id = ? AND request_id = ?`)
+    .bind(auth.organizationId, event.id, requestId).first<PresenceRequestRow>();
+  if (existing) {
+    if (existing.created_by !== auth.actorId) return c.json({ error: "idempotency_conflict" }, 409);
+    if (existing.venue_id !== venueId) return c.json({ error: "idempotency_conflict" }, 409);
+    const targetMatches = parsedQr ? parsedQr.ticketId === existing.ticket_id : attendeeId === existing.attendee_id;
+    const payloadHash = await sha256(JSON.stringify({ actorId: auth.actorId, attendeeId: existing.attendee_id, ticketId: existing.ticket_id, action, venueId, expectedRevision, qrTokenHash, occurredAt }));
+    if (!targetMatches || existing.payload_hash !== payloadHash) return c.json({ error: "idempotency_conflict" }, 409);
+    const response = await presenceRequestResponse(c.env.DB, existing);
+    return response ? c.json(response, 200) : c.json({ error: "not_found" }, 404);
+  }
+
+  const attendee = parsedQr
+    ? await findDistributionAttendeeByQr(c, event.id, qrLink!)
+    : credentialHash
+      ? await findDistributionAttendeeByCredentialHash(c,event.id,attendeeId!,credentialHash)
+      : await findDistributionAttendeeById(c, event.id, attendeeId!);
+  if (!attendee || (attendeeId && attendee.id !== attendeeId) || (parsedQr && parsedQr.ticketId !== attendee.ticket_id)) return c.json({ error: "not_found" }, 404);
+  const currentPresence = await c.env.DB.prepare("SELECT state, venue_id FROM attendee_presence WHERE event_id = ? AND attendee_id = ?")
+    .bind(event.id, attendee.id).first<{ state: "in" | "out"; venue_id: string | null }>();
+  if (auth.role === "staff" && currentPresence?.state === "in" && currentPresence.venue_id) {
+    const currentVenueError = await checkInVenueError(c, event.id, currentPresence.venue_id);
+    if (currentVenueError) return c.json({ error: currentVenueError }, 403);
+    if (currentPresence.venue_id !== venueId) return c.json({ error: "wrong_current_venue" }, 409);
+  }
+  const payloadHash = await sha256(JSON.stringify({ actorId: auth.actorId, attendeeId: attendee.id, ticketId: attendee.ticket_id, action, venueId, expectedRevision, qrTokenHash, occurredAt }));
+  const operationId = crypto.randomUUID();
+  const movementId = crypto.randomUUID();
+  const db = c.env.DB;
+  const qrCheck = `(? IS NULL OR EXISTS (SELECT 1 FROM ticket_qr_tokens q WHERE q.ticket_id = t.id AND q.token_hash = ? AND q.expires_at > CURRENT_TIMESTAMP) OR (t.token_key_id = 'v1' AND t.token_hash = ?))`;
+  const scopeCheck = `(? != 'staff' OR EXISTS (SELECT 1 FROM venue_staff_assignments s WHERE s.venue_id = ? AND s.user_id = ?))`;
+  try {
+    await db.batch([
+      db.prepare(`INSERT OR IGNORE INTO attendee_presence (id, organization_id, event_id, attendee_id, state, venue_id, revision)
+        SELECT ?, a.organization_id, a.event_id, a.id, 'out', NULL, 0
+        FROM attendees a JOIN tickets t ON t.attendee_id = a.id AND t.event_id = a.event_id
+        JOIN events e ON e.id = a.event_id JOIN venues v ON v.id = ? AND v.event_id = e.id
+        WHERE a.id = ? AND a.event_id = ? AND a.organization_id = ? AND a.status = 'active' AND t.id = ? AND t.status IN ('issued','checked_in')
+          AND e.archived_at IS NULL AND ${qrCheck} AND ${scopeCheck}`)
+        .bind(crypto.randomUUID(), venueId, attendee.id, event.id, auth.organizationId, attendee.ticket_id,
+          qrTokenHash, qrTokenHash, qrTokenHash, auth.role, venueId, auth.actorId),
+      db.prepare(`INSERT OR IGNORE INTO presence_requests (id, organization_id, event_id, request_id, payload_hash, attendee_id, ticket_id,
+          action, venue_id, expected_revision, created_by, outcome, movement_id, result_state, result_venue_id, result_revision, result_updated_at, occurred_at)
+        SELECT ?, ?, ?, ?, ?, a.id, t.id, ?, ?, ?, ?, 'pending', NULL, p.state, p.venue_id, p.revision, p.updated_at, COALESCE(?, CURRENT_TIMESTAMP)
+        FROM attendees a JOIN tickets t ON t.attendee_id = a.id AND t.event_id = a.event_id
+        JOIN events e ON e.id = a.event_id JOIN venues v ON v.id = ? AND v.event_id = e.id
+        JOIN attendee_presence p ON p.event_id = a.event_id AND p.attendee_id = a.id
+        WHERE a.id = ? AND a.event_id = ? AND a.organization_id = ? AND a.status = 'active' AND t.id = ? AND t.status IN ('issued','checked_in')
+          AND e.archived_at IS NULL AND ${qrCheck} AND ${scopeCheck}
+          AND (? != 'staff' OR p.state != 'in' OR EXISTS (SELECT 1 FROM venue_staff_assignments current_assignment
+            WHERE current_assignment.user_id = ? AND current_assignment.venue_id = p.venue_id))`)
+        .bind(operationId, auth.organizationId, event.id, requestId, payloadHash, action, venueId, expectedRevision, auth.actorId, occurredAt,
+          venueId, attendee.id, event.id, auth.organizationId, attendee.ticket_id,
+          qrTokenHash, qrTokenHash, qrTokenHash, auth.role, venueId, auth.actorId, auth.role, auth.actorId),
+      db.prepare(`UPDATE attendee_presence SET state = CASE WHEN ? = 'enter' THEN 'in' ELSE 'out' END,
+          venue_id = CASE WHEN ? = 'enter' THEN ? ELSE NULL END, revision = revision + 1,
+          updated_at = CURRENT_TIMESTAMP, last_request_id = ?
+        WHERE event_id = ? AND organization_id = ? AND attendee_id = ?
+          AND (? IS NULL OR revision = ?)
+          AND ((? = 'enter' AND state = 'out') OR (? = 'exit' AND state = 'in' AND venue_id = ?))
+          AND EXISTS (SELECT 1 FROM presence_requests r WHERE r.id = ? AND r.organization_id = ? AND r.event_id = ? AND r.request_id = ?
+            AND r.created_by = ? AND r.payload_hash = ? AND r.outcome = 'pending')
+          AND EXISTS (SELECT 1 FROM attendees a JOIN tickets t ON t.attendee_id = a.id AND t.event_id = a.event_id
+            JOIN events e ON e.id = a.event_id JOIN venues v ON v.id = ? AND v.event_id = e.id
+            WHERE a.id = attendee_presence.attendee_id AND a.status = 'active' AND t.id = ? AND t.status IN ('issued','checked_in')
+              AND e.id = ? AND e.organization_id = ? AND e.archived_at IS NULL
+              AND ${qrCheck} AND ${scopeCheck})
+          AND (? != 'staff' OR state != 'in' OR EXISTS (SELECT 1 FROM venue_staff_assignments current_assignment
+            WHERE current_assignment.user_id = ? AND current_assignment.venue_id = attendee_presence.venue_id))`)
+        .bind(action, action, venueId, requestId, event.id, auth.organizationId, attendee.id,
+          expectedRevision, expectedRevision, action, action, venueId,
+          operationId, auth.organizationId, event.id, requestId, auth.actorId, payloadHash,
+          venueId, attendee.ticket_id, event.id, auth.organizationId,
+          qrTokenHash, qrTokenHash, qrTokenHash, auth.role, venueId, auth.actorId, auth.role, auth.actorId),
+      db.prepare(`INSERT INTO presence_movements (id, organization_id, event_id, attendee_id, request_id, action, venue_id, revision, actor_id, occurred_at)
+        SELECT ?, r.organization_id, r.event_id, r.attendee_id, r.request_id, r.action, r.venue_id, p.revision, r.created_by, r.occurred_at
+        FROM presence_requests r JOIN attendee_presence p ON p.event_id = r.event_id AND p.attendee_id = r.attendee_id
+        WHERE r.id = ? AND r.organization_id = ? AND r.event_id = ? AND r.request_id = ? AND r.created_by = ? AND r.payload_hash = ?
+          AND r.outcome = 'pending' AND r.movement_id IS NULL AND p.last_request_id = r.request_id`)
+        .bind(movementId, operationId, auth.organizationId, event.id, requestId, auth.actorId, payloadHash),
+      db.prepare(`UPDATE presence_requests SET
+          outcome = CASE WHEN EXISTS (SELECT 1 FROM presence_movements m WHERE m.request_id = presence_requests.request_id AND m.event_id = presence_requests.event_id) THEN 'accepted'
+            WHEN expected_revision IS NOT NULL AND expected_revision != (SELECT revision FROM attendee_presence p WHERE p.event_id = presence_requests.event_id AND p.attendee_id = presence_requests.attendee_id) THEN 'revision_conflict'
+            ELSE 'state_conflict' END,
+          movement_id = (SELECT m.id FROM presence_movements m WHERE m.request_id = presence_requests.request_id AND m.event_id = presence_requests.event_id),
+          result_state = (SELECT state FROM attendee_presence p WHERE p.event_id = presence_requests.event_id AND p.attendee_id = presence_requests.attendee_id),
+          result_venue_id = (SELECT venue_id FROM attendee_presence p WHERE p.event_id = presence_requests.event_id AND p.attendee_id = presence_requests.attendee_id),
+          result_revision = (SELECT revision FROM attendee_presence p WHERE p.event_id = presence_requests.event_id AND p.attendee_id = presence_requests.attendee_id),
+          result_updated_at = (SELECT updated_at FROM attendee_presence p WHERE p.event_id = presence_requests.event_id AND p.attendee_id = presence_requests.attendee_id)
+        WHERE id = ? AND organization_id = ? AND event_id = ? AND request_id = ? AND created_by = ? AND payload_hash = ? AND outcome = 'pending'`)
+        .bind(operationId, auth.organizationId, event.id, requestId, auth.actorId, payloadHash),
+      db.prepare(`INSERT INTO audit_logs (id, organization_id, actor_id, action, target_type, target_id, metadata_json)
+        SELECT ?, r.organization_id, r.created_by, CASE WHEN r.action = 'enter' THEN 'presence.entered' ELSE 'presence.exited' END,
+          'presence_movement', m.id, ? FROM presence_requests r JOIN presence_movements m ON m.id = r.movement_id
+        WHERE r.id = ? AND r.organization_id = ? AND r.event_id = ? AND r.request_id = ? AND r.created_by = ? AND r.payload_hash = ? AND r.outcome = 'accepted'`)
+        .bind(crypto.randomUUID(), JSON.stringify({ requestId, venueId, action }), operationId, auth.organizationId, event.id, requestId, auth.actorId, payloadHash),
+    ]);
+  } catch (error) {
+    const raced = await db.prepare(`SELECT id, organization_id, event_id, request_id, payload_hash, attendee_id, ticket_id,
+        action, venue_id, expected_revision, created_by, outcome, movement_id, result_state, result_venue_id, result_revision,
+        result_updated_at, occurred_at FROM presence_requests WHERE organization_id = ? AND event_id = ? AND request_id = ?`)
+      .bind(auth.organizationId, event.id, requestId).first<PresenceRequestRow>();
+    if (raced) return raced.created_by === auth.actorId && raced.payload_hash === payloadHash
+      ? c.json(await presenceRequestResponse(db, raced), 200)
+      : c.json({ error: "idempotency_conflict" }, 409);
+    throw error;
+  }
+  const result = await db.prepare(`SELECT id, organization_id, event_id, request_id, payload_hash, attendee_id, ticket_id,
+      action, venue_id, expected_revision, created_by, outcome, movement_id, result_state, result_venue_id, result_revision,
+      result_updated_at, occurred_at FROM presence_requests WHERE organization_id = ? AND event_id = ? AND request_id = ?`)
+    .bind(auth.organizationId, event.id, requestId).first<PresenceRequestRow>();
+  if (!result) {
+    const latestVenueError = await checkInVenueError(c, event.id, venueId);
+    return latestVenueError ? c.json({ error: latestVenueError }, latestVenueError === "invalid_venue" ? 400 : 403) : c.json({ error: "not_found" }, 404);
+  }
+  if (result.created_by !== auth.actorId || result.payload_hash !== payloadHash) return c.json({ error: "idempotency_conflict" }, 409);
+  return c.json(await presenceRequestResponse(db, result), result.id === operationId ? 201 : 200);
+});
+
+app.get("/api/events/:eventId/presence/movements/by-request/:requestId", requireScope("checkin:write"), async (c) => {
+  const event = await eventForAuth(c);
+  if (!event) return c.json({ error: "not_found" }, 404);
+  const auth = c.get("auth");
+  const requestId = c.req.param("requestId");
+  if (!requestId || !isUuid(requestId)) return badRequest(c, "invalid request id");
+  const row = await c.env.DB.prepare(`SELECT id, organization_id, event_id, request_id, payload_hash, attendee_id, ticket_id,
+      action, venue_id, expected_revision, created_by, outcome, movement_id, result_state, result_venue_id, result_revision,
+      result_updated_at, occurred_at FROM presence_requests
+    WHERE organization_id = ? AND event_id = ? AND request_id = ? AND created_by = ?
+      AND (? != 'staff' OR EXISTS (SELECT 1 FROM venue_staff_assignments s JOIN venues v ON v.id = s.venue_id
+        WHERE s.user_id = ? AND s.venue_id = presence_requests.venue_id AND v.event_id = presence_requests.event_id))`)
+    .bind(auth.organizationId, event.id, requestId, auth.actorId, auth.role, auth.actorId).first<PresenceRequestRow>();
+  if (!row) return c.json({ error: "not_found" }, 404);
+  return c.json(await presenceRequestResponse(c.env.DB, row));
+});
+
+app.get("/api/events/:eventId/presence/history", requireScope("roster:read"), async (c) => {
+  const event = await eventForAuth(c);
+  if (!event) return c.json({ error: "not_found" }, 404);
+  const auth = c.get("auth");
+  const attendeeId = c.req.query("attendeeId") ?? "";
+  const venueId = c.req.query("venueId") ?? "";
+  const after = c.req.query("after") ?? "";
+  const rawLimit = c.req.query("limit");
+  const limit = rawLimit === undefined ? 50 : Number(rawLimit);
+  if ((attendeeId && !isUuid(attendeeId)) || (venueId && !isUuid(venueId)) || (after && !isUuid(after))
+    || !Number.isInteger(limit) || limit < 1 || limit > 100) return badRequest(c, "invalid movement history filters");
+  const venueError = await checkInVenueError(c, event.id, venueId || undefined);
+  if (venueError) return c.json({ error: venueError }, venueError === "invalid_venue" ? 400 : 403);
+  if (after && !await c.env.DB.prepare(`SELECT 1 FROM presence_movements WHERE id = ? AND event_id = ? AND organization_id = ?
+      UNION ALL SELECT 1 FROM presence_requests WHERE id = ? AND event_id = ? AND organization_id = ? AND outcome IN ('state_conflict','revision_conflict') LIMIT 1`)
+    .bind(after, event.id, auth.organizationId, after, event.id, auth.organizationId).first()) return badRequest(c, "invalid movement history cursor");
+  const rows = await c.env.DB.prepare(`WITH history AS (
+      SELECT m.id, m.request_id, m.attendee_id, a.name AS attendee_name, a.affiliation,
+        m.action, m.venue_id, v.name AS venue_name, m.revision, m.actor_id, COALESCE(u.display_name, '') AS actor_display_name,
+        m.recorded_at, m.occurred_at, 'accepted' AS outcome, 'accepted' AS status, m.id AS movement_id
+      FROM presence_movements m JOIN attendees a ON a.id = m.attendee_id
+      JOIN venues v ON v.id = m.venue_id LEFT JOIN users u ON u.id = m.actor_id
+      WHERE m.event_id = ? AND m.organization_id = ?
+      UNION ALL
+      SELECT r.id, r.request_id, r.attendee_id, a.name AS attendee_name, a.affiliation,
+        r.action, r.venue_id, v.name AS venue_name, r.result_revision AS revision, r.created_by AS actor_id,
+        COALESCE(u.display_name, '') AS actor_display_name, r.created_at AS recorded_at, r.occurred_at,
+        r.outcome, 'unsuccessful' AS status, NULL AS movement_id
+      FROM presence_requests r JOIN attendees a ON a.id = r.attendee_id
+      JOIN venues v ON v.id = r.venue_id LEFT JOIN users u ON u.id = r.created_by
+      WHERE r.event_id = ? AND r.organization_id = ? AND r.outcome IN ('state_conflict','revision_conflict')
+    )
+    SELECT h.* FROM history h
+    WHERE (? = '' OR h.attendee_id = ?) AND (? = '' OR h.venue_id = ?)
+      AND (? != 'staff' OR EXISTS (SELECT 1 FROM venue_staff_assignments s WHERE s.venue_id = h.venue_id AND s.user_id = ?))
+      AND (? = '' OR (h.recorded_at, h.revision, h.id) < (SELECT recorded_at, revision, id FROM history WHERE id = ?))
+    ORDER BY h.recorded_at DESC, h.revision DESC, h.id DESC LIMIT ?`)
+    .bind(event.id, auth.organizationId, event.id, auth.organizationId, attendeeId, attendeeId, venueId, venueId, auth.role, auth.actorId, after, after, limit + 1)
+    .all<Record<string, unknown>>();
+  const page = rows.results.slice(0, limit);
+  return c.json({ movements: page, nextCursor: rows.results.length > limit ? page.at(-1)?.id ?? null : null });
+});
+
+app.post("/api/events/:eventId/distributions/:distributionId/claims", requireScope("checkin:write"), async (c) => {
+  const event = await eventForAuth(c);
+  if (!event) return c.json({ error: "not_found" }, 404);
+  const auth = c.get("auth");
+  const distributionId = c.req.param("distributionId");
+  const distribution = await c.env.DB.prepare(`SELECT id, active FROM distributions
+    WHERE id = ? AND event_id = ? AND organization_id = ?`)
+    .bind(distributionId, event.id, auth.organizationId).first<{ id: string; active: number }>();
+  if (!distribution) return c.json({ error: "not_found" }, 404);
+
+  const body = await jsonBody(c);
+  const requestId = requiredString(body, "requestId");
+  const attendeeId = optionalString(body.attendeeId);
+  const qrLink = optionalString(body.qrLink);
+  const credentialHash = optionalString(body.credentialHash);
+  const requestedVenueId = optionalString(body.venueId);
+  const quantity = body.quantity;
+  if (!requestId || !isUuid(requestId) || (!attendeeId && !qrLink) || (!!qrLink && (!!attendeeId || !!credentialHash))
+    || (!!credentialHash && (!attendeeId || !/^[0-9a-f]{64}$/.test(credentialHash)))
+    || !Number.isInteger(quantity) || (quantity as number) < 1 || (quantity as number) > 1000
+    || (body.venueId !== undefined && body.venueId !== null && !requestedVenueId)
+    || Object.keys(body).some((key) => !["requestId", "attendeeId", "qrLink", "credentialHash", "quantity", "venueId"].includes(key))) return badRequest(c, "invalid claim request");
+
+  const attendee = qrLink
+    ? await findDistributionAttendeeByQr(c, event.id, qrLink)
+    : credentialHash
+      ? await findDistributionAttendeeByCredentialHash(c,event.id,attendeeId!,credentialHash)
+      : await findDistributionAttendeeById(c, event.id, attendeeId!);
+  if (!attendee) return c.json({ error: "not_found" }, 404);
+  if (attendeeId && attendee.id !== attendeeId) return c.json({ error: "credential_attendee_mismatch" }, 409);
+  const venueId = await distributionVenueForActor(c, event.id, attendee.operation_venue_id, requestedVenueId);
+  if (venueId instanceof Response) return venueId;
+  const proofHash=attendee.qr_token_hash;
+  const payloadHash = await sha256(JSON.stringify({ actorId: auth.actorId, attendeeId: attendee.id, ticketId: attendee.ticket_id, quantity, venueId, credentialHash:proofHash }));
+  const legacyPayloadHash=await sha256(JSON.stringify({actorId:auth.actorId,attendeeId:attendee.id,ticketId:attendee.ticket_id,quantity,venueId}));
+  const replay = await c.env.DB.prepare(`SELECT id, request_id, payload_hash, outcome, used_after, remaining_after,
+      quantity, attendee_id, venue_id, created_at FROM distribution_claims
+    WHERE distribution_id = ? AND request_id = ? AND event_id = ? AND organization_id = ?`)
+    .bind(distributionId, requestId, event.id, auth.organizationId).first<DistributionClaimRow>();
+  if (replay) {
+    if (replay.payload_hash !== payloadHash && replay.payload_hash !== legacyPayloadHash) return c.json({ error: "idempotency_conflict" }, 409);
+    return c.json(distributionClaimResponse(replay), 200);
+  }
+  if (distribution.active !== 1) return c.json({ error: "distribution_inactive" }, 409);
+
+  const claimId = crypto.randomUUID();
+  const auditId = crypto.randomUUID();
+  const qrTokenHash = proofHash;
+  const usageStatement = c.env.DB.prepare(`WITH quota AS (
+      SELECT d.max_per_attendee,
+        COALESCE(SUM(CASE WHEN dc.outcome = 'accepted' AND dc.reversed_at IS NULL THEN dc.quantity ELSE 0 END), 0) AS used
+      FROM distributions d
+      LEFT JOIN distribution_claims dc ON dc.distribution_id = d.id AND dc.attendee_id = ?
+      WHERE d.id = ? AND d.event_id = ? AND d.organization_id = ? AND d.active = 1
+      GROUP BY d.id
+    ), decision AS (
+      SELECT max_per_attendee, used, ? AS quantity,
+        CASE WHEN used + ? <= max_per_attendee THEN 'accepted' ELSE 'limit_reached' END AS outcome
+      FROM quota
+    )
+    INSERT INTO distribution_claims (id, organization_id, event_id, distribution_id, request_id, payload_hash,
+      attendee_id, ticket_id, venue_id, quantity, outcome, used_after, remaining_after, created_by)
+    SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, decision.quantity, decision.outcome,
+      CASE WHEN decision.outcome = 'accepted' THEN decision.used + decision.quantity ELSE decision.used END,
+      CASE WHEN decision.outcome = 'accepted' THEN decision.max_per_attendee - decision.used - decision.quantity ELSE decision.max_per_attendee - decision.used END,
+      ?
+    FROM attendees a JOIN tickets t ON t.attendee_id = a.id LEFT JOIN attendee_presence p ON p.event_id=a.event_id AND p.attendee_id=a.id CROSS JOIN decision
+    WHERE a.id = ? AND a.event_id = ? AND a.organization_id = ? AND a.status = 'active'
+      AND t.id = ? AND t.status IN ('issued', 'checked_in')
+      AND (? IS NULL OR EXISTS (SELECT 1 FROM ticket_qr_tokens q WHERE q.ticket_id = t.id AND q.token_hash = ? AND q.expires_at > CURRENT_TIMESTAMP)
+        OR (t.token_key_id = 'v1' AND t.token_hash = ?))
+      AND (? IS NULL OR EXISTS (SELECT 1 FROM venues v WHERE v.id = ? AND v.event_id = a.event_id))
+      AND (COALESCE(CASE WHEN p.state='in' THEN p.venue_id END,a.venue_id) IS NULL OR COALESCE(CASE WHEN p.state='in' THEN p.venue_id END,a.venue_id) IS ?)
+      AND EXISTS (SELECT 1 FROM distributions current_distribution WHERE current_distribution.id = ?
+        AND current_distribution.event_id = a.event_id AND current_distribution.organization_id = a.organization_id AND current_distribution.active = 1)
+      AND EXISTS (SELECT 1 FROM events current_event WHERE current_event.id = a.event_id AND current_event.organization_id = a.organization_id AND current_event.archived_at IS NULL)
+      AND (? != 'staff' OR EXISTS (SELECT 1 FROM venue_staff_assignments assignment JOIN venues assigned_venue ON assigned_venue.id = assignment.venue_id
+        WHERE assignment.user_id = ? AND assignment.venue_id = ? AND assigned_venue.event_id = a.event_id))`)
+    .bind(
+      attendee.id, distributionId, event.id, auth.organizationId,
+      quantity as number, quantity as number,
+      claimId, auth.organizationId, event.id, distributionId, requestId, payloadHash,
+      attendee.id, attendee.ticket_id, venueId, auth.actorId,
+      attendee.id, event.id, auth.organizationId, attendee.ticket_id,
+      qrTokenHash, qrTokenHash, qrTokenHash, venueId, venueId, attendee.operation_venue_id, distributionId, auth.role, auth.actorId, venueId,
+    );
+  const auditMetadata = JSON.stringify({ distributionId, claimId, requestId, quantity });
+  try {
+    const results = await c.env.DB.batch([
+      usageStatement,
+      c.env.DB.prepare(`INSERT INTO audit_logs (id, organization_id, actor_id, action, target_type, target_id, metadata_json)
+        SELECT ?, ?, ?, 'distribution.claim_attempted', 'distribution_claim', ?, ?
+        WHERE EXISTS (SELECT 1 FROM distribution_claims WHERE id = ? AND request_id = ?)`)
+        .bind(auditId, auth.organizationId, auth.actorId, claimId, auditMetadata, claimId, requestId),
+    ]);
+    if (!results[0]?.meta.changes) {
+      const existingAfterRace = await c.env.DB.prepare(`SELECT id, request_id, payload_hash, outcome, used_after, remaining_after,
+          quantity, attendee_id, venue_id, created_at FROM distribution_claims
+        WHERE distribution_id = ? AND request_id = ? AND event_id = ? AND organization_id = ?`)
+        .bind(distributionId, requestId, event.id, auth.organizationId).first<DistributionClaimRow>();
+      if (existingAfterRace) {
+        if (existingAfterRace.payload_hash !== payloadHash) return c.json({ error: "idempotency_conflict" }, 409);
+        return c.json(distributionClaimResponse(existingAfterRace), 200);
+      }
+      const latestDistribution = await c.env.DB.prepare("SELECT active FROM distributions WHERE id = ? AND event_id = ? AND organization_id = ?")
+        .bind(distributionId, event.id, auth.organizationId).first<{ active: number }>();
+      return latestDistribution?.active === 0 ? c.json({ error: "distribution_inactive" }, 409) : c.json({ error: "not_found" }, 404);
+    }
+  } catch (error) {
+    const existingAfterConflict = await c.env.DB.prepare(`SELECT id, request_id, payload_hash, outcome, used_after, remaining_after,
+        quantity, attendee_id, venue_id, created_at FROM distribution_claims
+      WHERE distribution_id = ? AND request_id = ? AND event_id = ? AND organization_id = ?`)
+      .bind(distributionId, requestId, event.id, auth.organizationId).first<DistributionClaimRow>();
+    if (existingAfterConflict) {
+      if (existingAfterConflict.payload_hash !== payloadHash) return c.json({ error: "idempotency_conflict" }, 409);
+      return c.json(distributionClaimResponse(existingAfterConflict), 200);
+    }
+    throw error;
+  }
+
+  const created = await c.env.DB.prepare(`SELECT id, request_id, payload_hash, outcome, used_after, remaining_after,
+      quantity, attendee_id, venue_id, created_at FROM distribution_claims WHERE id = ?`)
+    .bind(claimId).first<DistributionClaimRow>();
+  return created ? c.json(distributionClaimResponse(created), 201) : c.json({ error: "not_found" }, 404);
+});
+
+app.get("/api/events/:eventId/distributions/:distributionId/claims", requireScope("roster:read"), async (c) => {
+  const event = await eventForAuth(c);
+  if (!event) return c.json({ error: "not_found" }, 404);
+  const auth = c.get("auth");
+  const distributionId = c.req.param("distributionId");
+  const exists = await c.env.DB.prepare("SELECT id FROM distributions WHERE id = ? AND event_id = ? AND organization_id = ?")
+    .bind(distributionId, event.id, auth.organizationId).first();
+  if (!exists) return c.json({ error: "not_found" }, 404);
+  const rawLimit = c.req.query("limit");
+  const limit = rawLimit === undefined ? 50 : Number(rawLimit);
+  const after = c.req.query("after") ?? "";
+  if (!Number.isInteger(limit) || limit < 1 || limit > 100 || (after && !isUuid(after))) return badRequest(c, "invalid claims pagination");
+  if (after) {
+    const cursor = await c.env.DB.prepare("SELECT id FROM distribution_claims WHERE id = ? AND distribution_id = ? AND event_id = ?")
+      .bind(after, distributionId, event.id).first();
+    if (!cursor) return badRequest(c, "invalid claims cursor");
+  }
+  const rows = await c.env.DB.prepare(`SELECT dc.id, dc.request_id, dc.quantity, dc.attendee_id,
+      a.name AS attendee_name, a.affiliation, dc.venue_id, v.name AS venue_name,
+      CASE WHEN dc.reversed_at IS NOT NULL THEN 'reversed' ELSE dc.outcome END AS status,
+      dc.created_at, dc.reversed_at, dc.reverse_reason, dc.proxy_group_id,
+      (SELECT COALESCE(SUM(current_claim.quantity), 0) FROM distribution_claims current_claim
+        WHERE current_claim.distribution_id = dc.distribution_id AND current_claim.attendee_id = dc.attendee_id
+          AND current_claim.outcome = 'accepted' AND current_claim.reversed_at IS NULL) AS used_now,
+      (SELECT d.max_per_attendee - COALESCE(SUM(current_claim.quantity), 0) FROM distributions d
+        LEFT JOIN distribution_claims current_claim ON current_claim.distribution_id = d.id
+          AND current_claim.attendee_id = dc.attendee_id AND current_claim.outcome = 'accepted' AND current_claim.reversed_at IS NULL
+        WHERE d.id = dc.distribution_id GROUP BY d.id) AS remaining_now
+    FROM distribution_claims dc JOIN attendees a ON a.id = dc.attendee_id
+    LEFT JOIN venues v ON v.id = dc.venue_id
+    WHERE dc.distribution_id = ? AND dc.event_id = ? AND dc.organization_id = ?
+      AND (? = '' OR (dc.created_at, dc.id) < (SELECT created_at, id FROM distribution_claims WHERE id = ? AND distribution_id = ?))
+      AND (? != 'staff' OR dc.venue_id IN (SELECT venue_id FROM venue_staff_assignments WHERE user_id = ?))
+    ORDER BY dc.created_at DESC, dc.id DESC LIMIT ?`)
+    .bind(distributionId, event.id, auth.organizationId, after, after, distributionId, auth.role, auth.actorId, limit + 1)
+    .all<Record<string, unknown>>();
+  const page = rows.results.slice(0, limit);
+  return c.json({ claims: page, nextCursor: rows.results.length > limit ? page.at(-1)?.id ?? null : null });
+});
+
+app.get("/api/events/:eventId/distributions/:distributionId/claims/by-request/:requestId", requireScope("checkin:write"), async (c) => {
+  const event = await eventForAuth(c);
+  if (!event) return c.json({ error: "not_found" }, 404);
+  const auth = c.get("auth");
+  const distributionId = c.req.param("distributionId");
+  const requestId = c.req.param("requestId");
+  if (!requestId || !isUuid(requestId)) return badRequest(c, "invalid request id");
+  const row = await c.env.DB.prepare(`SELECT dc.id, dc.request_id, dc.payload_hash, dc.outcome, dc.used_after, dc.remaining_after,
+      dc.quantity, dc.attendee_id, dc.venue_id, dc.created_at
+    FROM distribution_claims dc JOIN distributions d ON d.id = dc.distribution_id
+    WHERE dc.distribution_id = ? AND dc.request_id = ? AND dc.event_id = ? AND dc.organization_id = ?
+      AND d.event_id = ? AND d.organization_id = ? AND dc.created_by = ?
+      AND (? != 'staff' OR EXISTS (SELECT 1 FROM venue_staff_assignments assignment JOIN venues assigned_venue ON assigned_venue.id = assignment.venue_id
+        WHERE assignment.user_id = ? AND assignment.venue_id = dc.venue_id AND assigned_venue.event_id = dc.event_id))`)
+    .bind(distributionId, requestId, event.id, auth.organizationId, event.id, auth.organizationId, auth.actorId,
+      auth.role, auth.actorId)
+    .first<DistributionClaimRow>();
+  return row ? c.json({ claim: {
+    ...distributionClaimResponse(row).claim,
+    outcome: row.outcome,
+    used: row.used_after,
+    remaining: row.remaining_after,
+  } }) : c.json({ error: "not_found" }, 404);
+});
+
+app.post("/api/events/:eventId/distributions/:distributionId/claims/:claimId/reverse", requireScope("admin"), async (c) => {
+  const event = await eventForAuth(c);
+  if (!event) return c.json({ error: "not_found" }, 404);
+  const auth = c.get("auth");
+  const distributionId = c.req.param("distributionId");
+  const claimId = c.req.param("claimId");
+  const body = await jsonBody(c);
+  const reason = typeof body.reason === "string" ? body.reason.trim() : "";
+  if (!reason || reason.length > 500 || Object.keys(body).some((key) => key !== "reason")) return badRequest(c, "reason is required and must be at most 500 characters");
+  const claim = await c.env.DB.prepare(`SELECT id, outcome, reversed_at, proxy_group_id FROM distribution_claims
+    WHERE id = ? AND distribution_id = ? AND event_id = ? AND organization_id = ?`)
+    .bind(claimId, distributionId, event.id, auth.organizationId).first<{ id: string; outcome: string; reversed_at: string | null; proxy_group_id:string|null }>();
+  if (!claim) return c.json({ error: "not_found" }, 404);
+  if (claim.proxy_group_id) return c.json({ error: "proxy_claim_requires_group_reverse" }, 409);
+  if (claim.reversed_at) return c.json({ error: "claim_already_reversed" }, 409);
+  if (claim.outcome !== "accepted") return c.json({ error: "claim_not_reversible" }, 409);
+
+  const reversalId = crypto.randomUUID();
+  const auditId = crypto.randomUUID();
+  await c.env.DB.batch([
+    c.env.DB.prepare(`UPDATE distribution_claims SET reversed_at = CURRENT_TIMESTAMP, reversal_id = ?, reversed_by = ?, reverse_reason = ?
+      WHERE id = ? AND distribution_id = ? AND event_id = ? AND organization_id = ? AND outcome = 'accepted' AND reversed_at IS NULL
+        AND EXISTS (SELECT 1 FROM events WHERE id = ? AND organization_id = ? AND archived_at IS NULL)`)
+      .bind(reversalId, auth.actorId, reason, claimId, distributionId, event.id, auth.organizationId, event.id, auth.organizationId),
+    c.env.DB.prepare(`INSERT INTO audit_logs (id, organization_id, actor_id, action, target_type, target_id, metadata_json)
+      SELECT ?, ?, ?, 'distribution.claim_reversed', 'distribution_claim', ?, ?
+      WHERE EXISTS (SELECT 1 FROM distribution_claims WHERE id = ? AND reversal_id = ?)`)
+      .bind(auditId, auth.organizationId, auth.actorId, claimId, JSON.stringify({ distributionId, claimId, reversalId }), claimId, reversalId),
+  ]);
+  const reversed = await c.env.DB.prepare(`SELECT dc.id, dc.request_id, dc.quantity, dc.attendee_id, dc.venue_id, dc.reversed_at, dc.reverse_reason
+    FROM distribution_claims dc JOIN events e ON e.id = dc.event_id
+    WHERE dc.id = ? AND dc.reversal_id = ? AND e.archived_at IS NULL`)
+    .bind(claimId, reversalId).first<Record<string, unknown>>();
+  if (!reversed) {
+    const eventActive = await c.env.DB.prepare("SELECT 1 FROM events WHERE id = ? AND organization_id = ? AND archived_at IS NULL").bind(event.id, auth.organizationId).first();
+    return eventActive ? c.json({ error: "claim_already_reversed" }, 409) : c.json({ error: "not_found" }, 404);
+  }
+  return c.json({ reversed: true, claim: { ...reversed, status: "reversed" } });
+});
+
+// Paper QR cards are a separate issuance record. The QR token is supplied by the
+// authorized issuer and is only ever persisted as a hash in ticket_qr_tokens.
+app.post("/api/events/:eventId/attendees/:attendeeId/qr-cards", requireScope("checkin:write"), (c) => issuePaperQrCard(c, "additional"));
+app.post("/api/events/:eventId/attendees/:attendeeId/qr-cards/reissue", requireScope("admin"), (c) => issuePaperQrCard(c, "replacement"));
+
+app.get("/api/events/:eventId/attendees/:attendeeId/qr-cards/by-request/:requestId", requireScope("checkin:write"), async (c) => {
+  const event = await eventForAuth(c);
+  if (!event) return c.json({ error: "not_found" }, 404);
+  const auth = c.get("auth"), attendeeId = c.req.param("attendeeId"), requestId = c.req.param("requestId");
+  if (!requestId || !isUuid(requestId)) return badRequest(c, "invalid request id");
+  const row = await c.env.DB.prepare(`SELECT r.action,r.revoked_count,r.legacy_credential_invalidated, r.created_by, card.id, card.kind, card.issued_at, card.expires_at,
+      CASE WHEN card.revoked_at IS NULL AND card.expires_at > CURRENT_TIMESTAMP AND t.status IN ('issued','checked_in')
+        AND a.status = 'active' AND (q.id IS NOT NULL) THEN 1 ELSE 0 END AS active,
+      r.venue_id
+    FROM ticket_qr_card_requests r JOIN ticket_qr_cards card ON card.id = r.card_id
+    JOIN attendees a ON a.id = r.attendee_id JOIN tickets t ON t.id = r.ticket_id
+    LEFT JOIN ticket_qr_tokens q ON q.id = card.qr_token_id AND q.expires_at > CURRENT_TIMESTAMP
+    LEFT JOIN attendee_presence p ON p.event_id = a.event_id AND p.attendee_id = a.id
+    WHERE r.organization_id = ? AND r.event_id = ? AND r.attendee_id = ? AND r.request_id = ? AND r.created_by = ?
+      AND a.organization_id = ? AND a.event_id = ? AND t.attendee_id = a.id
+      AND (? != 'staff' OR EXISTS (SELECT 1 FROM venue_staff_assignments s JOIN venues v ON v.id=s.venue_id
+        WHERE s.user_id=? AND v.event_id=a.event_id AND s.venue_id=r.venue_id))`)
+    .bind(auth.organizationId, event.id, attendeeId, requestId, auth.actorId, auth.organizationId, event.id,
+      auth.role, auth.actorId).first<Record<string, unknown>>();
+  return row ? c.json({ card: { id: row.id, kind: row.kind, issued_at: row.issued_at, expires_at: row.expires_at, active: row.active === 1 },
+    ...(row.action==="replacement"?{revokedCount:row.revoked_count,legacyCredentialInvalidated:row.legacy_credential_invalidated===1}:{}) }) : c.json({ error: "not_found" }, 404);
+});
+
+app.get("/api/events/:eventId/households", requireScope("roster:read"), async (c) => {
+  const event = await eventForAuth(c);
+  if (!event) return c.json({ error: "not_found" }, 404);
+  const auth = c.get("auth"), venueId = c.req.query("venueId") ?? "";
+  if (auth.role === "staff") {
+    if (!venueId) return c.json({ error: "venue_required" }, 403);
+    const err = await checkInVenueError(c, event.id, venueId);
+    if (err) return c.json({ error: err }, 403);
+  }
+  const rows = await c.env.DB.prepare(`SELECT h.id,h.name,
+      COUNT(DISTINCT CASE WHEN m.removed_at IS NULL AND a.status='active'
+        AND (? != 'staff' OR COALESCE(CASE WHEN p.state='in' THEN p.venue_id END,a.venue_id)=?) THEN a.id END) AS member_count
+    FROM households h LEFT JOIN household_memberships m ON m.household_id=h.id
+    LEFT JOIN attendees a ON a.id=m.attendee_id AND a.event_id=h.event_id AND a.organization_id=h.organization_id
+    LEFT JOIN attendee_presence p ON p.event_id=a.event_id AND p.attendee_id=a.id
+    WHERE h.event_id=? AND h.organization_id=? AND h.archived_at IS NULL
+      AND (? != 'staff' OR EXISTS (SELECT 1 FROM household_memberships sm JOIN attendees sa ON sa.id=sm.attendee_id
+        LEFT JOIN attendee_presence sp ON sp.event_id=sa.event_id AND sp.attendee_id=sa.id
+        WHERE sm.household_id=h.id AND sm.removed_at IS NULL AND sa.status='active'
+          AND COALESCE(CASE WHEN sp.state='in' THEN sp.venue_id END,sa.venue_id)=?))
+    GROUP BY h.id ORDER BY h.name COLLATE NOCASE,h.id LIMIT 200`)
+    .bind(auth.role,venueId, event.id,auth.organizationId,auth.role,venueId).all<Record<string,unknown>>();
+  return c.json({ households: rows.results });
+});
+
+app.post("/api/events/:eventId/households", requireScope("admin"), async (c) => {
+  const event = await eventForAuth(c);
+  if (!event) return c.json({ error: "not_found" }, 404);
+  const auth = c.get("auth"), body = await jsonBody(c), name = requiredString(body,"name")?.trim();
+  if (!name || name.length > 120 || Object.keys(body).some(k=>k!=="name")) return badRequest(c,"invalid household name");
+  const id=crypto.randomUUID(), auditId=crypto.randomUUID();
+  await c.env.DB.batch([
+    c.env.DB.prepare(`INSERT INTO households(id,organization_id,event_id,name,created_by)
+      SELECT ?,?,?,?,? WHERE EXISTS(SELECT 1 FROM events WHERE id=? AND organization_id=? AND archived_at IS NULL)`)
+      .bind(id,auth.organizationId,event.id,name,auth.actorId,event.id,auth.organizationId),
+    c.env.DB.prepare(`INSERT INTO audit_logs(id,organization_id,actor_id,action,target_type,target_id,metadata_json)
+      SELECT ?,?,?, 'household.created','household',?,? WHERE EXISTS(SELECT 1 FROM households WHERE id=?)`)
+      .bind(auditId,auth.organizationId,auth.actorId,id,JSON.stringify({eventId:event.id}),id),
+  ]);
+  const created=await c.env.DB.prepare("SELECT id,name FROM households WHERE id=? AND organization_id=? AND event_id=?").bind(id,auth.organizationId,event.id).first();
+  return created?c.json({household:created},201):c.json({error:"not_found"},404);
+});
+
+app.get("/api/events/:eventId/households/:householdId", requireScope("roster:read"), async (c) => {
+  const event=await eventForAuth(c); if(!event)return c.json({error:"not_found"},404);
+  const auth=c.get("auth"), householdId=c.req.param("householdId"), venueId=c.req.query("venueId")??"", distributionId=c.req.query("distributionId")??"";
+  if(auth.role==="staff"){
+    if(!venueId)return c.json({error:"venue_required"},403);
+    const err=await checkInVenueError(c,event.id,venueId);if(err)return c.json({error:err},403);
+  }
+  if(distributionId&&!await c.env.DB.prepare("SELECT 1 FROM distributions WHERE id=? AND event_id=? AND organization_id=?").bind(distributionId,event.id,auth.organizationId).first())return c.json({error:"not_found"},404);
+  const household=await c.env.DB.prepare("SELECT id,name FROM households WHERE id=? AND event_id=? AND organization_id=? AND archived_at IS NULL").bind(householdId,event.id,auth.organizationId).first<Record<string,unknown>>();
+  if(!household)return c.json({error:"not_found"},404);
+  const members=await c.env.DB.prepare(`SELECT a.id AS attendeeId,a.name,a.affiliation,a.venue_id AS venueId,t.status AS ticketStatus,
+      CASE WHEN ?='' THEN NULL ELSE COALESCE((SELECT SUM(dc.quantity) FROM distribution_claims dc WHERE dc.distribution_id=? AND dc.attendee_id=a.id AND dc.outcome='accepted' AND dc.reversed_at IS NULL),0) END AS used,
+      CASE WHEN ?='' THEN NULL ELSE (SELECT d.max_per_attendee-COALESCE((SELECT SUM(dc.quantity) FROM distribution_claims dc WHERE dc.distribution_id=d.id AND dc.attendee_id=a.id AND dc.outcome='accepted' AND dc.reversed_at IS NULL),0) FROM distributions d WHERE d.id=?) END AS remaining
+    FROM household_memberships m JOIN attendees a ON a.id=m.attendee_id JOIN tickets t ON t.attendee_id=a.id AND t.event_id=a.event_id
+    LEFT JOIN attendee_presence p ON p.event_id=a.event_id AND p.attendee_id=a.id
+    WHERE m.household_id=? AND m.removed_at IS NULL AND a.event_id=? AND a.organization_id=? AND a.status='active'
+      AND (?!='staff' OR COALESCE(CASE WHEN p.state='in' THEN p.venue_id END,a.venue_id)=?) ORDER BY a.name COLLATE NOCASE,a.id LIMIT 50`)
+    .bind(distributionId,distributionId,distributionId,distributionId,householdId,event.id,auth.organizationId,auth.role,venueId).all<Record<string,unknown>>();
+  const hasVisible=auth.role!=="staff"||members.results.length>0;
+  return hasVisible?c.json({household:{...household,members:members.results}}):c.json({error:"not_found"},404);
+});
+
+app.patch("/api/events/:eventId/households/:householdId", requireScope("admin"), async (c)=>{
+  const event=await eventForAuth(c);if(!event)return c.json({error:"not_found"},404);
+  const auth=c.get("auth"),householdId=c.req.param("householdId"),body=await jsonBody(c),name=requiredString(body,"name")?.trim();
+  if(!name||name.length>120||Object.keys(body).some(k=>k!=="name"))return badRequest(c,"invalid household name");
+  const changeId=crypto.randomUUID(),auditId=crypto.randomUUID();
+  await c.env.DB.batch([
+    c.env.DB.prepare("UPDATE households SET name=?,updated_at=CURRENT_TIMESTAMP,last_change_id=? WHERE id=? AND event_id=? AND organization_id=? AND archived_at IS NULL AND EXISTS(SELECT 1 FROM events WHERE id=? AND organization_id=? AND archived_at IS NULL)").bind(name,changeId,householdId,event.id,auth.organizationId,event.id,auth.organizationId),
+    c.env.DB.prepare(`INSERT INTO audit_logs(id,organization_id,actor_id,action,target_type,target_id,metadata_json)
+      SELECT ?,?,?, 'household.updated','household',?,? WHERE EXISTS(SELECT 1 FROM households WHERE id=? AND name=? AND last_change_id=? AND event_id=? AND organization_id=? AND archived_at IS NULL)`)
+      .bind(auditId,auth.organizationId,auth.actorId,householdId,JSON.stringify({name}),householdId,name,changeId,event.id,auth.organizationId),
+  ]);
+  const changed=await c.env.DB.prepare("SELECT id FROM households WHERE id=? AND event_id=? AND organization_id=? AND last_change_id=? AND name=?").bind(householdId,event.id,auth.organizationId,changeId,name).first();
+  return changed?c.json({updated:true}):c.json({error:"not_found"},404);
+});
+
+app.delete("/api/events/:eventId/households/:householdId",requireScope("admin"),async(c)=>{
+  const event=await eventForAuth(c);if(!event)return c.json({error:"not_found"},404);
+  const auth=c.get("auth"),householdId=c.req.param("householdId"),opId=crypto.randomUUID(),auditId=crypto.randomUUID();
+  await c.env.DB.batch([
+    c.env.DB.prepare(`UPDATE households SET archived_at=CURRENT_TIMESTAMP,updated_at=CURRENT_TIMESTAMP,last_change_id=?
+      WHERE id=? AND event_id=? AND organization_id=? AND archived_at IS NULL
+        AND EXISTS(SELECT 1 FROM events WHERE id=? AND organization_id=? AND archived_at IS NULL)`)
+      .bind(opId,householdId,event.id,auth.organizationId,event.id,auth.organizationId),
+    c.env.DB.prepare(`INSERT INTO audit_logs(id,organization_id,actor_id,action,target_type,target_id,metadata_json)
+      SELECT ?,?,?, 'household.archived','household',?,? FROM households WHERE id=? AND event_id=? AND organization_id=? AND last_change_id=? AND archived_at IS NOT NULL`)
+      .bind(auditId,auth.organizationId,auth.actorId,householdId,JSON.stringify({eventId:event.id}),householdId,event.id,auth.organizationId,opId),
+  ]);
+  const archived=await c.env.DB.prepare("SELECT id FROM households WHERE id=? AND event_id=? AND organization_id=? AND last_change_id=? AND archived_at IS NOT NULL")
+    .bind(householdId,event.id,auth.organizationId,opId).first();
+  return archived?c.json({archived:true}):c.json({error:"not_found"},404);
+});
+
+app.post("/api/events/:eventId/households/:householdId/members", requireScope("admin"), async (c)=>{
+  const event=await eventForAuth(c);if(!event)return c.json({error:"not_found"},404);
+  const auth=c.get("auth"),householdId=c.req.param("householdId"),body=await jsonBody(c),attendeeId=requiredString(body,"attendeeId");
+  if(!attendeeId||!isUuid(attendeeId)||Object.keys(body).some(k=>k!=="attendeeId"))return badRequest(c,"invalid household member");
+  const existing=await c.env.DB.prepare(`SELECT m.id FROM household_memberships m JOIN households h ON h.id=m.household_id
+    WHERE m.household_id=? AND m.attendee_id=? AND m.removed_at IS NULL AND h.event_id=? AND h.organization_id=? AND h.archived_at IS NULL`)
+    .bind(householdId,attendeeId,event.id,auth.organizationId).first();
+  if(existing)return c.json({added:true},200);
+  const membershipId=crypto.randomUUID(),auditId=crypto.randomUUID();
+  try{
+    await c.env.DB.batch([
+      c.env.DB.prepare(`INSERT INTO household_memberships(id,organization_id,event_id,household_id,attendee_id,added_by)
+        SELECT ?,h.organization_id,h.event_id,h.id,a.id,? FROM households h JOIN attendees a ON a.id=? AND a.event_id=h.event_id AND a.organization_id=h.organization_id AND a.status='active'
+        WHERE h.id=? AND h.event_id=? AND h.organization_id=? AND h.archived_at IS NULL
+          AND EXISTS(SELECT 1 FROM events e WHERE e.id=h.event_id AND e.organization_id=h.organization_id AND e.archived_at IS NULL)
+          AND (SELECT COUNT(*) FROM household_memberships WHERE household_id=h.id AND removed_at IS NULL)<50`)
+        .bind(membershipId,auth.actorId,attendeeId,householdId,event.id,auth.organizationId),
+      c.env.DB.prepare(`INSERT INTO audit_logs(id,organization_id,actor_id,action,target_type,target_id,metadata_json)
+        SELECT ?,?,?, 'household.member_added','household',?,? WHERE EXISTS(SELECT 1 FROM household_memberships WHERE id=?)`)
+        .bind(auditId,auth.organizationId,auth.actorId,householdId,JSON.stringify({attendeeId}),membershipId),
+    ]);
+  }catch(e){
+    const now=await c.env.DB.prepare(`SELECT m.id FROM household_memberships m JOIN households h ON h.id=m.household_id
+      WHERE m.household_id=? AND m.attendee_id=? AND m.removed_at IS NULL AND h.event_id=? AND h.organization_id=? AND h.archived_at IS NULL`)
+      .bind(householdId,attendeeId,event.id,auth.organizationId).first();
+    if(now)return c.json({error:"attendee_already_in_household"},409);
+    const elsewhere=await c.env.DB.prepare("SELECT household_id FROM household_memberships WHERE attendee_id=? AND event_id=? AND organization_id=? AND removed_at IS NULL")
+      .bind(attendeeId,event.id,auth.organizationId).first();
+    if(elsewhere)return c.json({error:"attendee_already_in_household"},409);
+    throw e;
+  }
+  const added=await c.env.DB.prepare("SELECT id FROM household_memberships WHERE id=?").bind(membershipId).first();
+  return added?c.json({added:true},201):c.json({error:"not_found_or_household_full"},409);
+});
+
+app.delete("/api/events/:eventId/households/:householdId/members/:attendeeId", requireScope("admin"), async(c)=>{
+  const event=await eventForAuth(c);if(!event)return c.json({error:"not_found"},404);
+  const auth=c.get("auth"),householdId=c.req.param("householdId"),attendeeId=c.req.param("attendeeId"),opId=crypto.randomUUID(),auditId=crypto.randomUUID();
+  await c.env.DB.batch([
+    c.env.DB.prepare(`UPDATE household_memberships SET removed_at=CURRENT_TIMESTAMP,removed_by=?,removed_operation_id=? WHERE household_id=? AND attendee_id=? AND event_id=? AND organization_id=? AND removed_at IS NULL
+      AND EXISTS(SELECT 1 FROM households h JOIN events e ON e.id=h.event_id WHERE h.id=household_id AND h.event_id=? AND h.organization_id=? AND h.archived_at IS NULL AND e.archived_at IS NULL)`)
+      .bind(auth.actorId,opId,householdId,attendeeId,event.id,auth.organizationId,event.id,auth.organizationId),
+    c.env.DB.prepare(`INSERT INTO audit_logs(id,organization_id,actor_id,action,target_type,target_id,metadata_json)
+      SELECT ?,?,?, 'household.member_removed','household',?,? WHERE EXISTS(SELECT 1 FROM household_memberships m JOIN households h ON h.id=m.household_id
+        WHERE m.household_id=? AND m.attendee_id=? AND m.removed_at IS NOT NULL AND m.removed_operation_id=? AND m.event_id=? AND m.organization_id=? AND h.archived_at IS NULL)`)
+      .bind(auditId,auth.organizationId,auth.actorId,householdId,JSON.stringify({attendeeId}),householdId,attendeeId,opId,event.id,auth.organizationId),
+  ]);
+  const removed=await c.env.DB.prepare("SELECT id FROM household_memberships WHERE household_id=? AND attendee_id=? AND removed_operation_id=? AND event_id=? AND organization_id=?").bind(householdId,attendeeId,opId,event.id,auth.organizationId).first();
+  return removed?c.json({removed:true}):c.json({error:"not_found"},404);
+});
+
+app.post("/api/events/:eventId/distributions/:distributionId/proxy-claims", requireScope("checkin:write"), async(c)=>{
+  const event=await eventForAuth(c);if(!event)return c.json({error:"not_found"},404);
+  const auth=c.get("auth"),distributionId=c.req.param("distributionId"),body=await jsonBody(c);
+  const requestId=requiredString(body,"requestId"),householdId=requiredString(body,"householdId"),collectorId=requiredString(body,"collectorId"),venueInput=optionalString(body.venueId);
+  const rawItems=body.items;
+  if(!requestId||!isUuid(requestId)||!householdId||!isUuid(householdId)||!collectorId||!isUuid(collectorId)||!Array.isArray(rawItems)||rawItems.length<1||rawItems.length>20
+      ||(body.venueId!==undefined&&body.venueId!==null&&!venueInput)||Object.keys(body).some(k=>!["requestId","householdId","collectorId","venueId","items"].includes(k)))return badRequest(c,"invalid proxy claim");
+  const items:{attendeeId:string;quantity:number;claimId:string;childRequestId:string;itemId:string}[]=[];
+  const seen=new Set<string>();
+  for(const item of rawItems){
+    if(!item||typeof item!=="object"||Array.isArray(item))return badRequest(c,"invalid proxy item");
+    const attendeeId=requiredString(item as JsonRecord,"attendeeId"),quantity=(item as JsonRecord).quantity;
+    if(!attendeeId||!isUuid(attendeeId)||!Number.isInteger(quantity)||Number(quantity)<1||Number(quantity)>1000||Object.keys(item as JsonRecord).some(k=>!["attendeeId","quantity"].includes(k))||seen.has(attendeeId))return badRequest(c,"invalid proxy item");
+    seen.add(attendeeId);items.push({attendeeId,quantity:Number(quantity),claimId:crypto.randomUUID(),childRequestId:crypto.randomUUID(),itemId:crypto.randomUUID()});
+  }
+  const payloadHash=await sha256(JSON.stringify({actorId:auth.actorId,distributionId,householdId,collectorId,venueId:venueInput??null,items:items.map(i=>({attendeeId:i.attendeeId,quantity:i.quantity}))}));
+  const priorActor=await c.env.DB.prepare("SELECT created_by FROM distribution_proxy_claims WHERE organization_id=? AND event_id=? AND distribution_id=? AND request_id=?")
+    .bind(auth.organizationId,event.id,distributionId,requestId).first<{created_by:string}>();
+  if(priorActor&&priorActor.created_by!==auth.actorId)return c.json({error:"idempotency_conflict"},409);
+  const replay=await c.env.DB.prepare("SELECT id,payload_hash,venue_id FROM distribution_proxy_claims WHERE organization_id=? AND event_id=? AND distribution_id=? AND request_id=? AND created_by=?")
+    .bind(auth.organizationId,event.id,distributionId,requestId,auth.actorId).first<{id:string;payload_hash:string;venue_id:string|null}>();
+  if(replay){if(replay.payload_hash!==payloadHash)return c.json({error:"idempotency_conflict"},409);const scope=await checkInVenueError(c,event.id,replay.venue_id??undefined);if(scope)return c.json({error:scope},403);return c.json(await proxyClaimResponse(c.env.DB,replay.id),200);}
+  const distribution=await c.env.DB.prepare("SELECT id,active FROM distributions WHERE id=? AND event_id=? AND organization_id=?")
+    .bind(distributionId,event.id,auth.organizationId).first<{id:string;active:number}>();
+  const household=await c.env.DB.prepare("SELECT id,name FROM households WHERE id=? AND event_id=? AND organization_id=? AND archived_at IS NULL")
+    .bind(householdId,event.id,auth.organizationId).first<{id:string;name:string}>();
+  if(!distribution||!household)return c.json({error:"not_found"},404);
+  if(distribution.active!==1)return c.json({error:"distribution_inactive"},409);
+  const itemJson=JSON.stringify(items.map(({attendeeId,quantity,claimId,childRequestId,itemId})=>({attendeeId,quantity,claimId,childRequestId,itemId})));
+  const targetRows=await c.env.DB.prepare(`SELECT a.id,a.name,a.affiliation,a.venue_id,t.id AS ticket_id,t.status AS ticket_status,
+      COALESCE(CASE WHEN p.state='in' THEN p.venue_id END,a.venue_id) AS operation_venue_id
+    FROM json_each(?) j JOIN attendees a ON a.id=json_extract(j.value,'$.attendeeId') AND a.event_id=? AND a.organization_id=?
+    JOIN tickets t ON t.attendee_id=a.id AND t.event_id=a.event_id
+    LEFT JOIN attendee_presence p ON p.event_id=a.event_id AND p.attendee_id=a.id
+    JOIN household_memberships hm ON hm.attendee_id=a.id AND hm.household_id=? AND hm.event_id=a.event_id AND hm.organization_id=a.organization_id AND hm.removed_at IS NULL
+    WHERE a.status='active' AND t.status IN ('issued','checked_in')`).bind(itemJson,event.id,auth.organizationId,householdId).all<Record<string,unknown>>();
+  const collector=await c.env.DB.prepare(`SELECT a.id,a.status,t.status AS ticket_status,COALESCE(CASE WHEN p.state='in' THEN p.venue_id END,a.venue_id) AS operation_venue_id
+    FROM attendees a JOIN tickets t ON t.attendee_id=a.id AND t.event_id=a.event_id LEFT JOIN attendee_presence p ON p.event_id=a.event_id AND p.attendee_id=a.id
+    JOIN household_memberships hm ON hm.attendee_id=a.id AND hm.household_id=? AND hm.event_id=a.event_id AND hm.organization_id=a.organization_id AND hm.removed_at IS NULL
+    WHERE a.id=? AND a.event_id=? AND a.organization_id=? AND a.status='active' AND t.status IN ('issued','checked_in')`)
+    .bind(householdId,collectorId,event.id,auth.organizationId).first<{id:string;status:string;ticket_status:string;operation_venue_id:string|null}>();
+  if(targetRows.results.length!==items.length||!collector)return c.json({error:"household_member_unavailable"},404);
+  let venueId:string|null=venueInput??null;
+  for(const target of [...targetRows.results,collector]){
+    const resolved=await distributionVenueForActor(c,event.id,target.operation_venue_id as string|null,venueInput);
+    if(resolved instanceof Response)return resolved;
+    if(venueId!==null&&resolved!==venueId)return c.json({error:"mixed_venue"},400);
+    if(venueId===null)venueId=resolved;
+  }
+  if(auth.role==="staff"&&!venueId)return c.json({error:"venue_required"},403);
+  const storedItems=JSON.stringify(items.map(i=>({...i})));
+  const proxyId=crypto.randomUUID(),auditId=crypto.randomUUID();
+  const guards=`EXISTS(SELECT 1 FROM events e WHERE e.id=? AND e.organization_id=? AND e.archived_at IS NULL)
+    AND EXISTS(SELECT 1 FROM distributions d WHERE d.id=? AND d.event_id=? AND d.organization_id=? AND d.active=1)
+    AND EXISTS(SELECT 1 FROM households h WHERE h.id=? AND h.event_id=? AND h.organization_id=? AND h.archived_at IS NULL)
+    AND EXISTS(SELECT 1 FROM household_memberships hm JOIN attendees ca ON ca.id=hm.attendee_id JOIN tickets ct ON ct.attendee_id=ca.id
+      LEFT JOIN attendee_presence cp ON cp.event_id=ca.event_id AND cp.attendee_id=ca.id
+      WHERE hm.household_id=? AND hm.attendee_id=? AND hm.event_id=? AND hm.organization_id=? AND hm.removed_at IS NULL AND ca.status='active' AND ct.status IN ('issued','checked_in')
+        AND (? IS NULL OR COALESCE(CASE WHEN cp.state='in' THEN cp.venue_id END,ca.venue_id) IS NULL OR COALESCE(CASE WHEN cp.state='in' THEN cp.venue_id END,ca.venue_id)=?))
+    AND (SELECT COUNT(*) FROM json_each(?) j JOIN attendees a ON a.id=json_extract(j.value,'$.attendeeId') AND a.event_id=? AND a.organization_id=?
+      JOIN tickets t ON t.attendee_id=a.id AND t.event_id=a.event_id
+      JOIN household_memberships hm ON hm.attendee_id=a.id AND hm.household_id=? AND hm.event_id=a.event_id AND hm.organization_id=a.organization_id AND hm.removed_at IS NULL
+      LEFT JOIN attendee_presence p ON p.event_id=a.event_id AND p.attendee_id=a.id
+      WHERE a.status='active' AND t.status IN ('issued','checked_in') AND (? IS NULL OR COALESCE(CASE WHEN p.state='in' THEN p.venue_id END,a.venue_id) IS NULL OR COALESCE(CASE WHEN p.state='in' THEN p.venue_id END,a.venue_id)=?))=?
+    AND (? IS NULL OR EXISTS(SELECT 1 FROM venues v WHERE v.id=? AND v.event_id=?))
+    AND (?!='staff' OR EXISTS(SELECT 1 FROM venue_staff_assignments s WHERE s.venue_id=? AND s.user_id=?))`;
+  const common=[event.id,auth.organizationId,distributionId,event.id,auth.organizationId,householdId,event.id,auth.organizationId,
+    householdId,collectorId,event.id,auth.organizationId,venueId,venueId,storedItems,event.id,auth.organizationId,householdId,venueId,venueId,items.length,
+    venueId,venueId,event.id,auth.role,venueId,auth.actorId];
+  // Collector display name is obtained and bound separately, avoiding client-provided snapshots.
+  const collectorName=await c.env.DB.prepare("SELECT name FROM attendees WHERE id=? AND event_id=? AND organization_id=?").bind(collectorId,event.id,auth.organizationId).first<{name:string}>();
+  const statements=[c.env.DB.prepare(`INSERT INTO distribution_proxy_claims(id,organization_id,event_id,distribution_id,request_id,payload_hash,household_id,household_name_snapshot,collector_id,collector_name_snapshot,venue_id,outcome,created_by)
+    SELECT ?,?,?,?,?,?,?,?,?,?,?,CASE WHEN EXISTS(SELECT 1 FROM json_each(?) j JOIN attendees a ON a.id=json_extract(j.value,'$.attendeeId')
+      JOIN distributions d ON d.id=? WHERE COALESCE((SELECT SUM(dc.quantity) FROM distribution_claims dc WHERE dc.distribution_id=d.id AND dc.attendee_id=a.id AND dc.outcome='accepted' AND dc.reversed_at IS NULL),0)+CAST(json_extract(j.value,'$.quantity') AS INTEGER)>d.max_per_attendee) THEN 'limit_reached' ELSE 'accepted' END,?
+    WHERE ${guards}`)
+    .bind(proxyId,auth.organizationId,event.id,distributionId,requestId,payloadHash,householdId,household.name,collectorId,(collectorName?.name ?? ""),venueId,storedItems,distributionId,auth.actorId,...common)];
+  // Child claims are inserted before their immutable snapshot rows because the
+  // snapshot optionally references each claim by foreign key.
+  statements.push(c.env.DB.prepare(`INSERT INTO distribution_claims(id,organization_id,event_id,distribution_id,request_id,payload_hash,attendee_id,ticket_id,venue_id,quantity,outcome,used_after,remaining_after,created_by,proxy_group_id)
+    SELECT json_extract(j.value,'$.claimId'),g.organization_id,g.event_id,g.distribution_id,json_extract(j.value,'$.childRequestId'),g.payload_hash,a.id,t.id,g.venue_id,
+      CAST(json_extract(j.value,'$.quantity') AS INTEGER),'accepted',
+      (SELECT COALESCE(SUM(dc.quantity),0) FROM distribution_claims dc WHERE dc.distribution_id=g.distribution_id AND dc.attendee_id=a.id AND dc.outcome='accepted' AND dc.reversed_at IS NULL)+CAST(json_extract(j.value,'$.quantity') AS INTEGER),
+      d.max_per_attendee-(SELECT COALESCE(SUM(dc.quantity),0) FROM distribution_claims dc WHERE dc.distribution_id=g.distribution_id AND dc.attendee_id=a.id AND dc.outcome='accepted' AND dc.reversed_at IS NULL)-CAST(json_extract(j.value,'$.quantity') AS INTEGER),
+      g.created_by,g.id
+    FROM json_each(?) j JOIN distribution_proxy_claims g ON g.id=? AND g.outcome='accepted'
+    JOIN attendees a ON a.id=json_extract(j.value,'$.attendeeId') JOIN tickets t ON t.attendee_id=a.id AND t.event_id=a.event_id
+    JOIN distributions d ON d.id=g.distribution_id`)
+    .bind(storedItems,proxyId));
+  statements.push(c.env.DB.prepare(`INSERT INTO distribution_proxy_items(id,proxy_claim_id,claim_id,attendee_id,attendee_name_snapshot,affiliation_snapshot,quantity,used_after,remaining_after,outcome)
+    SELECT json_extract(j.value,'$.itemId'),g.id,dc.id,a.id,a.name,a.affiliation,CAST(json_extract(j.value,'$.quantity') AS INTEGER),dc.used_after,dc.remaining_after,'accepted'
+    FROM json_each(?) j JOIN distribution_proxy_claims g ON g.id=? AND g.outcome='accepted'
+    JOIN attendees a ON a.id=json_extract(j.value,'$.attendeeId') JOIN distribution_claims dc ON dc.id=json_extract(j.value,'$.claimId') AND dc.proxy_group_id=g.id`)
+    .bind(storedItems,proxyId));
+  statements.push(c.env.DB.prepare(`INSERT INTO distribution_proxy_items(id,proxy_claim_id,attendee_id,attendee_name_snapshot,affiliation_snapshot,quantity,used_after,remaining_after,outcome)
+    SELECT json_extract(j.value,'$.itemId'),g.id,a.id,a.name,a.affiliation,CAST(json_extract(j.value,'$.quantity') AS INTEGER),
+      (SELECT COALESCE(SUM(dc.quantity),0) FROM distribution_claims dc WHERE dc.distribution_id=g.distribution_id AND dc.attendee_id=a.id AND dc.outcome='accepted' AND dc.reversed_at IS NULL),
+      d.max_per_attendee-(SELECT COALESCE(SUM(dc.quantity),0) FROM distribution_claims dc WHERE dc.distribution_id=g.distribution_id AND dc.attendee_id=a.id AND dc.outcome='accepted' AND dc.reversed_at IS NULL),
+      'limit_reached'
+    FROM json_each(?) j JOIN distribution_proxy_claims g ON g.id=? AND g.outcome='limit_reached'
+    JOIN attendees a ON a.id=json_extract(j.value,'$.attendeeId') JOIN distributions d ON d.id=g.distribution_id`)
+    .bind(storedItems,proxyId));
+  statements.push(c.env.DB.prepare(`INSERT INTO audit_logs(id,organization_id,actor_id,action,target_type,target_id,metadata_json)
+    SELECT ?,?,?,CASE WHEN outcome='accepted' THEN 'distribution.proxy_claimed' ELSE 'distribution.proxy_limit_reached' END,'distribution_proxy_claim',id,?
+    FROM distribution_proxy_claims WHERE id=?`)
+    .bind(auditId,auth.organizationId,auth.actorId,JSON.stringify({distributionId,householdId,collectorId,requestId,beneficiaryCount:items.length}),proxyId));
+  try{await c.env.DB.batch(statements);}catch(error){
+    const retry=await c.env.DB.prepare("SELECT id,payload_hash FROM distribution_proxy_claims WHERE organization_id=? AND event_id=? AND distribution_id=? AND request_id=? AND created_by=?")
+      .bind(auth.organizationId,event.id,distributionId,requestId,auth.actorId).first<{id:string;payload_hash:string}>();
+    if(retry){if(retry.payload_hash!==payloadHash)return c.json({error:"idempotency_conflict"},409);const scope=await checkInVenueError(c,event.id,(await c.env.DB.prepare("SELECT venue_id FROM distribution_proxy_claims WHERE id=?").bind(retry.id).first<{venue_id:string|null}>())?.venue_id??undefined);if(scope)return c.json({error:scope},403);return c.json(await proxyClaimResponse(c.env.DB,retry.id),200);}
+    const otherActor=await c.env.DB.prepare("SELECT created_by FROM distribution_proxy_claims WHERE organization_id=? AND event_id=? AND distribution_id=? AND request_id=?")
+      .bind(auth.organizationId,event.id,distributionId,requestId).first<{created_by:string}>();
+    if(otherActor)return c.json({error:"idempotency_conflict"},409);
+    throw error;
+  }
+  const created=await c.env.DB.prepare("SELECT id FROM distribution_proxy_claims WHERE id=? AND created_by=?").bind(proxyId,auth.actorId).first<{id:string}>();
+  if(!created)return c.json({error:"proxy_claim_unavailable"},409);
+  return c.json(await proxyClaimResponse(c.env.DB,proxyId),201);
+});
+
+app.get("/api/events/:eventId/distributions/:distributionId/proxy-claims/by-request/:requestId",requireScope("checkin:write"),async(c)=>{
+  const event=await eventForAuth(c);if(!event)return c.json({error:"not_found"},404);
+  const auth=c.get("auth"),distributionId=c.req.param("distributionId"),requestId=c.req.param("requestId");if(!requestId||!isUuid(requestId))return badRequest(c,"invalid request id");
+  const row=await c.env.DB.prepare(`SELECT id,venue_id FROM distribution_proxy_claims WHERE organization_id=? AND event_id=? AND distribution_id=? AND request_id=? AND created_by=?`)
+    .bind(auth.organizationId,event.id,distributionId,requestId,auth.actorId).first<{id:string;venue_id:string|null}>();
+  if(!row)return c.json({error:"not_found"},404);
+  const scope=await checkInVenueError(c,event.id,row.venue_id??undefined);if(scope)return c.json({error:scope},403);
+  return c.json(await proxyClaimResponse(c.env.DB,row.id));
+});
+
+app.get("/api/events/:eventId/distributions/:distributionId/proxy-claims",requireScope("roster:read"),async(c)=>{
+  const event=await eventForAuth(c);if(!event)return c.json({error:"not_found"},404);
+  const auth=c.get("auth"),distributionId=c.req.param("distributionId"),limit=Number(c.req.query("limit")??50),after=c.req.query("after")??"",householdId=c.req.query("householdId")??"",venueId=c.req.query("venueId")??"";
+  if(!Number.isInteger(limit)||limit<1||limit>100||(after&&!isUuid(after))||(householdId&&!isUuid(householdId)))return badRequest(c,"invalid proxy pagination");
+  if(auth.role==="staff"){if(!venueId)return c.json({error:"venue_required"},403);const err=await checkInVenueError(c,event.id,venueId);if(err)return c.json({error:err},403);}
+  const parents=await c.env.DB.prepare(`SELECT g.id,g.request_id,g.household_id,g.household_name_snapshot AS household_name,g.collector_id,g.collector_name_snapshot AS collector_name,g.venue_id,g.outcome,g.created_at,g.reversed_at
+    FROM distribution_proxy_claims g WHERE g.organization_id=? AND g.event_id=? AND g.distribution_id=? AND (?='' OR g.household_id=?)
+      AND (?='' OR g.venue_id=?) AND (?!='staff' OR EXISTS(SELECT 1 FROM venue_staff_assignments s WHERE s.venue_id=g.venue_id AND s.user_id=?))
+      AND (?='' OR (g.created_at,g.id)<(SELECT created_at,id FROM distribution_proxy_claims WHERE id=? AND distribution_id=?))
+    ORDER BY g.created_at DESC,g.id DESC LIMIT ?`)
+    .bind(auth.organizationId,event.id,distributionId,householdId,householdId,venueId,venueId,auth.role,auth.actorId,after,after,distributionId,limit+1).all<Record<string,unknown>>();
+  const page=parents.results.slice(0,limit);
+  const items=page.length?await c.env.DB.prepare(`SELECT i.proxy_claim_id,i.claim_id AS claimId,i.attendee_id AS attendeeId,
+      i.attendee_name_snapshot AS attendeeName,i.affiliation_snapshot AS affiliation,i.quantity,
+      i.outcome,CASE WHEN g.reversed_at IS NOT NULL THEN 'reversed' ELSE i.outcome END AS status,i.used_after,i.remaining_after
+    FROM distribution_proxy_items i JOIN distribution_proxy_claims g ON g.id=i.proxy_claim_id
+    WHERE i.proxy_claim_id IN (${page.map(()=>"?").join(",")}) ORDER BY i.attendee_name_snapshot COLLATE NOCASE,i.attendee_id`).bind(...page.map(p=>p.id)).all<Record<string,unknown>>():{results:[]};
+  return c.json({proxyClaims:page.map(parent=>({...parent,items:items.results.filter(item=>item.proxy_claim_id===parent.id).map(({proxy_claim_id,outcome,used_after,remaining_after,...item})=>({...item,used:used_after,remaining:remaining_after}))})),nextCursor:parents.results.length>limit?page.at(-1)?.id??null:null});
+});
+
+app.post("/api/events/:eventId/distributions/:distributionId/proxy-claims/:proxyClaimId/reverse",requireScope("admin"),async(c)=>{
+  const event=await eventForAuth(c);if(!event)return c.json({error:"not_found"},404);
+  const auth=c.get("auth"),distributionId=c.req.param("distributionId"),proxyClaimId=c.req.param("proxyClaimId"),body=await jsonBody(c),reason=typeof body.reason==="string"?body.reason.trim():"";
+  if(!reason||reason.length>500||Object.keys(body).some(k=>k!=="reason"))return badRequest(c,"reason is required and must be at most 500 characters");
+  const parent=await c.env.DB.prepare("SELECT id,outcome,reversed_at FROM distribution_proxy_claims WHERE id=? AND organization_id=? AND event_id=? AND distribution_id=?")
+    .bind(proxyClaimId,auth.organizationId,event.id,distributionId).first<{id:string;outcome:string;reversed_at:string|null}>();
+  if(!parent)return c.json({error:"not_found"},404);if(parent.reversed_at)return c.json({error:"claim_already_reversed"},409);if(parent.outcome!=="accepted")return c.json({error:"claim_not_reversible"},409);
+  const claims=await c.env.DB.prepare("SELECT id FROM distribution_claims WHERE proxy_group_id=? AND outcome='accepted' AND reversed_at IS NULL ORDER BY id LIMIT 20").bind(proxyClaimId).all<{id:string}>();
+  if(!claims.results.length)return c.json({error:"claim_not_reversible"},409);
+  const reversalId=crypto.randomUUID(),auditId=crypto.randomUUID();
+  const statements=[c.env.DB.prepare(`UPDATE distribution_proxy_claims SET reversed_at=CURRENT_TIMESTAMP,reversal_id=?,reversed_by=?,reverse_reason=?
+    WHERE id=? AND organization_id=? AND event_id=? AND distribution_id=? AND outcome='accepted' AND reversed_at IS NULL
+      AND EXISTS(SELECT 1 FROM events WHERE id=? AND organization_id=? AND archived_at IS NULL)`)
+    .bind(reversalId,auth.actorId,reason,proxyClaimId,auth.organizationId,event.id,distributionId,event.id,auth.organizationId)];
+  for(const claim of claims.results){
+    statements.push(c.env.DB.prepare(`UPDATE distribution_claims SET reversed_at=CURRENT_TIMESTAMP,reversal_id=?,reversed_by=?,reverse_reason=?
+      WHERE id=? AND proxy_group_id=? AND outcome='accepted' AND reversed_at IS NULL
+        AND EXISTS(SELECT 1 FROM distribution_proxy_claims g WHERE g.id=? AND g.reversal_id=?)`)
+      .bind(crypto.randomUUID(),auth.actorId,reason,claim.id,proxyClaimId,proxyClaimId,reversalId));
+  }
+  statements.push(c.env.DB.prepare(`INSERT INTO audit_logs(id,organization_id,actor_id,action,target_type,target_id,metadata_json)
+    SELECT ?,?,?, 'distribution.proxy_claim_reversed','distribution_proxy_claim',id,? FROM distribution_proxy_claims WHERE id=? AND reversal_id=?`)
+    .bind(auditId,auth.organizationId,auth.actorId,JSON.stringify({distributionId,proxyClaimId,reversalId,reason,childCount:claims.results.length}),proxyClaimId,reversalId));
+  await c.env.DB.batch(statements);
+  const reversed=await c.env.DB.prepare("SELECT id,reversed_at FROM distribution_proxy_claims WHERE id=? AND reversal_id=?").bind(proxyClaimId,reversalId).first();
+  return reversed?c.json({reversed:true,proxyClaimId}):c.json({error:"claim_already_reversed"},409);
+});
+
 app.get("/api/events/:eventId/roster", requireScope("roster:read"), async (c) => {
   const event = await eventForAuth(c);
   if (!event) return c.json({ error: "not_found" }, 404);
@@ -982,12 +2017,16 @@ app.post("/api/participant/ticket/cancel", async (c) => {
       SELECT ?, a.organization_id, 'ticket.cancelled_by_participant', 'ticket', t.id, '{}'
       FROM tickets t JOIN attendees a ON a.id = t.attendee_id JOIN events e ON e.id = t.event_id
       WHERE a.id = ? AND t.status = 'issued'
+      AND NOT EXISTS (SELECT 1 FROM attendee_presence p WHERE p.event_id = t.event_id AND p.attendee_id = a.id AND p.state = 'in')
       AND (e.cancellation_closes_at IS NULL OR datetime(e.cancellation_closes_at) > CURRENT_TIMESTAMP)`)
       .bind(auditId, attendeeId),
     c.env.DB.prepare("UPDATE tickets SET status = 'cancelled' WHERE attendee_id = ? AND EXISTS (SELECT 1 FROM audit_logs WHERE id = ?)").bind(attendeeId, auditId),
     c.env.DB.prepare("UPDATE attendees SET status = 'cancelled', cancelled_at = CURRENT_TIMESTAMP WHERE id = ? AND EXISTS (SELECT 1 FROM audit_logs WHERE id = ?)").bind(attendeeId, auditId),
   ]);
-  if (!results[0].meta.changes) return c.json({ error: "cancellation_unavailable" }, 409);
+  if (!results[0].meta.changes) {
+    const presence = await c.env.DB.prepare("SELECT state FROM attendee_presence WHERE attendee_id = ? AND state = 'in'").bind(attendeeId).first();
+    return presence ? c.json({ error: "attendee_present" }, 409) : c.json({ error: "cancellation_unavailable" }, 409);
+  }
   return c.json({ cancelled: true });
 });
 
@@ -2164,6 +3203,102 @@ function scheduleSummary(event: EventRow) {
   const allDay = !starts || canonicalDate(starts) === starts;
   return { enabled: event.scheduling_enabled === 1, status: event.schedule_status, date: !starts ? null : allDay ? starts : calendarDate(starts, timeZone), startsAt: starts || null, endsAt: event.ends_at || null, allDay, timeZone };
 }
+function isUuid(value: string) { return /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(value); }
+function isUniqueConstraintError(error: unknown, columns: string) { return error instanceof Error && error.message.includes(`UNIQUE constraint failed: ${columns}`); }
+function distributionClaimResponse(row: DistributionClaimRow) {
+  return {
+    outcome: row.outcome,
+    used: row.used_after,
+    remaining: row.remaining_after,
+    claim: {
+      id: row.id,
+      request_id: row.request_id,
+      quantity: row.quantity,
+      attendee_id: row.attendee_id,
+      venue_id: row.venue_id,
+      created_at: row.created_at,
+    },
+  };
+}
+async function presenceRequestResponse(db: D1Database, row: PresenceRequestRow) {
+  const movement = row.movement_id ? await db.prepare(`SELECT id, request_id, action, attendee_id, venue_id, revision, recorded_at, occurred_at
+    FROM presence_movements WHERE id = ? AND event_id = ? AND organization_id = ?`)
+    .bind(row.movement_id, row.event_id, row.organization_id).first<Record<string, unknown>>() : null;
+  return {
+    outcome: row.outcome,
+    movement,
+    presence: { state: row.result_state, venue_id: row.result_venue_id, revision: row.result_revision, updated_at: row.result_updated_at },
+  };
+}
+function normalizeOccurredAt(value: unknown): string | null {
+  if (typeof value !== "string" || value.length > 64 || !value.trim()) return null;
+  const timestamp = Date.parse(value);
+  return Number.isFinite(timestamp) ? new Date(timestamp).toISOString() : null;
+}
+function parseTicketQrLink(appOrigin: string, qrLink: string) {
+  try {
+    const url = new URL(qrLink);
+    if (url.origin !== new URL(appOrigin).origin || url.search || url.hash || url.username || url.password) return null;
+    const match = url.pathname.match(/^\/public\/tickets\/([^/]+)\/check-in\/([^/]+)$/);
+    if (!match) return null;
+    const ticketId = decodeURIComponent(match[1]!);
+    const token = decodeURIComponent(match[2]!);
+    if (!isUuid(ticketId) || !token || token.length > 512) return null;
+    return { ticketId, token };
+  } catch { return null; }
+}
+async function findDistributionAttendeeByQr(c: Context<AppEnv>, eventId: string, qrLink: string): Promise<DistributionAttendee | null> {
+  const parsed = parseTicketQrLink(c.env.APP_ORIGIN, qrLink);
+  if (!parsed) return null;
+  const qrTokenHash = await sha256(parsed.token);
+  return c.env.DB.prepare(`SELECT a.id, a.name, a.affiliation, a.venue_id, v.name AS venue_name,
+      COALESCE(CASE WHEN p.state='in' THEN p.venue_id END,a.venue_id) AS operation_venue_id,
+      t.id AS ticket_id, COALESCE(q.token_hash, t.token_hash) AS qr_token_hash
+    FROM tickets t LEFT JOIN ticket_qr_tokens q ON q.ticket_id = t.id AND q.token_hash = ? AND q.expires_at > CURRENT_TIMESTAMP
+    JOIN attendees a ON a.id = t.attendee_id JOIN events e ON e.id = a.event_id
+    LEFT JOIN attendee_presence p ON p.event_id=a.event_id AND p.attendee_id=a.id
+    LEFT JOIN venues v ON v.id = COALESCE(CASE WHEN p.state='in' THEN p.venue_id END,a.venue_id)
+    WHERE t.id = ? AND e.id = ? AND e.organization_id = ? AND e.archived_at IS NULL
+      AND a.organization_id = e.organization_id AND a.status = 'active'
+      AND t.event_id = e.id AND t.status IN ('issued', 'checked_in')
+      AND (q.id IS NOT NULL OR (t.token_key_id = 'v1' AND t.token_hash = ?))`)
+    .bind(qrTokenHash, parsed.ticketId, eventId, c.get("auth").organizationId, qrTokenHash)
+    .first<DistributionAttendee>();
+}
+async function findDistributionAttendeeById(c: Context<AppEnv>, eventId: string, attendeeId: string): Promise<DistributionAttendee | null> {
+  return c.env.DB.prepare(`SELECT a.id, a.name, a.affiliation, a.venue_id, v.name AS venue_name,
+      COALESCE(CASE WHEN p.state='in' THEN p.venue_id END,a.venue_id) AS operation_venue_id,
+      t.id AS ticket_id, NULL AS qr_token_hash
+    FROM attendees a JOIN tickets t ON t.attendee_id = a.id
+    LEFT JOIN attendee_presence p ON p.event_id=a.event_id AND p.attendee_id=a.id
+    LEFT JOIN venues v ON v.id = COALESCE(CASE WHEN p.state='in' THEN p.venue_id END,a.venue_id)
+    WHERE a.id = ? AND a.event_id = ? AND a.organization_id = ? AND a.status = 'active'
+      AND t.event_id = a.event_id AND t.status IN ('issued', 'checked_in')`)
+    .bind(attendeeId, eventId, c.get("auth").organizationId)
+    .first<DistributionAttendee>();
+}
+async function findDistributionAttendeeByCredentialHash(c:Context<AppEnv>,eventId:string,attendeeId:string,credentialHash:string):Promise<DistributionAttendee|null>{
+  return c.env.DB.prepare(`SELECT a.id,a.name,a.affiliation,a.venue_id,v.name AS venue_name,
+      COALESCE(CASE WHEN p.state='in' THEN p.venue_id END,a.venue_id) AS operation_venue_id,
+      t.id AS ticket_id,COALESCE(q.token_hash,t.token_hash) AS qr_token_hash
+    FROM attendees a JOIN tickets t ON t.attendee_id=a.id AND t.event_id=a.event_id
+    LEFT JOIN attendee_presence p ON p.event_id=a.event_id AND p.attendee_id=a.id
+    LEFT JOIN venues v ON v.id=COALESCE(CASE WHEN p.state='in' THEN p.venue_id END,a.venue_id)
+    LEFT JOIN ticket_qr_tokens q ON q.ticket_id=t.id AND q.token_hash=? AND q.expires_at>CURRENT_TIMESTAMP
+    JOIN events e ON e.id=a.event_id
+    WHERE a.id=? AND a.event_id=? AND a.organization_id=? AND e.organization_id=a.organization_id AND e.archived_at IS NULL
+      AND a.status='active' AND t.status IN ('issued','checked_in')
+      AND (q.id IS NOT NULL OR (t.token_key_id='v1' AND t.token_hash=?))`)
+    .bind(credentialHash,attendeeId,eventId,c.get("auth").organizationId,credentialHash).first<DistributionAttendee>();
+}
+async function distributionVenueForActor(c: Context<AppEnv>, eventId: string, attendeeVenueId: string | null, requestedVenueId?: string): Promise<string | null | Response> {
+  if (attendeeVenueId && requestedVenueId && attendeeVenueId !== requestedVenueId) return c.json({ error: "wrong_venue" }, 403);
+  const venueId = requestedVenueId ?? attendeeVenueId ?? undefined;
+  const error = await checkInVenueError(c, eventId, venueId);
+  if (error) return c.json({ error }, error === "invalid_venue" ? 400 : 403);
+  return venueId ?? null;
+}
+
 async function eventForAuth(c: Context<AppEnv>) {
   const event = await c.env.DB.prepare("SELECT * FROM events WHERE id = ? AND organization_id = ? AND archived_at IS NULL").bind(c.req.param("eventId"), c.get("auth").organizationId).first<EventRow>();
   if (event && c.get("auth").role === "staff") {
@@ -2263,6 +3398,141 @@ async function issueQrToken(db: D1Database, ticketId: string, lifetime: string) 
     .bind(crypto.randomUUID(), ticketId, await sha256(token), lifetime).run();
   return token;
 }
+async function issuePaperQrCard(c: Context<AppEnv>, kind: "additional" | "replacement") {
+  const event = await eventForAuth(c);
+  if (!event) return c.json({ error: "not_found" }, 404);
+  const auth = c.get("auth"), attendeeId = c.req.param("attendeeId");
+  const body = await jsonBody(c), requestId = requiredString(body, "requestId"), qrToken = requiredString(body, "qrToken");
+  const reason = kind === "replacement" ? (typeof body.reason === "string" ? body.reason.trim() : "") : null;
+  const requestedVenueId = optionalString(body.venueId);
+  if (!requestId || !isUuid(requestId) || !qrToken || !isCanonicalQrToken(qrToken)
+    || (kind === "replacement" && (!reason || reason.length > 500))
+    || (kind === "additional" && body.reason !== undefined)
+    || (body.venueId !== undefined && body.venueId !== null && !requestedVenueId)
+    || Object.keys(body).some(k => !["requestId", "qrToken", "venueId", ...(kind === "replacement" ? ["reason"] : [])].includes(k))) return badRequest(c, "invalid QR card request");
+
+  const attendee = await c.env.DB.prepare(`SELECT a.id,a.venue_id,a.status,t.id AS ticket_id,t.status AS ticket_status,t.token_key_id,
+      COALESCE(CASE WHEN p.state='in' THEN p.venue_id END,a.venue_id) AS operation_venue_id
+    FROM attendees a JOIN tickets t ON t.attendee_id=a.id AND t.event_id=a.event_id
+    LEFT JOIN attendee_presence p ON p.event_id=a.event_id AND p.attendee_id=a.id
+    WHERE a.id=? AND a.event_id=? AND a.organization_id=? AND t.event_id=?`)
+    .bind(attendeeId,event.id,auth.organizationId,event.id).first<{id:string;venue_id:string|null;operation_venue_id:string|null;status:string;ticket_id:string;ticket_status:string;token_key_id:string}>();
+  if (!attendee) return c.json({ error: "not_found" },404);
+  const venueId = await distributionVenueForActor(c,event.id,attendee.operation_venue_id,requestedVenueId);
+  if (venueId instanceof Response) return venueId;
+  if (attendee.status !== "active" || !["issued","checked_in"].includes(attendee.ticket_status)) return c.json({error:"credential_unavailable"},409);
+  const qrHash = await sha256(qrToken);
+  const payloadHash = await sha256(JSON.stringify({actorId:auth.actorId,kind,attendeeId:attendee.id,ticketId:attendee.ticket_id,qrHash,venueId,reason}));
+  const occupiedRequest = await c.env.DB.prepare("SELECT created_by FROM ticket_qr_card_requests WHERE organization_id=? AND event_id=? AND request_id=?")
+    .bind(auth.organizationId,event.id,requestId).first<{created_by:string}>();
+  if(occupiedRequest&&occupiedRequest.created_by!==auth.actorId)return c.json({error:"idempotency_conflict"},409);
+  const existing = await getPaperCardRequest(c.env.DB,auth.organizationId,event.id,requestId,auth.actorId);
+  if(existing) {
+    if(existing.payload_hash!==payloadHash||existing.attendee_id!==attendee.id||existing.action!==kind) return c.json({error:"idempotency_conflict"},409);
+    return buildPaperCardResponse(c,existing,qrToken,200);
+  }
+
+  const requestDbId=crypto.randomUUID(),cardId=crypto.randomUUID(),qrTokenId=crypto.randomUUID(),auditId=crypto.randomUUID();
+  const insertRequest=c.env.DB.prepare(`INSERT INTO ticket_qr_card_requests(id,organization_id,event_id,request_id,payload_hash,created_by,action,attendee_id,ticket_id,venue_id,revoked_count,legacy_credential_invalidated)
+    SELECT ?,?,?,?,?,?,?,?,?,?,CASE WHEN ?='replacement' THEN (SELECT COUNT(*) FROM ticket_qr_tokens WHERE ticket_id=? AND expires_at>CURRENT_TIMESTAMP) ELSE 0 END,
+      CASE WHEN ?='replacement' AND t.token_key_id='v1' THEN 1 ELSE 0 END
+    FROM attendees a JOIN events e ON e.id=a.event_id JOIN tickets t ON t.attendee_id=a.id
+    LEFT JOIN attendee_presence p ON p.event_id=a.event_id AND p.attendee_id=a.id
+    WHERE a.id=? AND a.event_id=? AND a.organization_id=? AND a.status='active' AND e.archived_at IS NULL AND t.id=? AND t.status IN ('issued','checked_in')
+      AND (COALESCE(CASE WHEN p.state='in' THEN p.venue_id END,a.venue_id) IS NULL OR COALESCE(CASE WHEN p.state='in' THEN p.venue_id END,a.venue_id) IS ?)
+      AND (? IS NULL OR EXISTS(SELECT 1 FROM venues requested WHERE requested.id=? AND requested.event_id=e.id))
+      AND (?!='staff' OR EXISTS(SELECT 1 FROM venue_staff_assignments s JOIN venues v ON v.id=s.venue_id WHERE s.user_id=? AND s.venue_id=? AND v.event_id=e.id))
+      AND (?='replacement' OR (SELECT COUNT(*) FROM ticket_qr_tokens WHERE ticket_id=t.id AND expires_at>CURRENT_TIMESTAMP)<25)`)
+    .bind(requestDbId,auth.organizationId,event.id,requestId,payloadHash,auth.actorId,kind,attendee.id,attendee.ticket_id,venueId,kind,attendee.ticket_id,kind,
+      attendee.id,event.id,auth.organizationId,attendee.ticket_id,venueId,venueId,venueId,auth.role,auth.actorId,venueId,kind);
+  const sql=[insertRequest];
+  if(kind==="replacement") {
+    sql.push(c.env.DB.prepare(`UPDATE ticket_qr_tokens SET expires_at=CURRENT_TIMESTAMP WHERE ticket_id=? AND EXISTS(
+      SELECT 1 FROM ticket_qr_card_requests r WHERE r.id=? AND r.card_id IS NULL AND r.created_by=? AND r.payload_hash=?)`)
+      .bind(attendee.ticket_id,requestDbId,auth.actorId,payloadHash));
+    sql.push(c.env.DB.prepare(`UPDATE tickets SET token_hash=?,token_key_id='possession-v2' WHERE id=? AND token_key_id='v1' AND EXISTS(
+      SELECT 1 FROM ticket_qr_card_requests r WHERE r.id=? AND r.card_id IS NULL AND r.created_by=? AND r.payload_hash=?)`)
+      .bind(await sha256(randomToken()),attendee.ticket_id,requestDbId,auth.actorId,payloadHash));
+  }
+  sql.push(c.env.DB.prepare(`INSERT INTO ticket_qr_tokens(id,ticket_id,token_hash,expires_at)
+    SELECT ?,?,?,datetime('now','+1 year') WHERE EXISTS(SELECT 1 FROM ticket_qr_card_requests r WHERE r.id=? AND r.card_id IS NULL AND r.created_by=? AND r.payload_hash=?)`)
+    .bind(qrTokenId,attendee.ticket_id,qrHash,requestDbId,auth.actorId,payloadHash));
+  sql.push(c.env.DB.prepare(`INSERT INTO ticket_qr_cards(id,organization_id,event_id,attendee_id,ticket_id,qr_token_id,venue_id,request_id,kind,reason,issued_by,expires_at)
+    SELECT ?,?,?,?,?,?,?,?,?,?,?,datetime('now','+1 year') WHERE EXISTS(SELECT 1 FROM ticket_qr_tokens q JOIN ticket_qr_card_requests r ON r.id=?
+      WHERE q.id=? AND r.card_id IS NULL AND r.created_by=? AND r.payload_hash=?)`)
+    .bind(cardId,auth.organizationId,event.id,attendee.id,attendee.ticket_id,qrTokenId,venueId,requestId,kind,reason,auth.actorId,
+      requestDbId,qrTokenId,auth.actorId,payloadHash));
+  sql.push(c.env.DB.prepare("UPDATE ticket_qr_card_requests SET card_id=? WHERE id=? AND card_id IS NULL AND created_by=? AND payload_hash=? AND EXISTS(SELECT 1 FROM ticket_qr_cards WHERE id=?)")
+    .bind(cardId,requestDbId,auth.actorId,payloadHash,cardId));
+  sql.push(c.env.DB.prepare(`INSERT INTO audit_logs(id,organization_id,actor_id,action,target_type,target_id,metadata_json)
+    SELECT ?,?,?,?, 'ticket_qr_card',?,? WHERE EXISTS(SELECT 1 FROM ticket_qr_card_requests WHERE id=? AND card_id=?)`)
+    .bind(auditId,auth.organizationId,auth.actorId,kind==="replacement"?"ticket.qr_replaced":"ticket.qr_card_issued",cardId,
+      JSON.stringify({eventId:event.id,attendeeId:attendee.id,ticketId:attendee.ticket_id,requestId,kind,reason}),requestDbId,cardId));
+  try { await c.env.DB.batch(sql); }
+  catch(error) {
+    const replay=await getPaperCardRequest(c.env.DB,auth.organizationId,event.id,requestId,auth.actorId);
+    if(replay) {
+      if(replay.payload_hash!==payloadHash||replay.action!==kind||replay.attendee_id!==attendee.id)return c.json({error:"idempotency_conflict"},409);
+      return buildPaperCardResponse(c,replay,qrToken,200);
+    }
+    const otherActor=await c.env.DB.prepare("SELECT created_by FROM ticket_qr_card_requests WHERE organization_id=? AND event_id=? AND request_id=?")
+      .bind(auth.organizationId,event.id,requestId).first<{created_by:string}>();
+    if(otherActor)return c.json({error:"idempotency_conflict"},409);
+    const duplicateToken=await c.env.DB.prepare("SELECT 1 FROM ticket_qr_tokens WHERE token_hash=?").bind(qrHash).first();
+    if(duplicateToken)return c.json({error:"qr_token_reused"},409);
+    throw error;
+  }
+  const created=await getPaperCardRequest(c.env.DB,auth.organizationId,event.id,requestId,auth.actorId);
+  if(!created)return c.json({error:"not_found"},404);
+  return buildPaperCardResponse(c,created,qrToken,201);
+}
+type PaperCardRequest = { id:string; request_id:string; payload_hash:string; created_by:string; action:string; attendee_id:string; ticket_id:string; card_id:string|null; card_kind:string|null; issued_at:string|null; expires_at:string|null; revoked_at:string|null; token_active:number; ticket_status:string; attendee_status:string; token_key_id:string; revoked_count:number; legacy_credential_invalidated:number; venue_id:string|null };
+async function getPaperCardRequest(db:D1Database,organizationId:string,eventId:string,requestId:string,actorId:string) {
+  return db.prepare(`SELECT r.id,r.request_id,r.payload_hash,r.created_by,r.action,r.attendee_id,r.ticket_id,r.card_id,
+      r.revoked_count,r.legacy_credential_invalidated,card.kind AS card_kind,card.issued_at,card.expires_at,card.revoked_at,
+      CASE WHEN q.id IS NOT NULL AND card.revoked_at IS NULL AND card.expires_at>CURRENT_TIMESTAMP THEN 1 ELSE 0 END AS token_active,
+      t.status AS ticket_status,a.status AS attendee_status,t.token_key_id,r.venue_id
+    FROM ticket_qr_card_requests r LEFT JOIN ticket_qr_cards card ON card.id=r.card_id
+    JOIN attendees a ON a.id=r.attendee_id JOIN tickets t ON t.id=r.ticket_id
+    LEFT JOIN attendee_presence p ON p.event_id=a.event_id AND p.attendee_id=a.id
+    LEFT JOIN ticket_qr_tokens q ON q.id=card.qr_token_id AND q.expires_at>CURRENT_TIMESTAMP
+    WHERE r.organization_id=? AND r.event_id=? AND r.request_id=? AND r.created_by=?`)
+    .bind(organizationId,eventId,requestId,actorId).first<PaperCardRequest>();
+}
+async function buildPaperCardResponse(c:Context<AppEnv>,row:PaperCardRequest,qrToken:string,status:number) {
+  if(!row.card_id||!row.card_kind||!row.issued_at||!row.expires_at)return c.json({error:"issuance_incomplete"},409);
+  const url=`${c.env.APP_ORIGIN.replace(/\/$/,"")}/public/tickets/${row.ticket_id}/check-in/${encodeURIComponent(qrToken)}`;
+  const png=await QRCodeServer.toBuffer(url,{type:"png",errorCorrectionLevel:"M",margin:4,width:640,color:{dark:"#000000",light:"#FFFFFF"}});
+  const active=Boolean(row.token_active&&row.ticket_status!=="cancelled"&&row.ticket_status!=="voided"&&row.attendee_status==="active");
+  return c.json({card:{id:row.card_id,kind:row.card_kind,url,qrPngDataUrl:pngDataUrl(new Uint8Array(png)),issued_at:row.issued_at,expires_at:row.expires_at,active},
+    ...(row.action==="replacement"?{revokedCount:row.revoked_count,legacyCredentialInvalidated:row.legacy_credential_invalidated===1}:{} )},status as ContentfulStatusCode);
+}
+async function proxyClaimResponse(db:D1Database,proxyClaimId:string) {
+  const parent=await db.prepare(`SELECT id,request_id,household_id,household_name_snapshot AS household_name,collector_id,
+      collector_name_snapshot AS collector_name,venue_id,outcome,created_at,reversed_at,reverse_reason
+    FROM distribution_proxy_claims WHERE id=?`).bind(proxyClaimId).first<Record<string,unknown>>();
+  if(!parent)return {error:"not_found"};
+  const rows=await db.prepare(`SELECT i.claim_id AS claimId,i.attendee_id AS attendeeId,i.attendee_name_snapshot AS attendeeName,
+      i.affiliation_snapshot AS affiliation,i.quantity,
+      CASE WHEN g.reversed_at IS NOT NULL THEN 'reversed' ELSE i.outcome END AS status,
+      i.used_after AS used,i.remaining_after AS remaining
+    FROM distribution_proxy_items i JOIN distribution_proxy_claims g ON g.id=i.proxy_claim_id
+    WHERE i.proxy_claim_id=? ORDER BY i.attendee_name_snapshot COLLATE NOCASE,i.attendee_id`).bind(proxyClaimId).all<Record<string,unknown>>();
+  return {outcome:parent.outcome,proxyClaim:{...parent,items:rows.results}};
+}
+function pngDataUrl(bytes:Uint8Array) {
+  let binary="";
+  for(let i=0;i<bytes.length;i+=0x8000)binary+=String.fromCharCode(...bytes.subarray(i,i+0x8000));
+  return `data:image/png;base64,${btoa(binary)}`;
+}
+function isCanonicalQrToken(value:string) {
+  if(!/^[A-Za-z0-9_-]{43}$/.test(value)||!/[AEIMQUYcgkosw048]$/.test(value))return false;
+  try{
+    const raw=atob(value.replace(/-/g,"+").replace(/_/g,"/")+"=");
+    const encoded=btoa(raw).replace(/\+/g,"-").replace(/\//g,"_").replace(/=+$/g,"");
+    return raw.length===32&&encoded===value;
+  }catch{return false;}
+}
 async function checkInVenueError(c: Context<AppEnv>, eventId: string, venueId: string | undefined) {
   if (venueId && !await c.env.DB.prepare("SELECT id FROM venues WHERE id = ? AND event_id = ?").bind(venueId, eventId).first()) return "invalid_venue";
   const auth = c.get("auth");
@@ -2286,6 +3556,14 @@ async function audit(db: D1Database, auth: OrganizerAuth, action: string, target
 
 type EventRow = { id: string; organization_id: string; name: string; status: string; archived_at?: string | null; registration_mode: string; capacity: number | null; timezone?: string; scheduling_enabled?: number; schedule_status?: string; starts_at?: string; ends_at?: string };
 type FieldRow = { id: string; field_key: string; field_type: string; required: number; options_json: string };
+type DistributionAttendee = { id: string; name: string; affiliation: string; venue_id: string | null; operation_venue_id:string|null; venue_name: string | null; ticket_id: string; qr_token_hash: string | null };
+type DistributionClaimRow = { id: string; request_id: string; payload_hash: string; outcome: "accepted" | "limit_reached"; used_after: number; remaining_after: number; quantity: number; attendee_id: string; venue_id: string | null; created_at: string };
+type PresenceRequestRow = {
+  id: string; organization_id: string; event_id: string; request_id: string; payload_hash: string;
+  attendee_id: string; ticket_id: string; action: "enter" | "exit"; venue_id: string; expected_revision: number | null;
+  created_by: string; outcome: "pending" | "accepted" | "state_conflict" | "revision_conflict"; movement_id: string | null;
+  result_state: "in" | "out"; result_venue_id: string | null; result_revision: number; result_updated_at: string; occurred_at: string;
+};
 
 export default {
   fetch: app.fetch,

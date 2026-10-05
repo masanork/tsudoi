@@ -1,4 +1,8 @@
 import { expect, test, type Locator } from "@playwright/test";
+import { verifyDistributionFlow } from "./operations-flow";
+import { verifyPresenceFlow } from "./presence-flow";
+import { verifyHouseholdFlow } from "./household-flow";
+import { verifyOfflineFlow } from "./offline-flow";
 
 async function fillAnswers(form: Locator, company: string) {
   await form.getByLabel("所属（必須）", { exact: true }).fill(company);
@@ -19,7 +23,9 @@ async function fillAnswers(form: Locator, company: string) {
 }
 
 test("completes Passkey setup, registration, roster reception, duplicate detection, and reversal", async ({ page, context }) => {
-  test.setTimeout(90_000);
+  test.setTimeout(180_000);
+  const runtimeErrors: string[] = [];
+  page.on("pageerror", (error) => runtimeErrors.push(error.message));
   const cdp = await context.newCDPSession(page);
   await cdp.send("WebAuthn.enable");
   await cdp.send("WebAuthn.addVirtualAuthenticator", { options: {
@@ -286,5 +292,10 @@ test("completes Passkey setup, registration, roster reception, duplicate detecti
         await expect(viewer.getByRole("button", { name: label, exact: true })).toHaveCount(0);
       }
     } finally { await viewerContext.close(); }
+    const operationsFixture = await verifyDistributionFlow(page, context);
+    const presenceFixture = await verifyPresenceFlow(page, context, operationsFixture);
+    const householdFixture = await verifyHouseholdFlow(page, context, presenceFixture);
+    await verifyOfflineFlow(page, context, householdFixture);
+    expect(runtimeErrors).toEqual([]);
   } finally { await participantContext.close(); }
 });

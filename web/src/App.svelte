@@ -2,6 +2,12 @@
   import { onDestroy, onMount, tick } from "svelte";
   import { startAuthentication, startRegistration } from "@simplewebauthn/browser";
   import QRCode from "qrcode";
+  import DistributionPanel from "./lib/DistributionPanel.svelte";
+  import PaperCardPanel from "./lib/PaperCardPanel.svelte";
+  import HouseholdPanel from "./lib/HouseholdPanel.svelte";
+  import PresencePanel from "./lib/PresencePanel.svelte";
+  import OfflinePanel from "./lib/OfflinePanel.svelte";
+  import { disableServiceWorker, purgeOfflineData, quarantineIfIdentityChanged, readOfflineState } from "./lib/offline-store";
   import FieldInputs from "./lib/FieldInputs.svelte";
   import type { FormAnswers, FormField } from "./lib/form-fields";
 
@@ -26,6 +32,7 @@
   let inviteMessage = "招待を確認しています。";
   let initialSetupRequired = false;
   let workspaceReady = false;
+  let offlineMode = false;
   let isAdministrator = false;
   let currentRole = "";
   let checkinBusy = false;
@@ -76,6 +83,7 @@
   let walkInSaving = false;
   let selectedStaffId = "";
   let selectedEventId = "";
+  let currentActorId = "";
   let schedule: { enabled: boolean; status: string; date: string | null; startsAt?: string | null; endsAt?: string | null; allDay?: boolean; timeZone?: string; readyToConfirm?: string[]; participants?: Array<{ displayName: string; role: string; answered: boolean }>; options: Array<{ id: string; date: string; note: string; yes: number; maybe: number; no: number; start?: string | null; end?: string | null; allDay?: boolean }> } | null = null;
   let scheduleInviteUrl = "";
   let scheduleDate = "";
@@ -169,9 +177,7 @@
     else if (ticketPage) void loadParticipantTicket();
     else if (registrationEventId) void loadRegistration();
     else if (scheduleEventId) { scheduleRespondentId = localStorage.getItem(`tsudoi-schedule-${scheduleEventId}`) ?? crypto.randomUUID(); localStorage.setItem(`tsudoi-schedule-${scheduleEventId}`, scheduleRespondentId); void loadPublicSchedule(); }
-    else {
-      void initializeOrganizer();
-    }
+    else { void bootOrganizer(); }
   });
   onDestroy(() => stopScanner());
 
@@ -179,12 +185,15 @@
     const response = await fetch(`/api${path}`, { ...init, credentials: "same-origin", headers: { "content-type": "application/json", ...init.headers } });
     const body = response.status === 204 ? null : await response.json();
     if (!response.ok) {
-      if (body?.outcome === "duplicate") throw new Error(`受付済みです。最初の受付: ${body.ticket?.checked_in_at ?? "時刻不明"} / 担当: ${body.ticket?.checked_in_by_display_name || "不明"}`);
-      if (body?.outcome === "rejected") throw new Error("このチケットは取消済み、または無効です。");
-      if (body?.error === "wrong_venue") throw new Error("この参加者の会場と受付会場が違います。受付会場を確認してください。");
-      throw new Error(body.message ?? body.error ?? "リクエストに失敗しました");
+      if (body?.outcome === "duplicate") throw apiError(`受付済みです。最初の受付: ${body.ticket?.checked_in_at ?? "時刻不明"} / 担当: ${body.ticket?.checked_in_by_display_name || "不明"}`, response.status, body.outcome);
+      if (body?.outcome === "rejected") throw apiError("このチケットは取消済み、または無効です。", response.status, body.outcome);
+      if (body?.error === "wrong_venue") throw apiError("この参加者の会場と受付会場が違います。受付会場を確認してください。", response.status, body.error);
+      throw apiError(body.message ?? body.error ?? "リクエストに失敗しました", response.status, body.error ?? body.outcome ?? "request_failed");
     }
     return body;
+  }
+  function apiError(message: string, status: number, code: string) {
+    return Object.assign(new Error(message), { status, code });
   }
   async function loadEvents() {
     try { events = await api("/events"); message = `${events.length} 件のイベントを読み込みました。`; }
@@ -234,9 +243,17 @@
       const setup = await status.json();
       if (setup.initialSetupRequired) { initialSetupRequired = true; screen = "setup"; return; }
       const session = await api("/session");
-      organizationId = session.organizationId; currentRole = session.role; isAdministrator = session.role === "owner" || session.role === "admin";
+      currentActorId = session.actorId ?? ""; organizationId = session.organizationId; currentRole = session.role; isAdministrator = session.role === "owner" || session.role === "admin";
+      if (currentActorId && organizationId) await quarantineIfIdentityChanged(currentActorId, organizationId);
       workspaceReady = true; screen = "home"; await Promise.all([loadEvents(), loadProfile(), loadApiTokens()]);
     } catch { screen = "setup"; setupMessage = "Passkey でログインしてください。"; }
+  }
+  async function bootOrganizer() {
+    try {
+      const offline = await readOfflineState();
+      if (offline.snapshot || offline.operations.length || offline.quarantinedIdentity) { offlineMode = true; return; }
+    } catch { /* regular online initialization can still continue */ }
+    await initializeOrganizer();
   }
   async function registerInitialAdministrator() {
     try {
@@ -250,11 +267,13 @@
       const response = await fetch("/api/setup/initial-admin/verify", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ challengeId: optionBody.challengeId, response: credential }) });
       const session = await response.json();
       if (!response.ok) throw new Error(session.message ?? session.error ?? "初期設定に失敗しました。");
+      const authenticated = await api("/session"); currentActorId = authenticated.actorId ?? ""; organizationId = authenticated.organizationId ?? session.organizationId ?? ""; currentRole = authenticated.role ?? session.role ?? "owner";
+      if (currentActorId && organizationId) await quarantineIfIdentityChanged(currentActorId, organizationId);
       isAdministrator = true; workspaceReady = true; screen = "home";
       await Promise.all([loadEvents(), loadProfile()]); message = "初期管理者を登録しました。まずはイベントを作成しましょう。";
     } catch (error) { setupMessage = error instanceof Error ? error.message : "Passkey を登録できませんでした。"; }
   }
-  function openEvent(eventId: string) { stopScanner(); csvColumns = []; csvRows = []; csvMapping = {}; csvPreview = null; csvDecisions = []; csvMessage = ""; confirmAttendee = null; editingAttendeeId = ""; editMessage = ""; checkinMessage = ""; ticketLinkMessage = ""; lastCheckinBy = ""; selectedEventId = eventId; screen = "event"; void selectEvent(eventId); }
+  function openEvent(eventId: string) { stopScanner(); csvColumns = []; csvRows = []; csvMapping = {}; csvPreview = null; csvDecisions = []; csvMessage = ""; confirmAttendee = null; editingAttendeeId = ""; editMessage = ""; checkinMessage = ""; ticketLinkMessage = ""; lastCheckinBy = ""; rosterAttendees = []; venues = []; selectedVenueId = ""; selectedEventId = eventId; screen = "event"; void selectEvent(eventId); }
   async function signIn() {
     try {
       if (!window.PublicKeyCredential) throw new Error("この端末は Passkey に対応していません。");
@@ -266,11 +285,23 @@
       const response = await fetch("/api/session/verify", { method: "POST", credentials: "same-origin", headers: { "content-type": "application/json" }, body: JSON.stringify({ challengeId: optionBody.challengeId, response: credential }) });
       const session = await response.json();
       if (!response.ok) throw new Error(session.message ?? session.error ?? "Passkey を確認できませんでした。");
-      organizationId = session.organizationId ?? organizationId; currentRole = session.role; isAdministrator = session.role === "owner" || session.role === "admin";
+      const authenticated = await api("/session"); currentActorId = authenticated.actorId ?? ""; organizationId = authenticated.organizationId ?? session.organizationId ?? organizationId; currentRole = authenticated.role ?? session.role; isAdministrator = currentRole === "owner" || currentRole === "admin";
+      if (currentActorId && organizationId) await quarantineIfIdentityChanged(currentActorId, organizationId);
       workspaceReady = true; screen = "home"; await Promise.all([loadEvents(), loadProfile()]);
     } catch (error) { setupMessage = error instanceof Error ? error.message : "Passkey でログインできませんでした。"; }
   }
-  async function signOut() { stopScanner(); await fetch("/api/session/logout", { method: "POST", credentials: "same-origin" }); workspaceReady = false; isAdministrator = false; currentRole = ""; events = []; screen = "setup"; setupMessage = "Passkey でログインしてください。"; }
+  async function signOut() {
+    try {
+      const offline = await readOfflineState();
+      if (offline.operations.length) { message = "未同期操作があります。オフライン受付画面で結果を同期するか、書き出してから明示的に消去してください。"; offlineMode = true; return; }
+      stopScanner(); await purgeOfflineData(); await disableServiceWorker();
+      const response = await fetch("/api/session/logout", { method: "POST", credentials: "same-origin" });
+      if (!response.ok) throw new Error("オンラインでログアウトを完了できませんでした。通信を確認して再試行してください。");
+      workspaceReady = false; isAdministrator = false; currentRole = ""; currentActorId = ""; organizationId = ""; events = []; screen = "setup"; offlineMode = false; setupMessage = "Passkey でログインしてください。";
+    } catch (error) { message = error instanceof Error ? error.message : "ログアウトできませんでした。"; }
+  }
+  function closeOfflinePanel() { offlineMode = false; if (!workspaceReady) void initializeOrganizer(); }
+  function openOfflinePanel() { offlineMode = true; }
   function goHome() { stopScanner(); confirmAttendee = null; editingAttendeeId = ""; screen = "home"; }
   async function loadParticipantTicket() {
     try {
@@ -308,7 +339,9 @@
       const body = await response.json();
       if (!response.ok) throw new Error(body.error ?? "cancellation_unavailable");
       participantMessage = "参加をキャンセルしました。"; await loadParticipantTicket();
-    } catch { participantMessage = "このチケットは現在キャンセルできません。"; }
+    } catch (error) { participantMessage = error instanceof Error && error.message === "attendee_present"
+      ? "在館中のためキャンセルできません。スタッフに退館の記録を依頼してください。"
+      : "このチケットは現在キャンセルできません。"; }
   }
   async function checkInTicketLink() {
     if (checkinBusy) return;
@@ -415,6 +448,7 @@
     }).catch(() => { csvColumns = []; csvRows = []; csvMapping = {}; csvMessage = "CSVをUTF-8で読み込めませんでした。"; });
   }
   function invalidateCsvPreview() { csvPreview = null; csvDecisions = []; if (csvMessage.startsWith("プレビュー:")) csvMessage = "列の対応を変更しました。プレビューをやり直してください。"; }
+  function setCsvMapping(key: string, value: string) { csvMapping = { ...csvMapping, [key]: value }; invalidateCsvPreview(); }
   function csvErrorText(error: string) {
     if (error === "name_required_or_too_long") return "氏名を確認してください。";
     if (error.startsWith("required:")) return `必須項目「${error.slice(9)}」を入力してください。`;
@@ -668,6 +702,8 @@
   {#if registrationMessage}<p class="notice" aria-live="polite">{registrationMessage}</p>{/if}
   {#if ticketQr}<section aria-labelledby="ticket-qr"><h2 id="ticket-qr">あなたの受付QR</h2><p>会場で提示してください。安全のため、他者へ転送しないでください。</p><img src={ticketQr} alt="受付用QRコード" width="320" height="320" /></section>{/if}
   {#if issuedTicket}<section aria-labelledby="passkey-registration"><h2 id="passkey-registration">Passkey を登録する</h2><p>この端末でチケットを安全に再表示できるようにします。PRF対応Passkeyでは、E2EE鍵の保護にも使用します。</p><button onclick={registerPasskey}>Passkey を登録</button>{#if passkeyMessage}<p class="notice" aria-live="polite">{passkeyMessage}</p>{/if}</section>{/if}
+{:else if offlineMode}
+  <OfflinePanel {api} onclose={closeOfflinePanel} onlogout={signOut} context={selectedEventId && currentActorId && organizationId ? { eventId: selectedEventId, eventName: events.find((event) => event.id === selectedEventId)?.name ?? "イベント", actorId: currentActorId, organizationId, role: currentRole, venues: venues.map(({ id, name }) => ({ id, name })) } : null} />
 {:else}
   {#if !workspaceReady || screen === "setup"}
     <header><p class="eyebrow">WELCOME TO TSUDOI</p><h1>tsudoi</h1><p>{initialSetupRequired ? "最初に、初期管理者を登録します。" : "Passkey でログインします。"}</p></header>
@@ -717,6 +753,7 @@
       </section>
     {:else}
       <section class="event-title"><h2>{events.find((event) => event.id === selectedEventId)?.name ?? "イベント管理"}</h2><p>必要な作業を選んでください。</p></section>
+      <button type="button" class="quiet" onclick={openOfflinePanel}>オフライン受付を開く</button>
       {#if schedule?.enabled && schedule.status !== "confirmed"}
         <section aria-labelledby="schedule-management"><h2 id="schedule-management">日程を調整</h2><p>候補日を選んで、参加者に回答してもらいます。</p>
           <p class="muted">共有用URL: <a href={`/events/${selectedEventId}/schedule`} target="_blank" rel="noreferrer">日程調整ページを開く</a></p>
@@ -729,7 +766,7 @@
         <section class="notice"><strong>日程確定済み</strong><p>{schedule.startsAt ? scheduleOptionLabel({ date: schedule.date ?? "", start: schedule.startsAt, end: schedule.endsAt, allDay: schedule.allDay }) : ""}</p><p class="muted">{schedule.allDay === false ? "この時刻を参加者へ案内できます。" : "時刻は参加者へ別途ご連絡ください。"}</p></section>
       {/if}
       {#if schedule?.enabled && schedule.status === "confirmed" && isAdministrator}<section aria-labelledby="announcement"><h2 id="announcement">参加者へ案内</h2><p>確定した日程や、時刻・場所の連絡をメールでまとめて送れます。</p><form onsubmit={(event) => { event.preventDefault(); void sendAnnouncement(); }}><label>件名<input bind:value={announcementSubject} placeholder="集合時刻と場所のご案内" required /></label><label>本文<textarea bind:value={announcementBody} placeholder="確定日、集合時刻、場所、持ち物など" required></textarea></label><button>参加者へ送信</button></form>{#if announcementMessage}<p class="notice">{announcementMessage}</p>{/if}</section>{/if}
-      <div class="management-grid"><a href="#roster">名簿を管理</a>{#if currentRole !== "viewer"}<a href="#check-in">QR 受付</a>{/if}{#if isAdministrator}<a href="#settings">申込フォーム設定</a>{/if}</div>
+      <div class="management-grid"><a href="#roster">名簿を管理</a><a href="#distribution">物品配布</a><a href="#presence">入退館管理</a><a href="#paper-cards">紙QRカード</a><a href="#households">世帯・代理受取</a>{#if currentRole !== "viewer"}<a href="#check-in">QR 受付</a>{/if}{#if isAdministrator}<a href="#settings">申込フォーム設定</a>{/if}</div>
       {#if isAdministrator}
         {@const currentEvent = events.find((event) => event.id === selectedEventId)}
         {#if currentEvent?.status === "draft"}<button class="quiet action" onclick={() => publishEvent(selectedEventId)}>イベントを公開する</button>{:else if currentEvent?.status === "published"}<button class="quiet action" onclick={() => closeEvent(selectedEventId)}>イベントを終了する</button>{/if}
@@ -743,11 +780,15 @@
       <dl class="metrics"><div><dt>申込</dt><dd>{metrics.registrations ?? 0}</dd></div><div><dt>発券</dt><dd>{metrics.issued ?? 0}</dd></div><div><dt>取消</dt><dd>{metrics.cancelled ?? 0}</dd></div><div><dt>受付済</dt><dd>{metrics.checked_in ?? 0}</dd></div><div><dt>未受付</dt><dd>{metrics.not_checked_in ?? 0}</dd></div></dl>
         </section>
       {/if}
+      {#key selectedEventId}<div id="distribution"><DistributionPanel eventId={selectedEventId} role={currentRole} {venues} attendees={rosterAttendees} {api} /></div>{/key}
+      {#key selectedEventId}<div id="paper-cards"><PaperCardPanel eventId={selectedEventId} eventName={events.find((event) => event.id === selectedEventId)?.name ?? "イベント"} role={currentRole} {venues} attendees={rosterAttendees} {api} /></div>{/key}
+      {#key selectedEventId}<div id="households"><HouseholdPanel eventId={selectedEventId} role={currentRole} {venues} attendees={rosterAttendees} {api} /></div>{/key}
+      {#key selectedEventId}<div id="presence"><PresencePanel eventId={selectedEventId} role={currentRole} {venues} {api} /></div>{/key}
       <section aria-labelledby="roster"><h2 id="roster">名簿を管理</h2><p class="muted">申込者と受付状態を確認できます。</p><form onsubmit={(event) => { event.preventDefault(); void loadRoster(selectedEventId); }}><label>検索<input bind:value={rosterQuery} placeholder="氏名またはメール" /></label><label>状態<select bind:value={rosterStatus}><option value="">すべて</option><option value="active">有効</option><option value="cancelled">取消</option></select></label><label>申込経路<select bind:value={rosterSource}><option value="">すべて</option><option value="public_form">事前申込</option><option value="walk_in">当日登録</option></select></label><label>会場<select bind:value={rosterVenueId}><option value="">すべて</option>{#each venues as venue}<option value={venue.id}>{venue.name}</option>{/each}</select></label><button>絞り込む</button></form>
       {#if ticketLinkMessage}<p class="notice" aria-live="polite">{ticketLinkMessage}</p>{/if}
       {#if isAdministrator}<section aria-labelledby="roster-import"><h3 id="roster-import">CSVから名簿を取り込む</h3><p class="muted">UTF-8 CSV、1 MB以下、データ100行・107列以下にしてください。CSV取込ではメールを送信しません。メールのない参加者は名簿から本人確認して受付してください。会場列は同じイベント内の会場名またはID、複数選択は「|」区切り、チェック項目は true / false、数値は有限の数で指定します。</p><label>CSVファイル<input type="file" accept=".csv,text/csv" disabled={!rosterReady} onchange={(event) => readCsvFile(event.currentTarget.files?.[0])} /></label>
-        {#if csvColumns.length}<div class="form-grid"><label>氏名列<select bind:value={csvMapping.name} onchange={invalidateCsvPreview}><option value="">列を選択</option>{#each csvColumns as column}<option value={column}>{column}</option>{/each}</select></label><label>所属列<select bind:value={csvMapping.affiliation} onchange={invalidateCsvPreview}><option value="">列を選択</option>{#each csvColumns as column}<option value={column}>{column}</option>{/each}</select></label><label>メール列<select bind:value={csvMapping.email} onchange={invalidateCsvPreview}><option value="">列を選択</option>{#each csvColumns as column}<option value={column}>{column}</option>{/each}</select></label><label>会場列<select bind:value={csvMapping.venueId} onchange={invalidateCsvPreview}><option value="">列を選択</option>{#each csvColumns as column}<option value={column}>{column}</option>{/each}</select></label>
-        {#each rosterFields as field}<label>{field.label}列<select bind:value={csvMapping[`answer:${field.field_key}`]} onchange={invalidateCsvPreview}><option value="">列を選択</option>{#each csvColumns as column}<option value={column}>{column}</option>{/each}</select></label>{/each}</div><button type="button" onclick={() => void previewCsv()}>プレビューを確認</button>{/if}
+        {#if csvColumns.length}<div class="form-grid"><label>氏名列<select value={csvMapping.name} onchange={(event) => setCsvMapping("name", event.currentTarget.value)}><option value="">列を選択</option>{#each csvColumns as column}<option value={column}>{column}</option>{/each}</select></label><label>所属列<select value={csvMapping.affiliation} onchange={(event) => setCsvMapping("affiliation", event.currentTarget.value)}><option value="">列を選択</option>{#each csvColumns as column}<option value={column}>{column}</option>{/each}</select></label><label>メール列<select value={csvMapping.email} onchange={(event) => setCsvMapping("email", event.currentTarget.value)}><option value="">列を選択</option>{#each csvColumns as column}<option value={column}>{column}</option>{/each}</select></label><label>会場列<select value={csvMapping.venueId} onchange={(event) => setCsvMapping("venueId", event.currentTarget.value)}><option value="">列を選択</option>{#each csvColumns as column}<option value={column}>{column}</option>{/each}</select></label>
+        {#each rosterFields as field}<label>{field.label}列<select value={csvMapping[`answer:${field.field_key}`]} onchange={(event) => setCsvMapping(`answer:${field.field_key}`, event.currentTarget.value)}><option value="">列を選択</option>{#each csvColumns as column}<option value={column}>{column}</option>{/each}</select></label>{/each}</div><button type="button" onclick={() => void previewCsv()}>プレビューを確認</button>{/if}
         {#if csvPreview}<p>{csvPreview.validCount} 行を取り込み可能</p><div class="table-scroll"><table><thead><tr><th>氏名</th><th>所属</th><th>メール</th><th>重複候補・判断</th></tr></thead><tbody>{#each csvPreview.rows as row, rowIndex}<tr><td>{row.values[csvColumns.indexOf(csvMapping.name)] ?? ""}</td><td>{row.values[csvColumns.indexOf(csvMapping.affiliation)] ?? ""}</td><td>{row.values[csvColumns.indexOf(csvMapping.email)] ?? ""}</td><td>{#if row.errors.length}<span>{row.errors.map(csvErrorText).join("、")}</span>{:else if row.duplicateCandidates.length}{#each row.duplicateCandidates as candidate}<p>既存候補: {candidate.name}{#if candidate.affiliation}・{candidate.affiliation}{/if}{#if candidate.venueName}・会場 {candidate.venueName}{/if}{#if candidate.email} ({candidate.email}){/if}</p>{/each}<select aria-label={`重複候補の扱い ${rowIndex + 1}行目`} bind:value={csvDecisions[rowIndex]}><option value="skip">取り込まない</option><option value="include">新規として登録</option></select>{:else}重複候補なし{/if}</td></tr>{/each}</tbody></table></div><button type="button" onclick={() => void commitCsv()}>取り込みを確定</button>{/if}
         {#if csvMessage}<p class="notice" aria-live="polite">{csvMessage}</p>{/if}</section>{/if}
       {#if rosterAttendees.length === 0}<p>登録者はいません。</p>{:else}<div class="table-scroll"><table><thead><tr><th>氏名</th><th>所属</th><th>メール</th><th>会場</th><th>チケット</th><th>受付操作</th>{#each rosterFields as field}<th>{field.label}</th>{/each}</tr></thead><tbody>{#each rosterAttendees as attendee}<tr><td>{attendee.name}</td><td>{attendee.affiliation ?? ""}</td><td>{attendee.email_normalized ?? ""}</td><td>{venues.find((venue) => venue.id === attendee.venue_id)?.name ?? ""}</td><td>{attendee.ticket_status}</td><td>{#if attendee.ticket_status === "issued" && currentRole !== "viewer"}<button class="quiet" onclick={() => requestAttendeeCheckin(attendee)}>受付</button>{:else if attendee.ticket_status === "checked_in" && isAdministrator}<button class="quiet" onclick={() => reverseCheckIn(attendee.ticket_id)}>受付取消</button>{/if}{#if isAdministrator && attendee.ticket_status === "issued" && attendee.email_normalized}<button class="quiet" onclick={() => void resendTicketLink(attendee.id)}>チケットを送信</button>{/if}{#if isAdministrator}<button class="quiet" disabled={!walkInFieldsReady} onclick={() => beginEdit(attendee)}>編集</button>{/if}</td>{#each rosterFields as field}<td>{answerText(attendee.answers[field.field_key])}</td>{/each}</tr>
