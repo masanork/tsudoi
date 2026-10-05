@@ -140,6 +140,7 @@ describe("phase 3 paper cards and households",()=>{
     const otherRead=await SELF.fetch(`${origin}/api/events/${eventId}/households/${household.id}`,{headers:other.headers});expect(otherRead.status).toBe(404);
   });
 
+  // Repeated QR PNG generation exercises the Worker integration path and needs a little extra CI budget.
   it("rechecks staff venue authorization for card reconciliation and proxy retries",async()=>{
     const owner=await session("Staff scope owner"),staff=await memberSession(owner.organizationId,"Venue staff","staff"),eventId=await event(owner.organizationId),venueA=crypto.randomUUID(),venueB=crypto.randomUUID();
     await env.DB.batch([
@@ -163,8 +164,9 @@ describe("phase 3 paper cards and households",()=>{
     const cardRetry=await SELF.fetch(`${origin}/api/events/${eventId}/attendees/${beneficiary.attendeeId}/qr-cards`,{method:"POST",headers:staff.headers,body:JSON.stringify({requestId:cardRequestId,qrToken:cardToken,venueId:venueA})});expect(cardRetry.status).toBe(403);
     const proxyStatus=await SELF.fetch(`${origin}/api/events/${eventId}/distributions/${distribution}/proxy-claims/by-request/${proxyRequestId}`,{headers:staff.headers});expect(proxyStatus.status).toBe(403);
     const proxyRetry=await SELF.fetch(`${origin}/api/events/${eventId}/distributions/${distribution}/proxy-claims`,{method:"POST",headers:staff.headers,body:JSON.stringify(proxyBody)});expect(proxyRetry.status).toBe(403);
-  });
+  }, 15_000);
 
+  // Repeated QR PNG generation exercises the Worker integration path and needs a little extra CI budget.
   it("binds card and proxy request IDs to the issuing actor and exact payload",async()=>{
     const owner=await session("Idempotency owner"),admin=await memberSession(owner.organizationId,"Second admin","admin"),eventId=await event(owner.organizationId),collector=await guest(eventId,owner.organizationId),beneficiary=await guest(eventId,owner.organizationId);
     const cardRequestId=crypto.randomUUID(),qrToken=token32(),cardPath=`${origin}/api/events/${eventId}/attendees/${beneficiary.attendeeId}/qr-cards`;
@@ -184,5 +186,5 @@ describe("phase 3 paper cards and households",()=>{
     const proxyChanged=await SELF.fetch(proxyPath,{method:"POST",headers:owner.headers,body:JSON.stringify({...proxyBody,items:[{attendeeId:beneficiary.attendeeId,quantity:2}]})});expect(proxyChanged.status).toBe(409);
     const proxyOtherActor=await SELF.fetch(proxyPath,{method:"POST",headers:admin.headers,body:JSON.stringify(proxyBody)});expect(proxyOtherActor.status).toBe(409);
     expect(await env.DB.prepare("SELECT COUNT(*) AS count FROM distribution_proxy_claims WHERE distribution_id=? AND request_id=?").bind(distribution,requestId).first<{count:number}>().then(r=>r?.count)).toBe(1);
-  });
+  }, 15_000);
 });

@@ -1,12 +1,12 @@
 # 本番反映・実環境確認ランブック
 
-この手順は次回の本番反映と、実機・実メール・OAuth/MCP 確認に使う。PR4・PNGメール修正を反映後、2026-10-05 07:24 JSTにCSVプレビュー定時削除のPR6マージcommit `aeff98c071a6e00f75899d3b6064a48e8dd612e8` を反映した。本番 Worker version は `96b5207f-1128-45f9-be1f-7b67bcee1325`（100%配信）、本番DBには `0001`〜`0004` が適用済み。[反映記録](releases/2026-10-05-production.md)を参照し、次回は作業直前に状態を再取得する。
+この手順は次回の本番反映と、実機・実メール・OAuth/MCP 確認に使う。2026-10-06 05:58 JSTに現場運用機能のPR8マージcommit `ddf08da328b4390a61713ab1cd84594fa9743aa1` を反映した。本番 Worker version は `9a0dc123-0407-4c63-ad83-97ec2ec9c236`（100%配信）、本番DBには `0001`〜`0007` が適用済み。[最新反映記録](releases/2026-10-06-field-operations.md)と[以前の履歴](releases/2026-10-05-production.md)を参照し、次回は作業直前に状態を再取得する。
 
 手順を実行する担当者は、本番操作の権限と時間帯を確認し、送信可能な検証用メールアドレスを用意する。実機、メール受信、実 OAuth/MCP クライアントの確認ができない場合は「未確認」と記録し、合格扱いにしない。
 
-### 次の現場運用機能リリース
+### 現場運用機能の配置と端末引継ぎ
 
-配布回・入退館・紙QR・世帯代理受取・通信断準備の変更は、[現場運用の仕様と検証記録](field-operations.md)を参照する。この変更の本番反映はまだ実施していない。既存DBへ `0005_distribution_claims.sql`、`0006_presence_tracking.sql`、`0007_field_operations.sql` を順に適用してから、同じリリースのWorkerと静的画面を出す。これらのテーブル・列を必要とするコードだけを先に出さない。
+配布回・入退館・紙QR・世帯代理受取・通信断準備の変更は、[現場運用の仕様と検証記録](field-operations.md)を参照する。本番では `0005_distribution_claims.sql`、`0006_presence_tracking.sql`、`0007_field_operations.sql` を順に適用してからWorkerと静的画面を配置済み。未適用の既存環境でもこの順を守り、これらのテーブル・列を必要とするコードだけを先に出さない。
 
 既存の単発受付済みチケットは入館中へ自動変換されない。現場で実際の在館者を確認して入館を記録してから、現在人数を運用に使う。QR追加発行と紛失再発行を職員へ説明し、旧形式v1の紛失再発行は旧本人リンクも無効になることを案内する。
 
@@ -16,7 +16,7 @@ Workerを旧版へ戻しても追加テーブルや履歴を削除しない。�
 
 ## 1. 対象と作業前確認
 
-1. `main` に PR4 のマージ commit `6bde4c1`、PNGメール修正commit `19500e0`、CSVプレビュー定時削除のPR6マージcommit `aeff98c` が含まれていることを確認し、作業ツリーが clean であることを確認する。
+1. `main` に PR4、PNGメール修正、PR6と現場運用機能PR8のマージcommit `ddf08da` が含まれていることを確認し、作業ツリーが clean であることを確認する。
 
    ```bash
    git switch main
@@ -26,6 +26,7 @@ Workerを旧版へ戻しても追加テーブルや履歴を削除しない。�
    git merge-base --is-ancestor 6bde4c1 HEAD
    git merge-base --is-ancestor 19500e0 HEAD
    git merge-base --is-ancestor aeff98c HEAD
+   git merge-base --is-ancestor ddf08da HEAD
    ```
 
    `git status --short` に出力がある場合は止め、対象を特定してから clean な checkout でやり直す。以降の記録には `git rev-parse HEAD` の完全な commit hash を使う。
@@ -66,9 +67,15 @@ node scripts/wrangler-env.mjs production d1 execute DB --remote --command "PRAGM
 node scripts/wrangler-env.mjs production d1 execute DB --remote --command "SELECT name FROM sqlite_master WHERE type='table' AND name='roster_import_previews';"
 ```
 
-migration 履歴には `0001_initial.sql`〜`0004_roster_edit_import.sql` があり、schema には `attendees.affiliation`、`attendees.revision` と `roster_import_previews` があることを確認する。適用前に `0004` が履歴にない場合は、実スキーマに `0004` の変更がすでに存在しないことも照合する。履歴とschemaが食い違う、想定外の migration がある、または対象DBを特定できない場合は停止してDB担当者に照合する。migration ファイルを編集・再採番して履歴を合わせてはならない。
+migration履歴には `0001_initial.sql`〜`0007_field_operations.sql` があり、schemaには既存の名簿列・CSVプレビューに加え、配布・入退館・世帯・紙QRの11テーブルと `distribution_claims.proxy_group_id` があることを確認する。次の読み取りで追加スキーマを照合する。
 
-この Worker は `0004` を必要とする。今回の本番では適用済み。未適用の別環境ではコードを出す前に適用する。適用済みDBで次のコマンドを実行しても、同じmigrationを再実行しない。
+```bash
+node scripts/wrangler-env.mjs production d1 execute DB --remote --command "SELECT name FROM sqlite_master WHERE type='table' AND name IN ('distributions','distribution_claims','attendee_presence','presence_requests','presence_movements','households','household_memberships','distribution_proxy_claims','distribution_proxy_items','ticket_qr_cards','ticket_qr_card_requests') ORDER BY name; SELECT name FROM pragma_table_info('distribution_claims') WHERE name='proxy_group_id';"
+```
+
+未適用migrationの変更が履歴より先に実スキーマへ存在していないことも照合する。履歴とschemaが食い違う、想定外のmigrationがある、または対象DBを特定できない場合は停止してDB担当者に照合する。migrationファイルを編集・再採番して履歴を合わせてはならない。
+
+このWorkerは `0001`〜`0007` を必要とする。本番では適用済み。未適用の既存環境ではコードを出す前に適用する。適用済みDBで次のコマンドを実行しても、同じmigrationを再実行しない。
 
 ```bash
 npm run db:migrate:production
@@ -78,7 +85,7 @@ node scripts/wrangler-env.mjs production d1 execute DB --remote --command "PRAGM
 node scripts/wrangler-env.mjs production d1 execute DB --remote --command "SELECT name FROM sqlite_master WHERE type='table' AND name='roster_import_previews';"
 ```
 
-一覧が `No migrations to apply!` であることに加え、migration履歴とschemaの双方で `0004` の適用を確認する。`0004` は `attendees` に `affiliation` と `revision` を追加し、`roster_import_previews` テーブルと期限 index を追加する additive migration である。列やテーブルを落とす down migration はない。適用中のエラー、または履歴と実DBの不一致があればデプロイを止め、migration を手作業で再実行・修正しない。[D1 migrations の履歴と適用方法](https://developers.cloudflare.com/d1/reference/migrations/)
+一覧が `No migrations to apply!` であることに加え、migration履歴とschemaの双方で `0001`〜`0007` の適用を確認する。適用後も上記の追加スキーマ照合を実行する。`0004` は名簿列とCSVプレビュー、`0005`〜`0007` は配布・入退館・紙QR・世帯のテーブルと索引、nullableの代理受取関連列を追加する。列やテーブルを落とすdown migrationはない。適用中のエラー、または履歴と実DBの不一致があればデプロイを止め、migrationを手作業で再実行・修正しない。[D1 migrations の履歴と適用方法](https://developers.cloudflare.com/d1/reference/migrations/)
 
 新規環境を作る場合は、先に一度デプロイして Wrangler に D1 等のリソースを作成させ、その後 `npm run db:migrate:production` を実行し、全 migration の適用を確認してからアプリの利用を始める。既存本番の順序とは異なる。
 
@@ -174,14 +181,16 @@ Worker の不具合なら、確認済みの直前 production version を Cloudfl
 
 rollback 先が active になる前にデータ構造の互換性を確認する。どちらの方法でも戻した Git commit と active version ID を記録する。復旧後に health・metadata・ログイン・名簿・受付を再確認する。
 
-現在の直前versionは `7586923b-24e7-4187-83df-cc2e888e32d4`（PNG修正、定時削除導入前）。Cron設定はWorker versionのrollbackでは戻らない。`scheduled()`のない版へ戻す前に対象環境のWrangler設定の `triggers.crons` を `[]` にし、`node scripts/wrangler-env.mjs production triggers deploy` で反映する。Triggers設定でCronがないことを照合し、設定変更の伝播中は旧handlerへ切り替えず、停止を確認してからWorkerをrollbackする。handler対応版を復元するまでCronを無効に保つ。PNG修正の直前versionは `71dcc52b-a3db-4e4c-a54a-56ea5c98b7ef`（PR4、SVG添付）。さらに以前のversion `e9dbff5c-488f-4c54-ace4-393f3906a523` は元commitが不明なので、互換性未確認のまま戻さない。新規 `possession-v2` チケットを扱えることを確認したコードを選ぶ。
+現在の直前versionは `96b5207f-1128-45f9-be1f-7b67bcee1325`（PR6、定時削除対応）。この版へのrollbackでは追加スキーマを保持し、端末の未同期操作を先に保全する。
+
+定時削除導入前の `7586923b-24e7-4187-83df-cc2e888e32d4` へさらに戻す場合、Cron設定はWorker versionのrollbackでは戻らない。`scheduled()`のない版へ戻す前に対象環境のWrangler設定の `triggers.crons` を `[]` にし、`node scripts/wrangler-env.mjs production triggers deploy` で反映する。Triggers設定でCronがないことを照合し、設定変更の伝播中は旧handlerへ切り替えず、停止を確認してからWorkerをrollbackする。handler対応版を復元するまでCronを無効に保つ。PNG修正の直前versionは `71dcc52b-a3db-4e4c-a54a-56ea5c98b7ef`（PR4、SVG添付）。さらに以前のversion `e9dbff5c-488f-4c54-ace4-393f3906a523` は元commitが不明なので、互換性未確認のまま戻さない。新規 `possession-v2` チケットを扱えることを確認したコードを選ぶ。
 
 復旧時はhandler対応版のactive配信を先に確認し、対象環境の `triggers.crons` を `["*/5 * * * *"]` に戻して `node scripts/wrangler-env.mjs production triggers deploy` を再実行する。Triggers設定と伝播後の `import_preview_cleanup` 成功ログを確認してから、定時削除の復旧を完了とする。Worker versionの切替だけでCronが再開したと判断しない。
 
-**`0004` はロールバック時にも保持する。** migration を戻す SQL は実行せず、列・テーブル・履歴を削除しない。`0004` の追加は旧アプリとの後方互換を保つための additive schema change である。データベース migration の後戻しは Worker の rollback に含めない。将来の schema cleanup が必要なら、別リリースで利用状況を確認し、独立した計画・レビューを経て行う。
+**`0004`〜`0007` はロールバック時にも保持する。** migrationを戻すSQLは実行せず、列・テーブル・履歴を削除しない。これらは追加的なスキーマ変更であり、データベースmigrationの後戻しはWorkerのrollbackに含めない。将来のschema cleanupが必要なら、別リリースで利用状況を確認し、独立した計画・レビューを経て行う。
 
 バージョン rollback 後に新コードで作成された名簿取込・所属情報のデータを旧版が読み書きする可能性がある。旧版で期待動作しないと判明した場合、データを削除・変換せず、互換コードの再デプロイまたは前進修正を選ぶ。参加者・チケット・回答・監査ログに対する手作業の変更を行わない。
 
 ## 完了記録
 
-各項目を「合格」「失敗」「未確認」のいずれかで記録し、未確認は残件として明示する。少なくとも Git commit、Worker version、`0001`〜`0004` の migration 状態、health/metadata、主催者ログイン・名簿・受付、iOS、Android、実メール受信、実 OAuth/MCP を含める。認証情報、秘密値、メールアドレス、参加者情報は記録しない。
+各項目を「合格」「失敗」「未確認」のいずれかで記録し、未確認は残件として明示する。少なくともGit commit、Worker version、`0001`〜`0007` のmigration状態、health/metadata、主催者ログイン・名簿・受付と現場運用API、iOS、Android、実メール受信、実OAuth/MCPを含める。検証用セッションでのAPI確認と実機Passkeyによるログインは区別する。認証情報、秘密値、メールアドレス、参加者情報は記録しない。
