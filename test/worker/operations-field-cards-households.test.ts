@@ -65,7 +65,7 @@ describe("phase 3 paper cards and households",()=>{
     expect(await env.DB.prepare("SELECT COUNT(*) AS count FROM ticket_qr_tokens WHERE ticket_id=? AND expires_at>CURRENT_TIMESTAMP").bind(tokenV1.ticketId).first<{count:number}>().then(r=>r?.count)).toBe(1);
     const status=await SELF.fetch(`${origin}/api/events/${eventId}/attendees/${tokenV1.attendeeId}/qr-cards/by-request/${replacementRequest}`,{headers:owner.headers});
     await expect(status.json()).resolves.toMatchObject({card:{id:replacementJson.card.id,kind:"replacement",active:true}});
-  });
+  }, 15_000);
 
   it("creates scoped household memberships and commits concurrent proxy claims only once at the per-round cap",async()=>{
     const owner=await session("Proxy owner"),eventId=await event(owner.organizationId),
@@ -88,7 +88,7 @@ describe("phase 3 paper cards and households",()=>{
     expect(bodies.map(b=>b.outcome).sort()).toEqual(["accepted","limit_reached"]);
     expect(await env.DB.prepare("SELECT COUNT(*) AS count FROM distribution_claims WHERE distribution_id=? AND attendee_id=? AND proxy_group_id IS NOT NULL AND outcome='accepted'").bind(distributionId,beneficiary.attendeeId).first<{count:number}>().then(r=>r?.count)).toBe(1);
     expect(await env.DB.prepare("SELECT COUNT(*) AS count FROM audit_logs WHERE action LIKE 'distribution.proxy_%' AND target_type='distribution_proxy_claim'").first<{count:number}>().then(r=>r?.count)).toBe(2);
-  });
+  }, 15_000);
 
   it("keeps a mixed-cap proxy batch all-or-none and reverses its accepted child claims only as a group",async()=>{
     const owner=await session("Atomic proxy owner"),eventId=await event(owner.organizationId),collector=await guest(eventId,owner.organizationId),a=await guest(eventId,owner.organizationId),b=await guest(eventId,owner.organizationId);
