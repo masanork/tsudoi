@@ -1,6 +1,6 @@
 # 本番反映・実環境確認ランブック
 
-この手順は次回の本番反映と、実機・実メール・OAuth/MCP 確認に使う。2026-10-06 05:58 JSTに現場運用機能のPR8マージcommit `ddf08da328b4390a61713ab1cd84594fa9743aa1` を反映した。本番 Worker version は `9a0dc123-0407-4c63-ad83-97ec2ec9c236`（100%配信）、本番DBには `0001`〜`0007` が適用済み。[最新反映記録](releases/2026-10-06-field-operations.md)と[以前の履歴](releases/2026-10-05-production.md)を参照し、次回は作業直前に状態を再取得する。
+この手順は次回の本番反映と、実機・実メール・OAuth/MCP 確認に使う。2026-10-06 07:26 JSTにオフライン配布のタブ間残数更新を直したPR9マージcommit `4018bcdaec13f961f0c7c35ab3691e898ac90d57` を反映した。本番Worker versionは `e6227e46-f2dc-4c5f-b27d-6a92d1ce7b12`（100%配信）、本番DBには `0001`〜`0007` が適用済み。[最新反映記録](releases/2026-10-06-field-operations.md)と[以前の履歴](releases/2026-10-05-production.md)を参照し、次回は作業直前に状態を再取得する。
 
 手順を実行する担当者は、本番操作の権限と時間帯を確認し、送信可能な検証用メールアドレスを用意する。実機、メール受信、実 OAuth/MCP クライアントの確認ができない場合は「未確認」と記録し、合格扱いにしない。
 
@@ -181,7 +181,7 @@ Worker の不具合なら、確認済みの直前 production version を Cloudfl
 
 rollback 先が active になる前にデータ構造の互換性を確認する。どちらの方法でも戻した Git commit と active version ID を記録する。復旧後に health・metadata・ログイン・名簿・受付を再確認する。
 
-現在の直前versionは `96b5207f-1128-45f9-be1f-7b67bcee1325`（PR6、定時削除対応）。この版へのrollbackでは追加スキーマを保持し、端末の未同期操作を先に保全する。
+現在の直前versionは `9a0dc123-0407-4c63-ad83-97ec2ec9c236`（PR8、現場運用機能）。この版へ戻すと、同一ブラウザの別タブで記録した配布の残数が画面へ反映されない経路も戻る。端末の未同期操作を先に保全し、画面を再読込して使用版を確認する。さらに以前の `96b5207f-1128-45f9-be1f-7b67bcee1325` はPR6の定時削除対応版で、現場運用画面がない。いずれのrollbackでも追加スキーマを保持する。
 
 定時削除導入前の `7586923b-24e7-4187-83df-cc2e888e32d4` へさらに戻す場合、Cron設定はWorker versionのrollbackでは戻らない。`scheduled()`のない版へ戻す前に対象環境のWrangler設定の `triggers.crons` を `[]` にし、`node scripts/wrangler-env.mjs production triggers deploy` で反映する。Triggers設定でCronがないことを照合し、設定変更の伝播中は旧handlerへ切り替えず、停止を確認してからWorkerをrollbackする。handler対応版を復元するまでCronを無効に保つ。PNG修正の直前versionは `71dcc52b-a3db-4e4c-a54a-56ea5c98b7ef`（PR4、SVG添付）。さらに以前のversion `e9dbff5c-488f-4c54-ace4-393f3906a523` は元commitが不明なので、互換性未確認のまま戻さない。新規 `possession-v2` チケットを扱えることを確認したコードを選ぶ。
 
