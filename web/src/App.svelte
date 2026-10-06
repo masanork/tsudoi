@@ -7,6 +7,7 @@
   import HouseholdPanel from "./lib/HouseholdPanel.svelte";
   import PresencePanel from "./lib/PresencePanel.svelte";
   import OfflinePanel from "./lib/OfflinePanel.svelte";
+  import { QrVideoScanner } from "./lib/qr-scanner";
   import { disableServiceWorker, purgeOfflineData, quarantineIfIdentityChanged, readOfflineState } from "./lib/offline-store";
   import FieldInputs from "./lib/FieldInputs.svelte";
   import type { FormAnswers, FormField } from "./lib/form-fields";
@@ -69,7 +70,7 @@
   let scannerActive = false;
   let scannerLatchedValue = "";
   let scannerVideo: HTMLVideoElement;
-  let scannerStream: MediaStream | null = null;
+  let qrScanner: QrVideoScanner | null = null;
   let venues: Array<{ id: string; name: string; address: string }> = [];
   let selectedVenueId = "";
   let newVenueName = "";
@@ -360,34 +361,29 @@
     finally { checkinBusy = false; }
   }
   async function startScanner() {
-    const browser = window as Window & { BarcodeDetector?: new (options: { formats: string[] }) => { detect: (video: HTMLVideoElement) => Promise<Array<{ rawValue: string }>> } };
-    if (!browser.BarcodeDetector) { checkinMessage = "このブラウザーではカメラ読み取りに対応していません。QR のリンクを貼り付けてください。"; return; }
-    try {
-      scannerStream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: "environment" }, audio: false });
-      scannerActive = true;
-      await tick();
-      scannerVideo.srcObject = scannerStream;
-      await scannerVideo.play();
-      const detector = new browser.BarcodeDetector({ formats: ["qr_code"] });
-      const scan = async () => {
-        if (!scannerActive) return;
-        try {
-          const codes = await detector.detect(scannerVideo);
-          const scanned = codes[0]?.rawValue ?? "";
-          if (!scanned) scannerLatchedValue = "";
-          else if (scanned !== scannerLatchedValue && !checkinBusy) { scannerLatchedValue = scanned; ticketLink = scanned; await checkInTicketLink(); }
-        } catch { /* keep scanning */ }
-        if (scannerActive) requestAnimationFrame(() => void scan());
-      };
-      void scan();
-    } catch { stopScanner(); checkinMessage = "カメラを開けませんでした。QR のリンクを貼り付けてください。"; }
+    if (scannerActive) return;
+    const scanner = new QrVideoScanner();
+    qrScanner = scanner;
+    scannerActive = true;
+    scannerLatchedValue = "";
+    await tick();
+    if (qrScanner !== scanner || !scannerActive) return;
+    await scanner.start(scannerVideo, async (scanned) => {
+      if (qrScanner !== scanner || !scannerActive) return;
+      if (!scanned) scannerLatchedValue = "";
+      else if (scanned !== scannerLatchedValue && !checkinBusy) { scannerLatchedValue = scanned; ticketLink = scanned; await checkInTicketLink(); }
+    }, () => {
+      if (qrScanner !== scanner) return;
+      qrScanner = null; scannerActive = false;
+      checkinMessage = "カメラを開けませんでした。QR のリンクを貼り付けてください。";
+    });
   }
   function stopScanner() {
     scannerActive = false;
     scannerLatchedValue = "";
-    scannerStream?.getTracks().forEach((track) => track.stop());
-    scannerStream = null;
-    if (scannerVideo) scannerVideo.srcObject = null;
+    const scanner = qrScanner;
+    qrScanner = null;
+    scanner?.stop();
   }
   async function checkInAttendee(attendeeId: string) {
     if (checkinBusy) return;
@@ -809,7 +805,7 @@
       </section>{/if}
       {#if currentRole !== "viewer"}<section aria-labelledby="check-in"><h2 id="check-in">QR 受付</h2>
     {#if venues.length > 0}<label>受付会場<select bind:value={selectedVenueId}>{#each venues as venue}<option value={venue.id}>{venue.name}</option>{/each}</select></label>{/if}
-    <button class="quiet" onclick={scannerActive ? stopScanner : startScanner}>{scannerActive ? "カメラを閉じる" : "カメラで QR を読む"}</button>{#if scannerActive}<video bind:this={scannerVideo} playsinline aria-label="QR 読み取り用カメラ"></video>{/if}
+    <button class="quiet" onclick={scannerActive ? stopScanner : startScanner}>{scannerActive ? "カメラを閉じる" : "カメラで QR を読む"}</button>{#if scannerActive}<video bind:this={scannerVideo} playsinline muted aria-label="QR 読み取り用カメラ"></video>{/if}
     <p>チケット QR から読み取ったリンクを貼り付けてください。</p>
     <form onsubmit={(event) => { event.preventDefault(); void checkInTicketLink(); }}>
       <label>チケットリンク<input bind:value={ticketLink} type="url" inputmode="url" required /></label>

@@ -1,4 +1,5 @@
 import { expect, test, type Locator } from "@playwright/test";
+import QRCode from "qrcode";
 import { verifyDistributionFlow } from "./operations-flow";
 import { verifyPresenceFlow } from "./presence-flow";
 import { verifyHouseholdFlow } from "./household-flow";
@@ -173,24 +174,147 @@ test("completes Passkey setup, registration, roster reception, duplicate detecti
 
     // Simulate camera input to verify continuous scanning without camera hardware.
     await page.evaluate((initialQr) => {
-      const camera = window as Window & { BarcodeDetector?: unknown; testQr: string; testDetections: number };
+      const camera = window as Window & { BarcodeDetector?: unknown; testQr: string; testDetections: number; testOriginalPlay: typeof HTMLMediaElement.prototype.play };
       camera.testQr = initialQr; camera.testDetections = 0;
       camera.BarcodeDetector = class { async detect() { camera.testDetections++; return [{ rawValue: camera.testQr }]; } };
       navigator.mediaDevices.getUserMedia = async () => new MediaStream();
+      camera.testOriginalPlay = HTMLMediaElement.prototype.play;
       HTMLMediaElement.prototype.play = async () => {};
     }, `http://localhost:4173/public/tickets/${registration.ticketId}/check-in/${registration.qrToken}`);
     let cameraRequests = 0;
     const cameraRequestListener = (request: import("@playwright/test").Request) => {
       if (request.method() === "POST" && /\/api\/tickets\/[^/]+\/check-in$/.test(request.url())) cameraRequests++;
     };
+    const checkinRoute = /\/api\/tickets\/[^/]+\/check-in$/;
+    let releaseFirstCheckin!: () => void;
+    let markFirstCheckinSeen!: () => void;
+    const firstCheckinGate = new Promise<void>((resolve) => { releaseFirstCheckin = resolve; });
+    const firstCheckinSeen = new Promise<void>((resolve) => { markFirstCheckinSeen = resolve; });
+    const checkedInTokens: string[] = [];
+    let holdFirstCheckin = true;
+    await page.route("**/api/tickets/*/check-in", async (route) => {
+      checkedInTokens.push(route.request().postDataJSON().ticketToken);
+      if (holdFirstCheckin) {
+        holdFirstCheckin = false;
+        markFirstCheckinSeen();
+        await firstCheckinGate;
+      }
+      await route.continue();
+    });
     page.on("request", cameraRequestListener);
-    await page.getByRole("button", { name: "カメラで QR を読む", exact: true }).click();
-    await expect.poll(() => page.evaluate(() => (window as Window & { testDetections: number }).testDetections)).toBeGreaterThan(3);
-    expect(cameraRequests).toBe(1);
-    await page.evaluate((qr) => { (window as Window & { testQr: string }).testQr = qr; }, `http://localhost:4173/public/tickets/${(await saved.json()).ticketId}/check-in/${(await saved.json()).qrToken}`);
-    await expect.poll(() => cameraRequests).toBe(2);
-    await page.getByRole("button", { name: "カメラを閉じる", exact: true }).click();
+    try {
+      const firstRequest = page.waitForRequest((request) => request.method() === "POST" && checkinRoute.test(new URL(request.url()).pathname), { timeout: 10_000 });
+      await page.getByRole("button", { name: "カメラで QR を読む", exact: true }).click();
+      await firstRequest.catch(async (error) => {
+        const videoState = await page.locator("video").evaluate((video) => ({ width: video.videoWidth, height: video.videoHeight, readyState: video.readyState, paused: video.paused }));
+        throw new Error(`最初のQR受付POSTが10秒以内に届きませんでした。video=${JSON.stringify(videoState)}; ${String(error)}`);
+      });
+      await firstCheckinSeen;
+      const detectionsWhileBlocked = await page.evaluate(() => (window as Window & { testDetections: number }).testDetections);
+      const savedTicket = await saved.json();
+      await page.evaluate((qr) => { (window as Window & { testQr: string }).testQr = qr; }, `http://localhost:4173/public/tickets/${savedTicket.ticketId}/check-in/${savedTicket.qrToken}`);
+      await page.waitForTimeout(400);
+      expect(await page.evaluate(() => (window as Window & { testDetections: number }).testDetections)).toBe(detectionsWhileBlocked);
+      expect(cameraRequests).toBe(1);
+
+      const secondResponse = page.waitForResponse((response) => response.request().method() === "POST" && checkinRoute.test(new URL(response.url()).pathname), { timeout: 10_000 });
+      releaseFirstCheckin();
+      await expect.poll(() => cameraRequests, { timeout: 10_000 }).toBe(2);
+      expect(checkedInTokens).toEqual([registration.qrToken, savedTicket.qrToken]);
+      await secondResponse;
+      const detectionsAfterSecondRequest = await page.evaluate(() => (window as Window & { testDetections: number }).testDetections);
+      await expect.poll(() => page.evaluate(() => (window as Window & { testDetections: number }).testDetections), { timeout: 5_000 }).toBeGreaterThanOrEqual(detectionsAfterSecondRequest + 3);
+      expect(cameraRequests).toBe(2);
+    } finally {
+      releaseFirstCheckin();
+      const closeCamera = page.getByRole("button", { name: "カメラを閉じる", exact: true });
+      if (await closeCamera.count()) await closeCamera.click({ timeout: 1_000 }).catch(() => {});
+      await page.unroute("**/api/tickets/*/check-in");
+    }
+    await page.evaluate(() => {
+      const camera = window as Window & { testOriginalPlay: typeof HTMLMediaElement.prototype.play };
+      HTMLMediaElement.prototype.play = camera.testOriginalPlay;
+    });
     page.off("request", cameraRequestListener);
+
+    // Exercise the canvas/jsQR path with a real QR PNG when native QR decoding
+    // is absent, does not advertise QR support, or fails during construction/detection.
+    const fallbackQrLink = `http://localhost:4173/public/tickets/${(await saved.json()).ticketId}/check-in/${(await saved.json()).qrToken}`;
+    const fallbackPng = await QRCode.toDataURL(fallbackQrLink, { width: 600, margin: 4 });
+    await page.evaluate(async (png) => {
+      const image = new Image(); image.src = png; await image.decode();
+      const canvas = document.createElement("canvas"); canvas.width = 960; canvas.height = 720;
+      const context = canvas.getContext("2d"); if (!context) throw new Error("canvas unavailable");
+      context.fillStyle = "white"; context.fillRect(0, 0, canvas.width, canvas.height);
+      context.drawImage(image, (canvas.width - 600) / 2, (canvas.height - 600) / 2, 600, 600);
+      const camera = window as Window & { testQrCanvas: HTMLCanvasElement; testCameraStream: () => MediaStream; BarcodeDetector?: unknown };
+      camera.testQrCanvas = canvas; camera.BarcodeDetector = undefined;
+      camera.testCameraStream = () => {
+        const drawFrame = () => context.drawImage(image, (canvas.width - 600) / 2, (canvas.height - 600) / 2, 600, 600);
+        const stream = canvas.captureStream(30);
+        const track = stream.getVideoTracks()[0];
+        const timer = window.setInterval(() => {
+          if (track.readyState === "ended") { window.clearInterval(timer); return; }
+          drawFrame();
+        }, 100);
+        track.addEventListener("ended", () => window.clearInterval(timer), { once: true });
+        return stream;
+      };
+      navigator.mediaDevices.getUserMedia = async () => camera.testCameraStream();
+    }, fallbackPng);
+    const waitForFallbackCheckin = async () => {
+      const request = page.waitForRequest((candidate) => candidate.method() === "POST" && /\/api\/tickets\/[^/]+\/check-in$/.test(candidate.url()), { timeout: 10_000 });
+      await page.getByRole("button", { name: "カメラで QR を読む", exact: true }).click();
+      try {
+        const checkin = await request.catch(async (error) => {
+          const videoState = await page.locator("video").evaluate((video) => ({ width: video.videoWidth, height: video.videoHeight, readyState: video.readyState, paused: video.paused }));
+          throw new Error(`canvas/jsQRの受付POSTが10秒以内に届きませんでした。video=${JSON.stringify(videoState)}; ${String(error)}`);
+        });
+        expect(checkin.postDataJSON()).toMatchObject({ ticketToken: (await saved.json()).qrToken });
+      } finally {
+        const closeCamera = page.getByRole("button", { name: "カメラを閉じる", exact: true });
+        if (await closeCamera.count()) await closeCamera.click({ timeout: 1_000 }).catch(() => {});
+      }
+    };
+    await waitForFallbackCheckin();
+
+    await page.evaluate(() => {
+      const camera = window as Window & { testCameraStream: () => MediaStream; BarcodeDetector?: unknown };
+      camera.BarcodeDetector = class { static async getSupportedFormats() { return ["code_128"]; } };
+      navigator.mediaDevices.getUserMedia = async () => camera.testCameraStream();
+    });
+    await waitForFallbackCheckin();
+
+    await page.evaluate(() => {
+      const camera = window as Window & { testCameraStream: () => MediaStream; BarcodeDetector?: unknown };
+      camera.BarcodeDetector = class { static async getSupportedFormats() { return ["qr_code"]; } constructor() { throw new Error("native constructor failed"); } };
+      navigator.mediaDevices.getUserMedia = async () => camera.testCameraStream();
+    });
+    await waitForFallbackCheckin();
+
+    await page.evaluate(() => {
+      const camera = window as Window & { testCameraStream: () => MediaStream; BarcodeDetector?: unknown };
+      camera.BarcodeDetector = class { static async getSupportedFormats() { return ["qr_code"]; } async detect() { throw new Error("native detect failed"); } };
+      navigator.mediaDevices.getUserMedia = async () => camera.testCameraStream();
+    });
+    await waitForFallbackCheckin();
+
+    // Stopping while permission is pending must stop a stream delivered late.
+    await page.evaluate(() => {
+      const camera = window as Window & { testCameraStream: () => MediaStream; testResolveCamera: (stream: MediaStream) => void; testLateTrack: MediaStreamTrack; testLateStream: MediaStream };
+      const stream = camera.testCameraStream();
+      camera.testLateStream = stream; camera.testLateTrack = stream.getVideoTracks()[0];
+      navigator.mediaDevices.getUserMedia = () => new Promise((resolve) => { camera.testResolveCamera = resolve; });
+    });
+    await page.getByRole("button", { name: "カメラで QR を読む", exact: true }).click();
+    await page.getByRole("button", { name: "カメラを閉じる", exact: true }).click();
+    await page.evaluate(() => { const camera = window as Window & { testLateTrack: MediaStreamTrack; testLateStream: MediaStream; testResolveCamera: (stream: MediaStream) => void }; camera.testResolveCamera(camera.testLateStream); });
+    await expect.poll(() => page.evaluate(() => (window as Window & { testLateTrack: MediaStreamTrack }).testLateTrack.readyState)).toBe("ended");
+
+    await page.evaluate(() => { navigator.mediaDevices.getUserMedia = async () => { throw new Error("camera permission denied"); }; });
+    await page.getByRole("button", { name: "カメラで QR を読む", exact: true }).click();
+    await expect(page.getByText("カメラを開けませんでした。QR のリンクを貼り付けてください。", { exact: true })).toBeVisible();
+    await expect(page.getByRole("button", { name: "カメラで QR を読む", exact: true })).toBeEnabled();
 
     // Use a separate event without required fields for CSV mapping and duplicates.
     const csvEventResponse = await context.request.post("/api/events", { data: {
