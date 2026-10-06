@@ -507,15 +507,42 @@ describe("Worker D1 roster flow", () => {
       SELF.fetch(`https://tsudoi.test/api/events/${eventId}/attendees/${attendeeId}/check-in`, { method: "POST", headers: auth, body: JSON.stringify({ venueId: venueA }) }),
       SELF.fetch(`https://tsudoi.test/api/events/${eventId}/attendees/${attendeeId}`, { method: "PATCH", headers: auth, body: JSON.stringify({ revision: 0, venueId: venueB }) }),
     ]);
-    expect(race.map((response) => response.status)).toEqual(expect.arrayContaining([200, 409]));
     const state = await env.DB.prepare("SELECT a.venue_id, a.revision, t.status, t.checked_in_venue_id FROM attendees a JOIN tickets t ON t.attendee_id = a.id WHERE a.id = ?").bind(attendeeId).first<{ venue_id: string; revision: number; status: string; checked_in_venue_id: string | null }>();
-    if (state?.status === "checked_in") expect(state).toMatchObject({ venue_id: venueA, checked_in_venue_id: venueA, revision: 0 });
-    else expect(state).toMatchObject({ venue_id: venueB, revision: 1, status: "issued", checked_in_venue_id: null });
-    const editAudit = await env.DB.prepare("SELECT metadata_json FROM audit_logs WHERE target_id = ? AND action = 'attendee.updated'").bind(attendeeId).first<{ metadata_json: string }>();
-    if (state?.revision === 1) expect(JSON.parse(editAudit?.metadata_json ?? "{}")).toMatchObject({ before: { venueId: venueA }, after: { venueId: venueB } });
-    else expect(editAudit).toBeNull();
-    const resultBody = await race[1]!.json<{ error?: string; revision?: number }>();
-    if (state?.status === "checked_in") expect(resultBody).toMatchObject({ error: "checked_in_venue_locked" });
+    const editAudits = await env.DB.prepare("SELECT metadata_json FROM audit_logs WHERE target_id = ? AND action = 'attendee.updated'").bind(attendeeId).all<{ metadata_json: string }>();
+    const checkInAttempts = await env.DB.prepare("SELECT outcome, venue_id FROM check_ins WHERE ticket_id = ? ORDER BY created_at, id").bind(ticketId).all<{ outcome: string; venue_id: string | null }>();
+    const checkInAudits = await env.DB.prepare("SELECT action, metadata_json FROM audit_logs WHERE target_type = 'ticket' AND target_id = ? AND action = 'ticket.verified_manually'").bind(ticketId).all<{ action: string; metadata_json: string }>();
+    const checkInBody = await race[0]!.json<{ outcome?: string; error?: string; ticket?: { status: string; checked_in_by_display_name?: string } }>();
+    const editBody = await race[1]!.json<{ updated?: boolean; revision?: number; error?: string }>();
+    expect(state).not.toBeNull();
+    if (state?.status === "checked_in") {
+      expect(race.map((response) => response.status)).toEqual([200, 409]);
+      expect(state).toMatchObject({ venue_id: venueA, checked_in_venue_id: venueA, revision: 0, status: "checked_in" });
+      expect(checkInBody).toMatchObject({ outcome: "accepted", ticket: { status: "checked_in" } });
+      expect(editBody).toEqual({ error: "checked_in_venue_locked" });
+      expect(checkInAttempts.results).toEqual([{ outcome: "accepted", venue_id: venueA }]);
+      expect(checkInAudits.results).toHaveLength(1);
+      expect(JSON.parse(checkInAudits.results[0]!.metadata_json)).toMatchObject({ outcome: "accepted", venueId: venueA });
+      expect(editAudits.results).toEqual([]);
+    } else {
+      expect(state).toMatchObject({ venue_id: venueB, revision: 1, status: "issued", checked_in_venue_id: null });
+      expect(race[1]!.status).toBe(200);
+      expect(editBody).toEqual({ updated: true, revision: 1 });
+      expect(editAudits.results).toHaveLength(1);
+      expect(JSON.parse(editAudits.results[0]!.metadata_json)).toMatchObject({
+        before: { venueId: venueA, revision: 0 }, after: { venueId: venueB, revision: 1 },
+      });
+      if (race[0]!.status === 403) {
+        expect(checkInBody).toEqual({ error: "wrong_venue" });
+        expect(checkInAttempts.results).toEqual([]);
+        expect(checkInAudits.results).toEqual([]);
+      } else {
+        expect(race[0]!.status).toBe(409);
+        expect(checkInBody).toMatchObject({ outcome: "rejected", ticket: { status: "issued" } });
+        expect(checkInAttempts.results).toEqual([{ outcome: "rejected", venue_id: venueA }]);
+        expect(checkInAudits.results).toHaveLength(1);
+        expect(JSON.parse(checkInAudits.results[0]!.metadata_json)).toMatchObject({ outcome: "rejected", venueId: venueA });
+      }
+    }
 
     if (state?.status === "checked_in") {
       const reversed = await SELF.fetch(`https://tsudoi.test/api/tickets/${ticketId}/reverse-check-in`, { method: "POST", headers: auth, body: JSON.stringify({ reason: "Wrong venue" }) });
@@ -524,6 +551,30 @@ describe("Worker D1 roster flow", () => {
       expect(moved.status).toBe(200);
       await expect(env.DB.prepare("SELECT status FROM tickets WHERE id = ?").bind(ticketId).first()).resolves.toEqual({ status: "issued" });
     }
+
+    const editFirstAttendeeResponse = await SELF.fetch(`https://tsudoi.test/api/events/${eventId}/attendees`, { method: "POST", headers: auth, body: JSON.stringify({ name: "Venue edit first", venueId: venueA }) });
+    expect(editFirstAttendeeResponse.status).toBe(201);
+    const { attendeeId: editFirstAttendeeId, ticketId: editFirstTicketId } = await editFirstAttendeeResponse.json<{ attendeeId: string; ticketId: string }>();
+    const editFirst = await SELF.fetch(`https://tsudoi.test/api/events/${eventId}/attendees/${editFirstAttendeeId}`, { method: "PATCH", headers: auth, body: JSON.stringify({ revision: 0, venueId: venueB }) });
+    expect(editFirst.status).toBe(200);
+    await expect(editFirst.json()).resolves.toEqual({ updated: true, revision: 1 });
+    const wrongVenueCheckIn = await SELF.fetch(`https://tsudoi.test/api/events/${eventId}/attendees/${editFirstAttendeeId}/check-in`, { method: "POST", headers: auth, body: JSON.stringify({ venueId: venueA }) });
+    expect(wrongVenueCheckIn.status).toBe(403);
+    await expect(wrongVenueCheckIn.json()).resolves.toEqual({ error: "wrong_venue" });
+    await expect(env.DB.prepare("SELECT COUNT(*) AS total FROM check_ins WHERE ticket_id = ?").bind(editFirstTicketId).first()).resolves.toEqual({ total: 0 });
+    await expect(env.DB.prepare("SELECT COUNT(*) AS total FROM audit_logs WHERE target_type = 'ticket' AND target_id = ? AND action = 'ticket.verified_manually'").bind(editFirstTicketId).first()).resolves.toEqual({ total: 0 });
+    await expect(env.DB.prepare("SELECT a.venue_id, a.revision, t.status, t.checked_in_venue_id FROM attendees a JOIN tickets t ON t.attendee_id = a.id WHERE a.id = ?").bind(editFirstAttendeeId).first()).resolves.toEqual({ venue_id: venueB, revision: 1, status: "issued", checked_in_venue_id: null });
+    const editFirstAudits = await env.DB.prepare("SELECT metadata_json FROM audit_logs WHERE target_id = ? AND action = 'attendee.updated'").bind(editFirstAttendeeId).all<{ metadata_json: string }>();
+    expect(editFirstAudits.results).toHaveLength(1);
+    expect(JSON.parse(editFirstAudits.results[0]!.metadata_json)).toMatchObject({ before: { venueId: venueA, revision: 0 }, after: { venueId: venueB, revision: 1 } });
+    const correctVenueCheckIn = await SELF.fetch(`https://tsudoi.test/api/events/${eventId}/attendees/${editFirstAttendeeId}/check-in`, { method: "POST", headers: auth, body: JSON.stringify({ venueId: venueB }) });
+    expect(correctVenueCheckIn.status).toBe(200);
+    await expect(correctVenueCheckIn.json()).resolves.toMatchObject({ outcome: "accepted", ticket: { status: "checked_in" } });
+    await expect(env.DB.prepare("SELECT outcome, venue_id FROM check_ins WHERE ticket_id = ?").bind(editFirstTicketId).all()).resolves.toMatchObject({ results: [{ outcome: "accepted", venue_id: venueB }] });
+    const correctVenueAudits = await env.DB.prepare("SELECT action, metadata_json FROM audit_logs WHERE target_type = 'ticket' AND target_id = ? AND action = 'ticket.verified_manually'").bind(editFirstTicketId).all<{ action: string; metadata_json: string }>();
+    expect(correctVenueAudits.results).toHaveLength(1);
+    expect(correctVenueAudits.results[0]!.action).toBe("ticket.verified_manually");
+    expect(JSON.parse(correctVenueAudits.results[0]!.metadata_json)).toMatchObject({ outcome: "accepted", venueId: venueB });
 
     const lockedAttendeeResponse = await SELF.fetch(`https://tsudoi.test/api/events/${eventId}/attendees`, { method: "POST", headers: auth, body: JSON.stringify({ name: "Checked-in lock", venueId: venueA }) });
     const { attendeeId: lockedAttendeeId, ticketId: lockedTicketId } = await lockedAttendeeResponse.json<{ attendeeId: string; ticketId: string }>();
