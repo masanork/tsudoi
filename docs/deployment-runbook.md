@@ -1,6 +1,6 @@
 # 本番反映・実環境確認ランブック
 
-最新配置は2026-10-21の名簿運用機能。Git commit `0723aaa`、Worker version `7f01b803-9245-42f6-b1fa-45fdb06f9a2c`、DB migration `0001`〜`0008` を確認済み。[最新反映記録](releases/2026-10-21-roster-workflows.md)を参照し、次回も作業直前に取得し直す。以下のPR9までのmigration一覧・配置記録は過去の基準であり、現在の名簿運用コードを配置するには追加の `0008_roster_workflows.sql` が必要。
+最新配置は2026-10-21の名簿運用機能と表示列CSVのレビュー修正。Git commit `6fa7605`、Worker version `2f712d70-c69f-4580-b0c3-eb3ea11b046d`、DB migration `0001`〜`0008` を確認済み。[最新反映記録](releases/2026-10-21-roster-workflows.md)を参照し、次回も作業直前に取得し直す。以下のPR9までのmigration一覧・配置記録は過去の基準であり、現在の名簿運用コードを配置するには追加の `0008_roster_workflows.sql` が必要。
 
 この手順は次回の本番反映と、実機・実メール・OAuth/MCP 確認に使う。2026-10-06 07:26 JSTにオフライン配布のタブ間残数更新を直したPR9マージcommit `4018bcdaec13f961f0c7c35ab3691e898ac90d57` を反映した。本番Worker versionは `e6227e46-f2dc-4c5f-b27d-6a92d1ce7b12`（100%配信）、本番DBには `0001`〜`0007` が適用済み。[最新反映記録](releases/2026-10-06-field-operations.md)と[以前の履歴](releases/2026-10-05-production.md)を参照し、次回は作業直前に状態を再取得する。
 
