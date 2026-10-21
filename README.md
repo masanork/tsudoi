@@ -22,6 +22,7 @@ Snapshot: [`stats/stats.md`](stats/stats.md)
 - Multi-tenant organizations, events, venues, Passkey organizer sessions, and role-scoped API tokens for future integrations
 - Configurable registration fields and roster data model
 - Administrator roster editing with revision checks and before/after audit records; CSV column mapping, duplicate preview, and one-time import confirmation
+- Editable and retired registration fields, personal roster columns, filtered CSV downloads, field templates, and atomic bulk roster updates
 - Individual ticket tokens and atomic duplicate-safe check-in
 - Separate entry, exit, reentry and current occupancy records
 - Multiple later-added distribution rounds, per-person cumulative limits, and reasoned reversals
@@ -36,6 +37,8 @@ See [`docs/release-readiness.md`](docs/release-readiness.md) for the reviewed ch
 Use [`docs/deployment-runbook.md`](docs/deployment-runbook.md) for an existing production database, commit/version tracking, rollback, and device/mail/OAuth acceptance checks. `npm run check:deployed -- --origin https://your-host` checks public deployed endpoints without credentials or remote data writes; `--output report.json` saves a local report. It does not verify organizer login, mail delivery, or the supplied deployment identity. `npm run test:operations` tests this checker.
 
 See the full product and technical requirements in [`docs/specification.md`](docs/specification.md).
+
+See [`docs/roster-workflows.md`](docs/roster-workflows.md) for the new roster workflows, their limits, and the additive `0008` migration required before deploying this change.
 
 See [`docs/field-operations.md`](docs/field-operations.md) for everyday event use and shelter operations, the ordered implementation milestones, acceptance checks, and offline limits. These features and migrations `0005`–`0007` were deployed to production on 2026-10-06 JST; see the [rollout record](docs/releases/2026-10-06-field-operations.md).
 

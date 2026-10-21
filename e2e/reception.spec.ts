@@ -4,6 +4,7 @@ import { verifyDistributionFlow } from "./operations-flow";
 import { verifyPresenceFlow } from "./presence-flow";
 import { verifyHouseholdFlow } from "./household-flow";
 import { verifyOfflineFlow } from "./offline-flow";
+import { verifyRosterWorkflows } from "./roster-workflows-flow";
 
 async function fillAnswers(form: Locator, company: string) {
   await form.getByLabel("所属（必須）", { exact: true }).fill(company);
@@ -24,7 +25,7 @@ async function fillAnswers(form: Locator, company: string) {
 }
 
 test("completes Passkey setup, registration, roster reception, duplicate detection, and reversal", async ({ page, context }) => {
-  test.setTimeout(180_000);
+  test.setTimeout(240_000);
   const runtimeErrors: string[] = [];
   page.on("pageerror", (error) => runtimeErrors.push(error.message));
   const cdp = await context.newCDPSession(page);
@@ -63,7 +64,7 @@ test("completes Passkey setup, registration, roster reception, duplicate detecti
   // Adding a field through the UI also refreshes the walk-in form immediately.
   await page.getByLabel("項目キー", { exact: true }).fill("company");
   await page.getByLabel("表示名", { exact: true }).fill("所属");
-  await page.locator("#settings select").selectOption("text");
+  await page.getByLabel("型", { exact: true }).selectOption("text");
   await page.getByLabel("必須項目", { exact: true }).check();
   await page.getByRole("button", { name: "項目を追加", exact: true }).click();
   const walkIn = page.locator("form").filter({ has: page.getByRole("button", { name: "登録する", exact: true }) });
@@ -416,6 +417,7 @@ test("completes Passkey setup, registration, roster reception, duplicate detecti
         await expect(viewer.getByRole("button", { name: label, exact: true })).toHaveCount(0);
       }
     } finally { await viewerContext.close(); }
+    await verifyRosterWorkflows(page, context);
     const operationsFixture = await verifyDistributionFlow(page, context);
     const presenceFixture = await verifyPresenceFlow(page, context, operationsFixture);
     const householdFixture = await verifyHouseholdFlow(page, context, presenceFixture);
