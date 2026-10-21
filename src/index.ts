@@ -8,14 +8,16 @@ import type { AuthenticationResponseJSON, RegistrationResponseJSON } from "@simp
 import * as QRCodeServer from "qrcode/lib/server.js";
 import { checkIn } from "./check-in";
 import { cleanupExpiredImportPreviews } from "./maintenance";
+import { registerRosterWorkflows } from "./roster-workflows";
+import { rosterFilter } from "./roster-filters";
 import { calendarDate, canonicalDate, confirmedCalendar, extractInviteToken, parseConstraints, parseScheduleSlot, pkceS256, suggestSlots } from "./schedule-protocol";
 
 type Role = "owner" | "admin" | "staff" | "viewer";
-type OrganizerAuth = { organizationId: string; scopes: string[]; actorId: string; role: Role | "api_token"; kind: "session" | "api_token" };
+export type OrganizerAuth = { organizationId: string; scopes: string[]; actorId: string; role: Role | "api_token"; kind: "session" | "api_token" };
 type AppVariables = { auth: OrganizerAuth; participantAttendeeId: string };
 type JsonRecord = Record<string, unknown>;
 type AppBindings = Cloudflare.Env & { TURNSTILE_SITE_KEY?: string; TURNSTILE_SECRET?: string };
-type AppEnv = { Bindings: AppBindings; Variables: AppVariables };
+export type AppEnv = { Bindings: AppBindings; Variables: AppVariables };
 type NotificationJob =
   | { type: "ticket_link"; to: string; eventName: string; link: string; ticketUrl?: string }
   | { type: "event_announcement"; to: string; eventName: string; subject: string; message: string };
@@ -162,6 +164,8 @@ app.use("/api/tickets/*", requireOrganizer);
 app.use("/api/messages/*", requireOrganizer);
 app.use("/api/tokens", requireOrganizer);
 app.use("/api/tokens/*", requireOrganizer);
+app.use("/api/form-templates", requireOrganizer);
+app.use("/api/form-templates/*", requireOrganizer);
 app.use("/api/participant/*", requireParticipant);
 
 app.get("/.well-known/oauth-protected-resource", (c) => c.json(protectedResourceMetadata(requestOrigin(c))));
@@ -509,7 +513,8 @@ app.delete("/api/events/:eventId/venues/:venueId/staff/:userId", requireScope("a
 app.get("/api/events/:eventId/form-fields", requireScope("roster:read"), async (c) => {
   const event = await eventForAuth(c);
   if (!event) return c.json({ error: "not_found" }, 404);
-  const fields = await c.env.DB.prepare("SELECT * FROM form_fields WHERE event_id = ? AND retired_at IS NULL AND (? != 'staff' OR staff_visibility = 'visible') ORDER BY sort_order, created_at").bind(event.id, c.get("auth").role).all();
+  const includeRetired = c.req.query("includeRetired") === "true" && ["owner", "admin"].includes(c.get("auth").role);
+  const fields = await c.env.DB.prepare("SELECT * FROM form_fields WHERE event_id = ? AND (? = 1 OR retired_at IS NULL) AND (? NOT IN ('staff', 'viewer') OR staff_visibility = 'visible') ORDER BY sort_order, created_at, id").bind(event.id, Number(includeRetired), c.get("auth").role).all();
   return c.json(fields.results);
 });
 
@@ -524,11 +529,17 @@ app.post("/api/events/:eventId/form-fields", requireScope("admin"), async (c) =>
   if (!key || !/^[a-z][a-z0-9_]{0,62}$/.test(key) || !label || !validTypes.includes(type ?? "")) return badRequest(c, "invalid field");
   const id = crypto.randomUUID();
   const options = Array.isArray(body.options) ? body.options.filter((v): v is string => typeof v === "string").slice(0, 100) : [];
-  await c.env.DB.prepare(`INSERT INTO form_fields (id, event_id, field_key, label, field_type, required, options_json, staff_visibility, searchable, sort_order)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
-    .bind(id, event.id, key, label, type, body.required === true ? 1 : 0, JSON.stringify(options), body.staffVisibility === "admin_only" ? "admin_only" : "visible", body.searchable === true ? 1 : 0, optionalInteger(body.sortOrder) ?? 0).run();
+  await c.env.DB.batch([
+    c.env.DB.prepare(`INSERT INTO form_fields (id, event_id, field_key, label, field_type, required, options_json, staff_visibility, searchable, sort_order)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+      .bind(id, event.id, key, label, type, body.required === true ? 1 : 0, JSON.stringify(options), body.staffVisibility === "admin_only" ? "admin_only" : "visible", body.searchable === true ? 1 : 0, optionalInteger(body.sortOrder) ?? 0),
+    c.env.DB.prepare("INSERT INTO audit_logs (id, organization_id, actor_id, action, target_type, target_id, metadata_json) VALUES (?, ?, ?, 'form_field.created', 'form_field', ?, ?)")
+      .bind(crypto.randomUUID(), c.get("auth").organizationId, c.get("auth").actorId, id, JSON.stringify({ eventId: event.id, key, label })),
+  ]);
   return c.json({ id }, 201);
 });
+
+registerRosterWorkflows(app, { requireSession, requireScope, eventForAuth, jsonBody, audit, isValidFieldAnswer, hasRequiredAnswer });
 
 app.get("/api/events/:eventId/distributions", requireScope("roster:read"), async (c) => {
   const event = await eventForAuth(c);
@@ -1569,30 +1580,26 @@ app.get("/api/events/:eventId/roster", requireScope("roster:read"), async (c) =>
   const event = await eventForAuth(c);
   if (!event) return c.json({ error: "not_found" }, 404);
   const auth = c.get("auth");
-  const fields = await c.env.DB.prepare("SELECT id, field_key, label FROM form_fields WHERE event_id = ? AND retired_at IS NULL AND (? != 'staff' OR staff_visibility = 'visible') ORDER BY sort_order, created_at")
-    .bind(event.id, auth.role).all<{ id: string; field_key: string; label: string }>();
-  const q = c.req.query("q")?.trim() ?? "";
-  const status = c.req.query("status") ?? "";
-  const source = c.req.query("source") ?? "";
-  const venueId = c.req.query("venueId") ?? "";
+  const fields = await c.env.DB.prepare("SELECT id, field_key, label, retired_at FROM form_fields WHERE event_id = ? AND (? NOT IN ('staff', 'viewer') OR staff_visibility = 'visible') ORDER BY sort_order, created_at")
+    .bind(event.id, auth.role).all<{ id: string; field_key: string; label: string; retired_at: string | null }>();
+  const filter = rosterFilter(new URL(c.req.url).searchParams, event.id);
+  if (!filter) return badRequest(c, "invalid roster filter");
   const after = c.req.query("after") ?? "";
-  if (q.length > 100 || !["", "active", "cancelled"].includes(status) || !["", "public_form", "walk_in", "admin"].includes(source)) return badRequest(c, "invalid roster filter");
   const attendees = await c.env.DB.prepare(`SELECT a.id, a.name, a.email_normalized, a.affiliation, a.venue_id, a.revision, a.status, a.registration_source, a.created_at,
       t.id AS ticket_id, t.status AS ticket_status, t.checked_in_at, COALESCE(u.display_name, t.checked_in_by, '') AS checked_in_by_display_name FROM attendees a JOIN tickets t ON t.attendee_id = a.id
       LEFT JOIN users u ON u.id = t.checked_in_by
-      WHERE a.event_id = ? AND (? = '' OR a.name LIKE ? OR a.email_normalized LIKE ?)
-      AND (? = '' OR a.status = ?) AND (? = '' OR a.registration_source = ?) AND (? = '' OR a.venue_id = ?)
+      WHERE ${filter.sql}
       AND (? = '' OR (a.created_at, a.id) < (SELECT created_at, id FROM attendees WHERE id = ? AND event_id = ?))
       AND (? != 'staff' OR a.venue_id IN (SELECT s.venue_id FROM venue_staff_assignments s WHERE s.user_id = ?))
       ORDER BY a.created_at DESC, a.id DESC LIMIT 51`)
-    .bind(event.id, q, `%${q}%`, `%${q}%`, status, status, source, source, venueId, venueId, after, after, event.id, auth.role, auth.actorId)
+    .bind(...filter.values, after, after, event.id, auth.role, auth.actorId)
     .all<{ id: string; name: string; email_normalized: string | null; affiliation: string; venue_id: string | null; revision: number; status: string; registration_source: string; created_at: string; ticket_status: string; checked_in_at: string | null; checked_in_by_display_name: string }>();
   const page = attendees.results.slice(0, 50);
   const answers = page.length ? await c.env.DB.prepare(`SELECT attendee_id, field_id, value_json FROM attendee_answers WHERE attendee_id IN (${page.map(() => "?").join(",")})`)
     .bind(...page.map((attendee) => attendee.id)).all<{ attendee_id: string; field_id: string; value_json: string }>() : { results: [] };
   const answerMap = new Map(answers.results.map((answer) => [`${answer.attendee_id}:${answer.field_id}`, answerValue(answer.value_json)]));
   await audit(c.env.DB, auth, "roster.viewed", "event", event.id);
-  return c.json({ fields: fields.results.map(({ field_key, label }) => ({ field_key, label })), attendees: page.map((attendee) => ({ ...attendee, answers: Object.fromEntries(fields.results.map((field) => [field.field_key, answerMap.get(`${attendee.id}:${field.id}`) ?? null])) })), nextCursor: attendees.results.length > 50 ? page.at(-1)?.id : null });
+  return c.json({ fields: fields.results.map(({ field_key, label, retired_at }) => ({ field_key, label, retired_at })), attendees: page.map((attendee) => ({ ...attendee, answers: Object.fromEntries(fields.results.map((field) => [field.field_key, answerMap.get(`${attendee.id}:${field.id}`) ?? null])) })), nextCursor: attendees.results.length > 50 ? page.at(-1)?.id : null });
 });
 
 app.get("/api/events/:eventId/attendees", requireScope("roster:read"), async (c) => {
@@ -1613,6 +1620,9 @@ app.get("/api/events/:eventId/attendees", requireScope("roster:read"), async (c)
 app.get("/api/events/:eventId/attendees.csv", requireScope("admin"), async (c) => {
   const event = await eventForAuth(c);
   if (!event) return c.json({ error: "not_found" }, 404);
+  const params = new URL(c.req.url).searchParams;
+  const filter = rosterFilter(params, event.id);
+  if (!filter) return badRequest(c, "invalid roster filter");
   const fields = await c.env.DB.prepare("SELECT id, field_key, label, field_type FROM form_fields WHERE event_id = ? ORDER BY sort_order, created_at").bind(event.id).all<{ id: string; field_key: string; label: string; field_type: string }>();
   const venueRows = await c.env.DB.prepare("SELECT id, name FROM venues WHERE event_id = ?").bind(event.id).all<{ id: string; name: string }>();
   const venueNameCounts = new Map<string, number>();
@@ -1623,13 +1633,13 @@ app.get("/api/events/:eventId/attendees.csv", requireScope("admin"), async (c) =
   const venueLabels = new Map(venueRows.results.map((venue) => [venue.id,
     (venueNameCounts.get(venue.name.trim().toLocaleLowerCase()) ?? 0) > 1 ? venue.id : venue.name,
   ]));
-  const attendees = await c.env.DB.prepare(`SELECT id, name, affiliation, email_normalized, venue_id, registration_source, status, created_at
-    FROM attendees WHERE event_id = ? ORDER BY created_at`).bind(event.id)
-    .all<{ id: string; name: string; affiliation: string; email_normalized: string | null; venue_id: string | null; registration_source: string; status: string; created_at: string }>();
+  const attendees = await c.env.DB.prepare(`SELECT a.id, a.name, a.affiliation, a.email_normalized, a.venue_id, a.registration_source, a.status, a.created_at, t.status AS ticket_status
+    FROM attendees a JOIN tickets t ON t.attendee_id = a.id WHERE ${filter.sql} ORDER BY a.created_at, a.id`).bind(...filter.values)
+    .all<{ id: string; name: string; affiliation: string; email_normalized: string | null; venue_id: string | null; registration_source: string; status: string; created_at: string; ticket_status: string }>();
   const answers = await c.env.DB.prepare("SELECT attendee_id, field_id, value_json FROM attendee_answers WHERE attendee_id IN (SELECT id FROM attendees WHERE event_id = ?)").bind(event.id).all<{ attendee_id: string; field_id: string; value_json: string }>();
   const fieldTypeById = new Map(fields.results.map((field) => [field.id, field.field_type]));
   const answerMap = new Map(answers.results.map((answer) => [`${answer.attendee_id}:${answer.field_id}`, csvAnswer(answer.value_json, fieldTypeById.get(answer.field_id))]));
-  const standardHeaders = new Set(["name", "affiliation", "email", "venue", "registration source", "status", "registered at"]);
+  const standardHeaders = new Set(["name", "affiliation", "email", "venue", "registration source", "status", "registered at", "ticket"]);
   const labelCounts = new Map<string, number>();
   for (const field of fields.results) {
     const key = field.label.trim().toLocaleLowerCase();
@@ -1641,12 +1651,16 @@ app.get("/api/events/:eventId/attendees.csv", requireScope("admin"), async (c) =
       ? `answer:${field.field_key}`
       : field.label;
   });
-  const header = ["Name", "Affiliation", "Email", "Venue", "Registration source", "Status", "Registered at", ...answerHeaders];
-  const rows = attendees.results.map((attendee) => [attendee.name, attendee.affiliation, attendee.email_normalized ?? "", attendee.venue_id ? venueLabels.get(attendee.venue_id) ?? attendee.venue_id : "", attendee.registration_source, attendee.status, attendee.created_at, ...fields.results.map((field) => answerMap.get(`${attendee.id}:${field.id}`) ?? "")]);
-  await audit(c.env.DB, c.get("auth"), "attendees.exported", "event", event.id);
+  const header = ["Name", "Affiliation", "Email", "Venue", "Registration source", "Status", "Registered at", ...answerHeaders, "Ticket"];
+  const rows = attendees.results.map((attendee) => [attendee.name, attendee.affiliation, attendee.email_normalized ?? "", attendee.venue_id ? venueLabels.get(attendee.venue_id) ?? attendee.venue_id : "", attendee.registration_source, attendee.status, attendee.created_at, ...fields.results.map((field) => answerMap.get(`${attendee.id}:${field.id}`) ?? ""), attendee.ticket_status]);
+  const availableColumns = ["name", "affiliation", "email", "venue", "source", "status", "createdAt", ...fields.results.map((field) => `answer:${field.field_key}`), "ticket"];
+  const requested = params.getAll("column");
+  if (requested.length > availableColumns.length || new Set(requested).size !== requested.length || requested.some((key) => !availableColumns.includes(key))) return badRequest(c, "invalid export columns");
+  const indices = requested.length ? requested.map((key) => availableColumns.indexOf(key)) : availableColumns.slice(0, -1).map((_, index) => index);
+  await audit(c.env.DB, c.get("auth"), "attendees.exported", "event", event.id, { columns: requested.length ? requested : availableColumns.slice(0, -1), count: rows.length, filters: Object.fromEntries(params.entries()) });
   c.header("Content-Type", "text/csv; charset=utf-8");
   c.header("Content-Disposition", `attachment; filename="tsudoi-${event.id}-attendees.csv"`);
-  return c.body(`\uFEFF${[header, ...rows].map((row) => row.map(csvCell).join(",")).join("\r\n")}\r\n`);
+  return c.body(`\uFEFF${[header, ...rows].map((row) => indices.map((index) => csvCell(row[index])).join(",")).join("\r\n")}\r\n`);
 });
 
 app.post("/api/events/:eventId/attendees", requireScope("roster:write"), async (c) => {
@@ -1968,6 +1982,8 @@ app.post("/api/events/:eventId/announcements", requireScope("admin"), async (c) 
   const subject = requiredString(body, "subject"), message = requiredString(body, "message");
   if (!subject || subject.length > 160 || !message || message.length > 5000) return badRequest(c, "subject and message are required");
   const attendees = await c.env.DB.prepare("SELECT DISTINCT email_normalized FROM attendees WHERE event_id = ? AND status = 'active' AND email_normalized IS NOT NULL").bind(event.id).all<{ email_normalized: string }>();
+  if (body.preview === true) return c.json({ recipients: attendees.results.length });
+  if (body.preview !== undefined && typeof body.preview !== "boolean") return badRequest(c, "invalid preview");
   await Promise.all(attendees.results.map((attendee) => c.env.NOTIFICATION_QUEUE.send({ type: "event_announcement", to: attendee.email_normalized, eventName: event.name, subject, message } satisfies NotificationJob)));
   await audit(c.env.DB, c.get("auth"), "event.announcement_sent", "event", event.id);
   return c.json({ queued: attendees.results.length }, 202);
@@ -3554,8 +3570,8 @@ async function consumeAuthChallenge(db: D1Database, table: "organizer_webauthn_c
 }
 async function audit(db: D1Database, auth: OrganizerAuth, action: string, targetType: string, targetId: string, metadata: JsonRecord = {}) { await db.prepare("INSERT INTO audit_logs (id, organization_id, actor_id, action, target_type, target_id, metadata_json) VALUES (?, ?, ?, ?, ?, ?, ?)").bind(crypto.randomUUID(), auth.organizationId, auth.actorId, action, targetType, targetId, JSON.stringify(metadata)).run(); }
 
-type EventRow = { id: string; organization_id: string; name: string; status: string; archived_at?: string | null; registration_mode: string; capacity: number | null; timezone?: string; scheduling_enabled?: number; schedule_status?: string; starts_at?: string; ends_at?: string };
-type FieldRow = { id: string; field_key: string; field_type: string; required: number; options_json: string };
+export type EventRow = { id: string; organization_id: string; name: string; status: string; archived_at?: string | null; registration_mode: string; capacity: number | null; timezone?: string; scheduling_enabled?: number; schedule_status?: string; starts_at?: string; ends_at?: string };
+export type FieldRow = { id: string; field_key: string; field_type: string; required: number; options_json: string };
 type DistributionAttendee = { id: string; name: string; affiliation: string; venue_id: string | null; operation_venue_id:string|null; venue_name: string | null; ticket_id: string; qr_token_hash: string | null };
 type DistributionClaimRow = { id: string; request_id: string; payload_hash: string; outcome: "accepted" | "limit_reached"; used_after: number; remaining_after: number; quantity: number; attendee_id: string; venue_id: string | null; created_at: string };
 type PresenceRequestRow = {

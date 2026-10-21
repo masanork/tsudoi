@@ -1,6 +1,7 @@
 <script lang="ts">
   import { onDestroy, onMount, tick } from "svelte";
   import { formatUtcTimestamp, utcTimestampMillis } from "./time";
+  import { QrVideoScanner } from "./qr-scanner";
   import {
     appendOfflineOperation, disableServiceWorker, expirePreparedSnapshot, exportPendingOperations, markOfflineNeedsReview, setOfflineStatus,
     purgeOfflineData, quarantineIfIdentityChanged, readOfflineState, recordOfflineOutcome,
@@ -38,7 +39,7 @@
   let verifiedOrganizationId = "";
   let scanning = false;
   let video: HTMLVideoElement;
-  let stream: MediaStream | null = null;
+  let qrScanner: QrVideoScanner | null = null;
   let scanLatched = "";
   let channel: BroadcastChannel | null = null;
   let clockNow = Date.now();
@@ -176,13 +177,14 @@
   }
 
   function setAttendee(personId: string, proof = "") { attendeeId = personId; credentialHash = proof; statusMessage = ""; errorMessage = ""; }
-  async function resolveQr() {
+  async function resolveQr(shouldApply: () => boolean = () => true) {
     const raw = qrInput.trim(); qrInput = "";
     if (!raw) return;
     try {
       // A different tab may have committed a quota reservation since this
       // panel last rendered; use the durable snapshot and queue for projection.
       const latest = await readOfflineState();
+      if (!shouldApply()) return;
       if (!latest.snapshot || latest.quarantinedIdentity) throw new Error("準備データを確認できません。画面を再読み込みしてください。");
       localState = latest;
       const parsed = new URL(raw, location.origin);
@@ -190,32 +192,33 @@
       if (!match || parsed.origin !== location.origin) throw new Error("受付QRリンクの形式を確認してください。");
       const token = decodeURIComponent(match[2]);
       const digest = new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(token)));
+      if (!shouldApply()) return;
       const hash = [...digest].map((byte) => byte.toString(16).padStart(2, "0")).join("");
       const person = latest.snapshot.attendees.find((attendee) => attendee.ticket.id === decodeURIComponent(match[1]) && attendee.credentials.some((credential) => credential.credentialHash === hash && utcTimestampMillis(credential.expiresAt) > Date.now()));
       if (!person) throw new Error("このQRは準備データに含まれていないか、有効期限が切れています。オンラインで本人確認してください。");
+      if (!shouldApply()) return;
       setAttendee(person.id, hash);
       statusMessage = `${person.name}さんを確認しました。記録する操作を選んでください。`;
-    } catch (error) { errorMessage = messageOf(error); }
+    } catch (error) { if (shouldApply()) errorMessage = messageOf(error); }
   }
   async function startScanner() {
-    const browser = window as Window & { BarcodeDetector?: new (options: { formats: string[] }) => { detect: (source: HTMLVideoElement) => Promise<Array<{ rawValue: string }>> } };
-    if (!browser.BarcodeDetector) { errorMessage = "この端末ではカメラ読取に対応していません。受付QRリンクを貼り付けてください。"; return; }
-    try {
-      stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: "environment" }, audio: false });
-      scanning = true; await tick(); video.srcObject = stream; await video.play();
-      const detector = new browser.BarcodeDetector({ formats: ["qr_code"] });
-      while (scanning && video && !video.paused) {
-        try {
-          const found = await detector.detect(video);
-          const value = found[0]?.rawValue ?? "";
-          if (value && value !== scanLatched) { scanLatched = value; qrInput = value; await resolveQr(); }
-          if (!value) scanLatched = "";
-        } catch { /* retry on the next frame */ }
-        await new Promise((resolve) => setTimeout(resolve, 160));
-      }
-    } catch { errorMessage = "カメラを利用できません。受付QRリンクを貼り付けてください。"; stopScanner(); }
+    if (scanning) return;
+    const scanner = new QrVideoScanner();
+    qrScanner = scanner;
+    scanning = true; scanLatched = "";
+    await tick();
+    if (qrScanner !== scanner || !scanning) return;
+    await scanner.start(video, async (value) => {
+      if (qrScanner !== scanner || !scanning) return;
+      if (!value) scanLatched = "";
+      else if (value !== scanLatched) { scanLatched = value; qrInput = value; await resolveQr(() => qrScanner === scanner && scanning); }
+    }, () => {
+      if (qrScanner !== scanner) return;
+      qrScanner = null; scanning = false;
+      errorMessage = "カメラを利用できません。受付QRリンクを貼り付けてください。";
+    });
   }
-  function stopScanner() { scanning = false; stream?.getTracks().forEach((track) => track.stop()); stream = null; }
+  function stopScanner() { scanning = false; const scanner = qrScanner; qrScanner = null; scanner?.stop(); }
 
   function projectPerson(person: OfflineAttendee) {
     let state = person.presence.state, venueId = person.presence.venueId, revision = person.presence.revision;

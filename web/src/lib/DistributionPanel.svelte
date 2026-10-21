@@ -1,6 +1,7 @@
 <script lang="ts">
   import { formatUtcTimestamp } from "./time";
   import { onDestroy, onMount, tick } from "svelte";
+  import { QrVideoScanner } from "./qr-scanner";
 
   type Api = (path: string, init?: RequestInit) => Promise<any>;
   type Venue = { id: string; name: string };
@@ -37,7 +38,7 @@
   let scanning = false;
   let scanLatched = "";
   let video: HTMLVideoElement;
-  let stream: MediaStream | null = null;
+  let qrScanner: QrVideoScanner | null = null;
   let statusMessage = "";
   let errorMessage = "";
   let pendingRetry: ClaimPayload | null = null;
@@ -203,28 +204,25 @@
   }
 
   async function startScanner() {
-    const browser = window as Window & { BarcodeDetector?: new (options: { formats: string[] }) => { detect: (source: HTMLVideoElement) => Promise<Array<{ rawValue: string }>> } };
-    if (!browser.BarcodeDetector) { statusMessage = "このブラウザーはカメラ読取に対応していません。チケットの受付QRリンクを下へ貼り付けてください。"; return; }
-    try {
-      stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: "environment" }, audio: false });
-      scanning = true; await tick(); video.srcObject = stream; await video.play();
-      const detector = new browser.BarcodeDetector({ formats: ["qr_code"] });
-      const scan = async () => {
-        if (!scanning) return;
-        try {
-          const value = (await detector.detect(video))[0]?.rawValue ?? "";
-          if (!value) scanLatched = "";
-          else if (value !== scanLatched && !submitting) { scanLatched = value; qrLink = value; await resolveQr(value); }
-        } catch { /* Continue scanning; the pasted link remains available. */ }
-        if (scanning) requestAnimationFrame(() => void scan());
-      };
-      void scan();
-    } catch { stopScanner(); statusMessage = "カメラを開けませんでした。チケットの受付QRリンクを貼り付けてください。"; }
+    if (scanning) return;
+    const scanner = new QrVideoScanner();
+    qrScanner = scanner;
+    scanning = true; scanLatched = "";
+    await tick();
+    if (qrScanner !== scanner || !scanning) return;
+    await scanner.start(video, async (value) => {
+      if (qrScanner !== scanner || !scanning) return;
+      if (!value) scanLatched = "";
+      else if (value !== scanLatched && !submitting) { scanLatched = value; qrLink = value; await resolveQr(value); }
+    }, () => {
+      if (qrScanner !== scanner) return;
+      qrScanner = null; scanning = false;
+      statusMessage = "カメラを開けませんでした。チケットの受付QRリンクを下へ貼り付けてください。";
+    });
   }
 
   function stopScanner() {
-    scanning = false; scanLatched = ""; stream?.getTracks().forEach((track) => track.stop()); stream = null;
-    if (video) video.srcObject = null;
+    scanning = false; scanLatched = ""; const scanner = qrScanner; qrScanner = null; scanner?.stop();
   }
 
   function friendly(error: unknown) {
@@ -292,7 +290,7 @@
           <summary>チケットQRから参加者を確認</summary>
           <p class="muted">配布専用スキャンです。受付処理は実行しません。在館中は現在の会場、退館中は登録時の会場を使います。未割当の場合は配布会場を選択してください。</p>
           <button type="button" class="quiet" disabled={submitting} onclick={scanning ? stopScanner : startScanner}>{scanning ? "カメラを閉じる" : "配布用カメラを開く"}</button>
-          {#if scanning}<video bind:this={video} playsinline aria-label="配布用QR読み取りカメラ"></video>{/if}
+          {#if scanning}<video bind:this={video} playsinline muted aria-label="配布用QR読み取りカメラ"></video>{/if}
           <form onsubmit={(event) => { event.preventDefault(); void resolveQr(); }}>
             <label>チケットの受付QRリンク<input bind:value={qrLink} type="url" inputmode="url" placeholder="https://…/public/tickets/…/check-in/…" required disabled={Boolean(pendingRetry)} /></label>
             <button type="submit" class="quiet" disabled={submitting}>参加者を確認</button>

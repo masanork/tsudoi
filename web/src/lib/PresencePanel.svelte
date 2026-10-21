@@ -1,6 +1,7 @@
 <script lang="ts">
   import { onDestroy, onMount, tick } from "svelte";
   import { formatUtcTimestamp } from "./time";
+  import { QrVideoScanner } from "./qr-scanner";
 
   type Api = (path: string, init?: RequestInit) => Promise<any>;
   type Venue = { id: string; name: string };
@@ -64,7 +65,7 @@
   let scanning = false;
   let scannerLatched = "";
   let video: HTMLVideoElement;
-  let stream: MediaStream | null = null;
+  let qrScanner: QrVideoScanner | null = null;
   let statusMessage = "";
   let errorMessage = "";
   let pendingPayload: MovementPayload | null = null;
@@ -258,28 +259,25 @@
   }
 
   async function startScanner() {
-    const browser = window as Window & { BarcodeDetector?: new (options: { formats: string[] }) => { detect: (source: HTMLVideoElement) => Promise<Array<{ rawValue: string }>> } };
-    if (!browser.BarcodeDetector) { errorMessage = "このブラウザーはカメラ読取に対応していません。受付用QRリンクを貼り付けて確認してください。"; return; }
-    try {
-      stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: "environment" }, audio: false });
-      scanning = true; await tick(); video.srcObject = stream; await video.play();
-      const detector = new browser.BarcodeDetector({ formats: ["qr_code"] });
-      const scan = async () => {
-        if (!scanning) return;
-        try {
-          const value = (await detector.detect(video))[0]?.rawValue ?? "";
-          if (!value) scannerLatched = "";
-          else if (value !== scannerLatched && !submitting) { scannerLatched = value; qrLink = value; stopScanner(); await resolveQr(value); }
-        } catch { /* Continue scanning; manual QR entry remains available. */ }
-        if (scanning) requestAnimationFrame(() => void scan());
-      };
-      void scan();
-    } catch { stopScanner(); errorMessage = "カメラを開けませんでした。受付用QRリンクを貼り付けて確認してください。"; }
+    if (scanning) return;
+    const scanner = new QrVideoScanner();
+    qrScanner = scanner;
+    scanning = true; scannerLatched = "";
+    await tick();
+    if (qrScanner !== scanner || !scanning) return;
+    await scanner.start(video, async (value) => {
+      if (qrScanner !== scanner || !scanning) return;
+      if (!value) scannerLatched = "";
+      else if (value !== scannerLatched && !submitting) { scannerLatched = value; qrLink = value; stopScanner(); await resolveQr(value); }
+    }, () => {
+      if (qrScanner !== scanner) return;
+      qrScanner = null; scanning = false;
+      errorMessage = "カメラを開けませんでした。受付用QRリンクを貼り付けて確認してください。";
+    });
   }
 
   function stopScanner() {
-    scanning = false; scannerLatched = ""; stream?.getTracks().forEach((track) => track.stop()); stream = null;
-    if (video) video.srcObject = null;
+    scanning = false; scannerLatched = ""; const scanner = qrScanner; qrScanner = null; scanner?.stop();
   }
 
   function errorStatus(error: unknown) { return error && typeof error === "object" && "status" in error ? Number((error as { status: unknown }).status) : 0; }
@@ -341,7 +339,7 @@
       <p class="muted">入退館専用スキャンです。受付処理は実行しません。</p>
       {#if venues.length}<label>入退館会場<select bind:value={selectedVenueId} disabled={Boolean(pendingPayload)}><option value="">会場を選択</option>{#each venues as venue}<option value={venue.id}>{venue.name}</option>{/each}</select></label>{/if}
       <button type="button" class="quiet" disabled={submitting || Boolean(pendingPayload) || !selectedVenueId} onclick={scanning ? stopScanner : startScanner}>{scanning ? "カメラを閉じる" : "入退館用カメラを開く"}</button>
-      {#if scanning}<video bind:this={video} playsinline aria-label="入退館用QR読み取りカメラ"></video>{/if}
+      {#if scanning}<video bind:this={video} playsinline muted aria-label="入退館用QR読み取りカメラ"></video>{/if}
       <form onsubmit={(event) => { event.preventDefault(); void resolveQr(); }}>
         <label>入退館用QRリンク<input bind:value={qrLink} type="url" inputmode="url" placeholder="https://…/public/tickets/…/check-in/…" required disabled={Boolean(pendingPayload)} /></label>
         <button type="submit" class="quiet" disabled={submitting || Boolean(pendingPayload) || !selectedVenueId}>参加者を確認</button>

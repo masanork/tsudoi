@@ -1,4 +1,5 @@
 import { readFile } from "node:fs/promises";
+import { randomBytes } from "node:crypto";
 import { expect, type BrowserContext, type Page } from "@playwright/test";
 
 type Fixture = { eventId: string; venueId: string; secondVenueId: string; qrLink: string; person: { attendeeId: string }; familyMember: { attendeeId: string } };
@@ -35,6 +36,12 @@ export async function verifyOfflineFlow(page: Page, context: BrowserContext, fix
   const expiryPersonResponse = await context.request.post(`/api/events/${eventId}/attendees`, { data: { name: "期限検証用の参加者", venueId } });
   expect(expiryPersonResponse.status()).toBe(201);
   const expiryPerson = await expiryPersonResponse.json();
+  const delayedQrResponse = await context.request.post(`/api/events/${eventId}/attendees/${familyMember.attendeeId}/qr-cards`, { data: {
+    requestId: crypto.randomUUID(), qrToken: randomBytes(32).toString("base64url"), venueId,
+  } });
+  expect(delayedQrResponse.status()).toBe(201);
+  const delayedQrLink = (await delayedQrResponse.json()).card.url as string;
+  const delayedQrToken = new URL(delayedQrLink, "http://localhost:4173").pathname.split("/").at(-1)!;
   await page.goto("/");
   await page.locator("li").filter({ hasText: "平時と避難所の運用検証" }).getByRole("button", { name: "管理する", exact: true }).click();
   await page.getByRole("button", { name: "オフライン受付を開く", exact: true }).click();
@@ -83,6 +90,68 @@ export async function verifyOfflineFlow(page: Page, context: BrowserContext, fix
   await expect.poll(async () => (await storedState(page)).snapshot?.eventId).toBe(eventId);
   await page.evaluate(async () => { await navigator.serviceWorker.ready; });
   await expect.poll(() => page.evaluate(() => Boolean(navigator.serviceWorker.controller))).toBe(true);
+
+  // A QR resolution started by an old camera instance must not override the
+  // next attendee selected after stop/restart when its digest finishes late.
+  await page.evaluate(({ firstQr, firstToken }) => {
+    const camera = window as Window & {
+      testQr: string; testFirstDigestStarted: boolean; testFirstDigestFinished: boolean; testReleaseFirstDigest: () => void;
+      testOriginalDigest: SubtleCrypto["digest"]; testOriginalPlay: typeof HTMLMediaElement.prototype.play;
+      testOriginalGetUserMedia: typeof navigator.mediaDevices.getUserMedia;
+      testOriginalBarcodeDetector?: unknown; BarcodeDetector?: unknown;
+    };
+    camera.testQr = firstQr; camera.testFirstDigestStarted = false; camera.testFirstDigestFinished = false;
+    camera.testOriginalDigest = crypto.subtle.digest.bind(crypto.subtle);
+    camera.testOriginalPlay = HTMLMediaElement.prototype.play;
+    camera.testOriginalGetUserMedia = navigator.mediaDevices.getUserMedia;
+    camera.testOriginalBarcodeDetector = camera.BarcodeDetector;
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    camera.testReleaseFirstDigest = release;
+    const originalDigest = camera.testOriginalDigest;
+    crypto.subtle.digest = async (algorithm, data) => {
+      if (new TextDecoder().decode(data) === firstToken) {
+        camera.testFirstDigestStarted = true;
+        await gate;
+        const result = await originalDigest(algorithm, data);
+        camera.testFirstDigestFinished = true;
+        return result;
+      }
+      return originalDigest(algorithm, data);
+    };
+    camera.BarcodeDetector = class { async detect() { return [{ rawValue: camera.testQr }]; } };
+    navigator.mediaDevices.getUserMedia = async () => new MediaStream();
+    HTMLMediaElement.prototype.play = async () => {};
+  }, { firstQr: delayedQrLink, firstToken: delayedQrToken });
+  await panel.locator("summary").filter({ hasText: "受付QRから参加者を確認" }).click();
+  try {
+    await panel.getByRole("button", { name: "カメラでQRを読む", exact: true }).click();
+    await expect.poll(() => page.evaluate(() => (window as Window & { testFirstDigestStarted: boolean }).testFirstDigestStarted)).toBe(true);
+    await panel.getByRole("button", { name: "カメラを停止", exact: true }).click();
+    await page.evaluate((nextQr) => { (window as Window & { testQr: string }).testQr = nextQr; }, qrLink);
+    await panel.getByRole("button", { name: "カメラでQRを読む", exact: true }).click();
+    await expect(panel).toContainText("配布確認者さんを確認しました。記録する操作を選んでください。");
+    await page.evaluate(() => (window as Window & { testReleaseFirstDigest: () => void }).testReleaseFirstDigest());
+    await expect.poll(() => page.evaluate(() => (window as Window & { testFirstDigestFinished: boolean }).testFirstDigestFinished)).toBe(true);
+    await page.waitForTimeout(0);
+    await expect(panel).toContainText("配布確認者さんを確認しました。記録する操作を選んでください。");
+    await expect(panel).not.toContainText("世帯の同伴者さんを確認しました。記録する操作を選んでください。");
+  } finally {
+    await page.evaluate(() => (window as Window & { testReleaseFirstDigest: () => void }).testReleaseFirstDigest());
+    const stopCamera = panel.getByRole("button", { name: "カメラを停止", exact: true });
+    if (await stopCamera.count()) await stopCamera.click({ timeout: 1_000 }).catch(() => {});
+    await page.evaluate(() => {
+      const camera = window as Window & {
+        testOriginalDigest: SubtleCrypto["digest"]; testOriginalPlay: typeof HTMLMediaElement.prototype.play;
+        testOriginalGetUserMedia: typeof navigator.mediaDevices.getUserMedia;
+        testOriginalBarcodeDetector?: unknown; BarcodeDetector?: unknown;
+      };
+      crypto.subtle.digest = camera.testOriginalDigest;
+      HTMLMediaElement.prototype.play = camera.testOriginalPlay;
+      navigator.mediaDevices.getUserMedia = camera.testOriginalGetUserMedia;
+      camera.BarcodeDetector = camera.testOriginalBarcodeDetector;
+    });
+  }
 
   await context.setOffline(true);
   await panel.getByRole("combobox", { name: "参加者を選択", exact: true }).selectOption(expiryPerson.attendeeId);

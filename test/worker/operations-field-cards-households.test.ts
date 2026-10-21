@@ -37,7 +37,7 @@ function token32(){const bytes=crypto.getRandomValues(new Uint8Array(32));let bi
 async function createDistribution(eventId:string,headers:Record<string,string>,name:string,maxPerAttendee:number){const r=await SELF.fetch(`${origin}/api/events/${eventId}/distributions`,{method:"POST",headers,body:JSON.stringify({name,unit:"meal",maxPerAttendee})});expect(r.status).toBe(201);return (await r.json<{id:string}>()).id;}
 
 describe("phase 3 paper cards and households",()=>{
-  it("issues additional QR without revoking, then replacement revokes old QR and rotates only legacy possession",async()=>{
+  it("issues additional QR without revoking, then replacement preserves v2 possession",async()=>{
     const owner=await session("Card owner"),eventId=await event(owner.organizationId),member=await guest(eventId,owner.organizationId,{checkedIn:true});
     const issue=async(attendeeId:string,kind:"additional"|"replacement",requestId:string,qrToken:string,reason?:string)=>SELF.fetch(`${origin}/api/events/${eventId}/attendees/${attendeeId}/qr-cards${kind==="replacement"?"/reissue":""}`,{
       method:"POST",headers:owner.headers,body:JSON.stringify({requestId,qrToken,...(reason?{reason}:{})}),
@@ -52,6 +52,13 @@ describe("phase 3 paper cards and households",()=>{
     expect(await env.DB.prepare("SELECT token_hash,token_key_id,status FROM tickets WHERE id=?").bind(member.ticketId).first()).toMatchObject({token_hash:member.ticketHash,token_key_id:"possession-v2",status:"checked_in"});
     const stillPossession=await SELF.fetch(`${origin}/public/tickets/${member.ticketId}/passkeys/options`,{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({ticketToken:member.pass})});expect(stillPossession.status).toBe(200);
     expect(await env.DB.prepare("SELECT COUNT(*) AS count FROM ticket_qr_tokens WHERE ticket_id=? AND expires_at>CURRENT_TIMESTAMP").bind(member.ticketId).first<{count:number}>().then(r=>r?.count)).toBe(1);
+  }, 15_000);
+
+  it("replaces legacy QR and possession while preserving the original issuance result",async()=>{
+    const owner=await session("Legacy card owner"),eventId=await event(owner.organizationId);
+    const issue=async(attendeeId:string,kind:"additional"|"replacement",requestId:string,qrToken:string,reason?:string)=>SELF.fetch(`${origin}/api/events/${eventId}/attendees/${attendeeId}/qr-cards${kind==="replacement"?"/reissue":""}`,{
+      method:"POST",headers:owner.headers,body:JSON.stringify({requestId,qrToken,...(reason?{reason}:{})}),
+    });
     const tokenV1=await guest(eventId,owner.organizationId,{legacy:true});
     const legacyIssue=await issue(tokenV1.attendeeId,"additional",crypto.randomUUID(),token32());expect(legacyIssue.status).toBe(201);
     const replacementRequest=crypto.randomUUID();

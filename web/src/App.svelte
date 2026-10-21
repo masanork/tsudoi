@@ -7,8 +7,12 @@
   import HouseholdPanel from "./lib/HouseholdPanel.svelte";
   import PresencePanel from "./lib/PresencePanel.svelte";
   import OfflinePanel from "./lib/OfflinePanel.svelte";
+  import { QrVideoScanner } from "./lib/qr-scanner";
   import { disableServiceWorker, purgeOfflineData, quarantineIfIdentityChanged, readOfflineState } from "./lib/offline-store";
   import FieldInputs from "./lib/FieldInputs.svelte";
+  import FieldManager from "./lib/FieldManager.svelte";
+  import BulkRosterEditor from "./lib/BulkRosterEditor.svelte";
+  import AnnouncementPanel from "./lib/AnnouncementPanel.svelte";
   import type { FormAnswers, FormField } from "./lib/form-fields";
 
   type ParticipantTicket = { id: string; status: string; event_name: string; starts_at: string; ends_at: string; timezone: string; venue_name: string | null; cancellation_closes_at: string | null };
@@ -69,7 +73,7 @@
   let scannerActive = false;
   let scannerLatchedValue = "";
   let scannerVideo: HTMLVideoElement;
-  let scannerStream: MediaStream | null = null;
+  let qrScanner: QrVideoScanner | null = null;
   let venues: Array<{ id: string; name: string; address: string }> = [];
   let selectedVenueId = "";
   let newVenueName = "";
@@ -89,7 +93,7 @@
   let scheduleDate = "";
   let scheduleNote = "";
   let metrics: { registrations: number; issued: number; cancelled: number; checked_in: number; not_checked_in: number } | null = null;
-  let rosterFields: Array<{ field_key: string; label: string }> = [];
+  let rosterFields: Array<{ field_key: string; label: string; retired_at?: string | null }> = [];
   let rosterReady = false;
   let rosterAttendees: Array<{ id: string; ticket_id: string; name: string; email_normalized: string | null; ticket_status: string; answers: Record<string, string | number | boolean | string[] | null>; affiliation?: string | null; venue_id?: string | null; revision?: number; checked_in_by_display_name?: string | null }> = [];
   let confirmAttendee: typeof rosterAttendees[number] | null = null;
@@ -98,18 +102,31 @@
   let rosterSource = "";
   let rosterVenueId = "";
   let rosterCursor: string | null = null;
+  let rosterTicketStatus = "";
+  let appliedRosterFilters = new URLSearchParams();
+  let selectedRosterIds: string[] = [];
+  let columnKeys: string[] | null = null;
+  let columnRevision = 0;
+  let viewReady = false;
+  let columnMessage = "";
+  let exporting = false;
+  let bulkMessage = "";
+  $: activeRosterFields = rosterFields.filter((field) => !field.retired_at);
+  $: availableColumns = [{ key: "name", label: "氏名", retired: false }, { key: "affiliation", label: "所属", retired: false }, { key: "email", label: "メール", retired: false }, { key: "venue", label: "会場", retired: false }, { key: "ticket", label: "チケット", retired: false }, ...rosterFields.map((field) => ({ key: `answer:${field.field_key}`, label: field.label, retired: Boolean(field.retired_at) }))];
+  $: effectiveColumnKeys = columnKeys ?? availableColumns.filter((column) => !column.retired).map((column) => column.key);
+  $: displayColumns = effectiveColumnKeys.flatMap((key) => availableColumns.filter((column) => column.key === key));
+  $: columnChoices = [...displayColumns, ...availableColumns.filter((column) => !effectiveColumnKeys.includes(column.key))];
+  $: bulkAttendees = rosterAttendees.filter((person) => selectedRosterIds.includes(person.id));
   let fieldKey = "";
   let fieldLabel = "";
   let fieldType = "text";
   let fieldOptions = "";
   let fieldRequired = false;
+  let fieldAdminOnly = false;
   let fieldMessage = "";
   let organizers: Array<{ user_id: string; role: string; display_name: string; email_normalized: string | null }> = [];
   let organizationMembers: Array<{ id: string; display_name: string; email_normalized: string | null; role: string }> = [];
   let selectedCohostId = "";
-  let announcementSubject = "";
-  let announcementBody = "";
-  let announcementMessage = "";
   const fieldKeyPattern = "[a-z][a-z0-9_]{0,62}";
   const registerMatch = typeof window !== "undefined" ? window.location.pathname.match(/^\/events\/([^/]+)\/register$/) : null;
   const registrationEventId = registerMatch?.[1] ?? "";
@@ -360,34 +377,29 @@
     finally { checkinBusy = false; }
   }
   async function startScanner() {
-    const browser = window as Window & { BarcodeDetector?: new (options: { formats: string[] }) => { detect: (video: HTMLVideoElement) => Promise<Array<{ rawValue: string }>> } };
-    if (!browser.BarcodeDetector) { checkinMessage = "このブラウザーではカメラ読み取りに対応していません。QR のリンクを貼り付けてください。"; return; }
-    try {
-      scannerStream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: "environment" }, audio: false });
-      scannerActive = true;
-      await tick();
-      scannerVideo.srcObject = scannerStream;
-      await scannerVideo.play();
-      const detector = new browser.BarcodeDetector({ formats: ["qr_code"] });
-      const scan = async () => {
-        if (!scannerActive) return;
-        try {
-          const codes = await detector.detect(scannerVideo);
-          const scanned = codes[0]?.rawValue ?? "";
-          if (!scanned) scannerLatchedValue = "";
-          else if (scanned !== scannerLatchedValue && !checkinBusy) { scannerLatchedValue = scanned; ticketLink = scanned; await checkInTicketLink(); }
-        } catch { /* keep scanning */ }
-        if (scannerActive) requestAnimationFrame(() => void scan());
-      };
-      void scan();
-    } catch { stopScanner(); checkinMessage = "カメラを開けませんでした。QR のリンクを貼り付けてください。"; }
+    if (scannerActive) return;
+    const scanner = new QrVideoScanner();
+    qrScanner = scanner;
+    scannerActive = true;
+    scannerLatchedValue = "";
+    await tick();
+    if (qrScanner !== scanner || !scannerActive) return;
+    await scanner.start(scannerVideo, async (scanned) => {
+      if (qrScanner !== scanner || !scannerActive) return;
+      if (!scanned) scannerLatchedValue = "";
+      else if (scanned !== scannerLatchedValue && !checkinBusy) { scannerLatchedValue = scanned; ticketLink = scanned; await checkInTicketLink(); }
+    }, () => {
+      if (qrScanner !== scanner) return;
+      qrScanner = null; scannerActive = false;
+      checkinMessage = "カメラを開けませんでした。QR のリンクを貼り付けてください。";
+    });
   }
   function stopScanner() {
     scannerActive = false;
     scannerLatchedValue = "";
-    scannerStream?.getTracks().forEach((track) => track.stop());
-    scannerStream = null;
-    if (scannerVideo) scannerVideo.srcObject = null;
+    const scanner = qrScanner;
+    qrScanner = null;
+    scanner?.stop();
   }
   async function checkInAttendee(attendeeId: string) {
     if (checkinBusy) return;
@@ -413,7 +425,7 @@
   async function previewCsv() {
     const eventId = selectedEventId;
     try {
-      const mapping = { name: csvMapping.name ?? "", affiliation: csvMapping.affiliation ?? "", email: csvMapping.email ?? "", venueId: csvMapping.venueId ?? "", ...Object.fromEntries(rosterFields.map((field) => [`answer:${field.field_key}`, csvMapping[`answer:${field.field_key}`] ?? ""])) };
+      const mapping = { name: csvMapping.name ?? "", affiliation: csvMapping.affiliation ?? "", email: csvMapping.email ?? "", venueId: csvMapping.venueId ?? "", ...Object.fromEntries(activeRosterFields.map((field) => [`answer:${field.field_key}`, csvMapping[`answer:${field.field_key}`] ?? ""])) };
       const preview = await api(`/events/${eventId}/roster/import/preview`, { method: "POST", body: JSON.stringify({ columns: csvColumns, rows: csvRows, mapping }) });
       if (selectedEventId !== eventId) return;
       csvPreview = preview;
@@ -444,7 +456,7 @@
       if (parsed[0].length > 107) { csvMessage = "CSVは107列以下にしてください。"; return; }
       if (parsed.length - 1 > 100) { csvMessage = "CSVはデータ100行以下にしてください。"; return; }
       csvColumns = parsed[0]; csvRows = parsed.slice(1); csvMapping = { name: csvColumns.find((column) => /^(氏名|名前|name)$/i.test(column)) ?? "", affiliation: csvColumns.find((column) => /^(所属|会社|affiliation)$/i.test(column)) ?? "", email: csvColumns.find((column) => /^(メール|メールアドレス|email)$/i.test(column)) ?? "", venueId: csvColumns.find((column) => /^(会場|venue)$/i.test(column)) ?? "" };
-      for (const field of rosterFields) csvMapping[`answer:${field.field_key}`] = csvColumns.find((column) => column === `answer:${field.field_key}`) ?? csvColumns.find((column) => column === field.label || column === field.field_key) ?? "";
+      for (const field of activeRosterFields) csvMapping[`answer:${field.field_key}`] = csvColumns.find((column) => column === `answer:${field.field_key}`) ?? csvColumns.find((column) => column === field.label || column === field.field_key) ?? "";
     }).catch(() => { csvColumns = []; csvRows = []; csvMapping = {}; csvMessage = "CSVをUTF-8で読み込めませんでした。"; });
   }
   function invalidateCsvPreview() { csvPreview = null; csvDecisions = []; if (csvMessage.startsWith("プレビュー:")) csvMessage = "列の対応を変更しました。プレビューをやり直してください。"; }
@@ -477,16 +489,18 @@
     catch (error) { message = error instanceof Error ? error.message : "集計を読み込めませんでした。"; }
   }
   async function loadRoster(eventId: string, append = false) {
-    if (!append && selectedEventId === eventId) rosterReady = false;
+    if (!append && selectedEventId === eventId) { rosterReady = false; selectedRosterIds = []; }
     try {
       const params = new URLSearchParams();
       if (rosterQuery) params.set("q", rosterQuery);
       if (rosterStatus) params.set("status", rosterStatus);
       if (rosterSource) params.set("source", rosterSource);
       if (rosterVenueId) params.set("venueId", rosterVenueId);
+      if (rosterTicketStatus) params.set("ticketStatus", rosterTicketStatus);
       if (append && rosterCursor) params.set("after", rosterCursor);
       const roster = await api(`/events/${eventId}/roster?${params}`);
       if (selectedEventId !== eventId) return;
+      appliedRosterFilters = new URLSearchParams(params); appliedRosterFilters.delete("after");
       rosterFields = roster.fields; rosterAttendees = append ? [...rosterAttendees, ...roster.attendees] : roster.attendees;
       rosterCursor = roster.nextCursor;
       rosterReady = true;
@@ -546,7 +560,6 @@
   }
   async function addCohost() { try { if (!selectedCohostId) return; await api(`/events/${selectedEventId}/organizers`, { method: "POST", body: JSON.stringify({ userId: selectedCohostId, role: "cohost" }) }); selectedCohostId = ""; await loadOrganizers(selectedEventId); } catch (error) { message = error instanceof Error ? error.message : "共同主催者を追加できませんでした。"; } }
   async function removeOrganizer(userId: string) { try { await api(`/events/${selectedEventId}/organizers/${userId}`, { method: "DELETE" }); await loadOrganizers(selectedEventId); } catch (error) { message = error instanceof Error ? error.message : "運営メンバーを変更できませんでした。"; } }
-  async function sendAnnouncement() { try { const result = await api(`/events/${selectedEventId}/announcements`, { method: "POST", body: JSON.stringify({ subject: announcementSubject, message: announcementBody }) }); announcementSubject = ""; announcementBody = ""; announcementMessage = `${result.queued} 名へ案内を送信しました。`; } catch (error) { announcementMessage = error instanceof Error ? error.message : "案内を送信できませんでした。"; } }
   async function loadProfile() { try { const profile = await api("/profile"); profileName = profile.display_name ?? ""; profileEmail = profile.email_normalized ?? ""; profileAvatarUrl = profile.avatar_url ?? ""; } catch { /* no active organizer session */ } }
   async function loadApiTokens() { try { apiTokens = (await api("/tokens")).tokens; } catch { apiTokens = []; } }
   async function createApiToken() {
@@ -589,18 +602,47 @@
     } catch (error) { message = error instanceof Error ? error.message : "イベントを処理できませんでした。"; }
   }
   async function selectEvent(eventId: string) {
-    rosterReady = false; rosterFields = []; rosterAttendees = [];
+    rosterReady = false; rosterFields = []; rosterAttendees = []; selectedRosterIds = []; columnKeys = null; viewReady = false; columnMessage = ""; bulkMessage = "";
     walkInName = ""; walkInEmail = ""; walkInAnswers = {}; walkInQr = ""; walkInFields = []; checkinMessage = "";
-    await Promise.all([loadMetrics(eventId), loadRoster(eventId), loadSchedule(eventId), loadOrganizers(eventId), loadVenues(eventId), loadWalkInFields(eventId)]);
+    await Promise.all([loadMetrics(eventId), loadRoster(eventId), loadSchedule(eventId), loadOrganizers(eventId), loadVenues(eventId), loadWalkInFields(eventId), loadRosterView(eventId)]);
   }
   async function createField() {
     try {
       const options = fieldOptions.split(/[\n,]/).map((option) => option.trim()).filter(Boolean);
-      await api(`/events/${selectedEventId}/form-fields`, { method: "POST", body: JSON.stringify({ key: fieldKey, label: fieldLabel, type: fieldType, required: fieldRequired, options }) });
-      fieldKey = ""; fieldLabel = ""; fieldOptions = ""; fieldRequired = false; fieldMessage = "項目を追加しました。";
+      await api(`/events/${selectedEventId}/form-fields`, { method: "POST", body: JSON.stringify({ key: fieldKey, label: fieldLabel, type: fieldType, required: fieldRequired, options, staffVisibility: fieldAdminOnly ? "admin_only" : "visible" }) });
+      fieldKey = ""; fieldLabel = ""; fieldOptions = ""; fieldRequired = false; fieldAdminOnly = false; fieldMessage = "項目を追加しました。";
       await Promise.all([loadRoster(selectedEventId), loadWalkInFields(selectedEventId)]);
     } catch (error) { fieldMessage = error instanceof Error ? error.message : "項目を追加できませんでした。"; }
   }
+  async function refreshRosterWorkflows() { await Promise.all([loadRoster(selectedEventId), loadWalkInFields(selectedEventId)]); }
+  async function loadRosterView(eventId: string) {
+    try { const result = await api(`/events/${eventId}/roster/view`); if (selectedEventId === eventId) { columnKeys = result.columns; columnRevision = result.revision; viewReady = true; } }
+    catch { if (selectedEventId === eventId) columnMessage = "列設定を読み込めませんでした。イベントを開き直してください。"; }
+  }
+  function toggleColumn(key: string, checked: boolean) { columnKeys = checked ? [...effectiveColumnKeys, key] : effectiveColumnKeys.filter((column) => column !== key); }
+  function moveColumn(key: string, offset: number) {
+    const keys = [...effectiveColumnKeys], index = keys.indexOf(key), next = index + offset;
+    if (index < 0 || next < 0 || next >= keys.length) return;
+    [keys[index], keys[next]] = [keys[next], keys[index]]; columnKeys = keys;
+  }
+  async function saveRosterView() {
+    try { const result = await api(`/events/${selectedEventId}/roster/view`, { method: "PUT", body: JSON.stringify({ columns: effectiveColumnKeys, revision: columnRevision }) }); columnRevision = result.revision; columnMessage = "自分の列設定を保存しました。"; }
+    catch { columnMessage = "列設定を保存できませんでした。別の画面で変更した場合はイベントを開き直してください。"; }
+  }
+  async function exportRoster(visibleOnly: boolean) {
+    exporting = true; columnMessage = "";
+    try {
+      const params = new URLSearchParams(appliedRosterFilters);
+      if (visibleOnly) for (const key of effectiveColumnKeys) params.append("column", key);
+      const response = await fetch(`/api/events/${selectedEventId}/attendees.csv?${params}`, { credentials: "same-origin" });
+      if (!response.ok) throw new Error("export_failed");
+      const url = URL.createObjectURL(await response.blob()), link = document.createElement("a"); link.href = url; link.download = `tsudoi-${selectedEventId}-attendees.csv`; link.click(); setTimeout(() => URL.revokeObjectURL(url), 1000);
+      columnMessage = "現在の絞り込み条件でCSVを出力しました。未表示のページも含みます。";
+    } catch { columnMessage = "CSVを出力できませんでした。通信と列設定を確認してください。"; }
+    finally { exporting = false; }
+  }
+  function selectRosterPerson(id: string, checked: boolean) { selectedRosterIds = checked ? [...selectedRosterIds, id] : selectedRosterIds.filter((key) => key !== id); }
+  async function afterBulkUpdate() { await refreshRosterWorkflows(); bulkMessage = "選択した参加者の一括更新が完了しました。"; }
   async function loadRegistration() {
     try { const response = await fetch(`/public/events/${registrationEventId}`); const body = await response.json(); if (!response.ok) throw new Error(); publicEvent = body.event; publicFields = body.fields; turnstileSiteKey = body.turnstileSiteKey ?? ""; if (turnstileSiteKey) await renderTurnstile(); }
     catch { registrationMessage = "この申込フォームは利用できません。"; }
@@ -765,7 +807,7 @@
       {:else if schedule?.enabled}
         <section class="notice"><strong>日程確定済み</strong><p>{schedule.startsAt ? scheduleOptionLabel({ date: schedule.date ?? "", start: schedule.startsAt, end: schedule.endsAt, allDay: schedule.allDay }) : ""}</p><p class="muted">{schedule.allDay === false ? "この時刻を参加者へ案内できます。" : "時刻は参加者へ別途ご連絡ください。"}</p></section>
       {/if}
-      {#if schedule?.enabled && schedule.status === "confirmed" && isAdministrator}<section aria-labelledby="announcement"><h2 id="announcement">参加者へ案内</h2><p>確定した日程や、時刻・場所の連絡をメールでまとめて送れます。</p><form onsubmit={(event) => { event.preventDefault(); void sendAnnouncement(); }}><label>件名<input bind:value={announcementSubject} placeholder="集合時刻と場所のご案内" required /></label><label>本文<textarea bind:value={announcementBody} placeholder="確定日、集合時刻、場所、持ち物など" required></textarea></label><button>参加者へ送信</button></form>{#if announcementMessage}<p class="notice">{announcementMessage}</p>{/if}</section>{/if}
+      {#if isAdministrator}{#key selectedEventId}<AnnouncementPanel eventId={selectedEventId} {api} />{/key}{/if}
       <div class="management-grid"><a href="#roster">名簿を管理</a><a href="#distribution">物品配布</a><a href="#presence">入退館管理</a><a href="#paper-cards">紙QRカード</a><a href="#households">世帯・代理受取</a>{#if currentRole !== "viewer"}<a href="#check-in">QR 受付</a>{/if}{#if isAdministrator}<a href="#settings">申込フォーム設定</a>{/if}</div>
       {#if isAdministrator}
         {@const currentEvent = events.find((event) => event.id === selectedEventId)}
@@ -784,15 +826,24 @@
       {#key selectedEventId}<div id="paper-cards"><PaperCardPanel eventId={selectedEventId} eventName={events.find((event) => event.id === selectedEventId)?.name ?? "イベント"} role={currentRole} {venues} attendees={rosterAttendees} {api} /></div>{/key}
       {#key selectedEventId}<div id="households"><HouseholdPanel eventId={selectedEventId} role={currentRole} {venues} attendees={rosterAttendees} {api} /></div>{/key}
       {#key selectedEventId}<div id="presence"><PresencePanel eventId={selectedEventId} role={currentRole} {venues} {api} /></div>{/key}
-      <section aria-labelledby="roster"><h2 id="roster">名簿を管理</h2><p class="muted">申込者と受付状態を確認できます。</p><form onsubmit={(event) => { event.preventDefault(); void loadRoster(selectedEventId); }}><label>検索<input bind:value={rosterQuery} placeholder="氏名またはメール" /></label><label>状態<select bind:value={rosterStatus}><option value="">すべて</option><option value="active">有効</option><option value="cancelled">取消</option></select></label><label>申込経路<select bind:value={rosterSource}><option value="">すべて</option><option value="public_form">事前申込</option><option value="walk_in">当日登録</option></select></label><label>会場<select bind:value={rosterVenueId}><option value="">すべて</option>{#each venues as venue}<option value={venue.id}>{venue.name}</option>{/each}</select></label><button>絞り込む</button></form>
+      <section aria-labelledby="roster"><h2 id="roster">名簿を管理</h2><p class="muted">申込者と受付状態を確認できます。</p><form onsubmit={(event) => { event.preventDefault(); void loadRoster(selectedEventId); }}><label>検索<input bind:value={rosterQuery} placeholder="氏名・メール・所属" /></label><label>状態<select bind:value={rosterStatus}><option value="">すべて</option><option value="active">有効</option><option value="cancelled">取消</option></select></label><label>申込経路<select bind:value={rosterSource}><option value="">すべて</option><option value="public_form">事前申込</option><option value="walk_in">当日登録</option><option value="admin">CSV取込</option></select></label><label>チケット状態<select aria-label="チケット状態" bind:value={rosterTicketStatus}><option value="">すべて</option><option value="issued">未受付</option><option value="checked_in">受付済</option><option value="cancelled">取消</option><option value="voided">無効</option></select></label><label>会場<select bind:value={rosterVenueId}><option value="">すべて</option>{#each venues as venue}<option value={venue.id}>{venue.name}</option>{/each}</select></label><button>絞り込む</button></form>
+      <details class="workflow-panel"><summary>名簿の表示列</summary><p class="muted">自分の表示列と順序を設定します。廃止済み項目の回答も選んで表示できます。</p>
+        {#each columnChoices as column (column.key)}<div class="column-setting"><label class="inline"><input type="checkbox" checked={effectiveColumnKeys.includes(column.key)} disabled={!viewReady || column.key === "name"} onchange={(event) => toggleColumn(column.key, event.currentTarget.checked)} />{column.label}{column.retired ? "（廃止済み）" : ""}</label>
+          {#if effectiveColumnKeys.includes(column.key)}<button type="button" class="quiet" aria-label={`${column.label}列を前へ`} disabled={effectiveColumnKeys.indexOf(column.key) === 0} onclick={() => moveColumn(column.key, -1)}>前へ</button><button type="button" class="quiet" aria-label={`${column.label}列を後ろへ`} disabled={effectiveColumnKeys.indexOf(column.key) === effectiveColumnKeys.length - 1} onclick={() => moveColumn(column.key, 1)}>後ろへ</button>{/if}</div>{/each}
+        <button type="button" disabled={!viewReady} onclick={() => void saveRosterView()}>列設定を保存</button>
+      </details>
+      {#if isAdministrator}<div class="workflow-actions"><button type="button" class="quiet" disabled={!rosterReady || exporting} onclick={() => void exportRoster(false)}>CSVを出力</button><button type="button" class="quiet" disabled={!rosterReady || !viewReady || exporting} onclick={() => void exportRoster(true)}>表示列でCSVを出力</button></div>{/if}
+      {#if columnMessage}<p class="notice" role="status">{columnMessage}</p>{/if}
+      {#if bulkMessage}<p class="notice" role="status">{bulkMessage}</p>{/if}
+      {#if isAdministrator && bulkAttendees.length}{#key selectedEventId}<BulkRosterEditor eventId={selectedEventId} attendees={bulkAttendees} fields={walkInFields} {venues} {api} onchange={afterBulkUpdate} />{/key}{/if}
       {#if ticketLinkMessage}<p class="notice" aria-live="polite">{ticketLinkMessage}</p>{/if}
       {#if isAdministrator}<section aria-labelledby="roster-import"><h3 id="roster-import">CSVから名簿を取り込む</h3><p class="muted">UTF-8 CSV、1 MB以下、データ100行・107列以下にしてください。CSV取込ではメールを送信しません。メールのない参加者は名簿から本人確認して受付してください。会場列は同じイベント内の会場名またはID、複数選択は「|」区切り、チェック項目は true / false、数値は有限の数で指定します。</p><label>CSVファイル<input type="file" accept=".csv,text/csv" disabled={!rosterReady} onchange={(event) => readCsvFile(event.currentTarget.files?.[0])} /></label>
         {#if csvColumns.length}<div class="form-grid"><label>氏名列<select value={csvMapping.name} onchange={(event) => setCsvMapping("name", event.currentTarget.value)}><option value="">列を選択</option>{#each csvColumns as column}<option value={column}>{column}</option>{/each}</select></label><label>所属列<select value={csvMapping.affiliation} onchange={(event) => setCsvMapping("affiliation", event.currentTarget.value)}><option value="">列を選択</option>{#each csvColumns as column}<option value={column}>{column}</option>{/each}</select></label><label>メール列<select value={csvMapping.email} onchange={(event) => setCsvMapping("email", event.currentTarget.value)}><option value="">列を選択</option>{#each csvColumns as column}<option value={column}>{column}</option>{/each}</select></label><label>会場列<select value={csvMapping.venueId} onchange={(event) => setCsvMapping("venueId", event.currentTarget.value)}><option value="">列を選択</option>{#each csvColumns as column}<option value={column}>{column}</option>{/each}</select></label>
-        {#each rosterFields as field}<label>{field.label}列<select value={csvMapping[`answer:${field.field_key}`]} onchange={(event) => setCsvMapping(`answer:${field.field_key}`, event.currentTarget.value)}><option value="">列を選択</option>{#each csvColumns as column}<option value={column}>{column}</option>{/each}</select></label>{/each}</div><button type="button" onclick={() => void previewCsv()}>プレビューを確認</button>{/if}
+        {#each activeRosterFields as field}<label>{field.label}列<select value={csvMapping[`answer:${field.field_key}`]} onchange={(event) => setCsvMapping(`answer:${field.field_key}`, event.currentTarget.value)}><option value="">列を選択</option>{#each csvColumns as column}<option value={column}>{column}</option>{/each}</select></label>{/each}</div><button type="button" onclick={() => void previewCsv()}>プレビューを確認</button>{/if}
         {#if csvPreview}<p>{csvPreview.validCount} 行を取り込み可能</p><div class="table-scroll"><table><thead><tr><th>氏名</th><th>所属</th><th>メール</th><th>重複候補・判断</th></tr></thead><tbody>{#each csvPreview.rows as row, rowIndex}<tr><td>{row.values[csvColumns.indexOf(csvMapping.name)] ?? ""}</td><td>{row.values[csvColumns.indexOf(csvMapping.affiliation)] ?? ""}</td><td>{row.values[csvColumns.indexOf(csvMapping.email)] ?? ""}</td><td>{#if row.errors.length}<span>{row.errors.map(csvErrorText).join("、")}</span>{:else if row.duplicateCandidates.length}{#each row.duplicateCandidates as candidate}<p>既存候補: {candidate.name}{#if candidate.affiliation}・{candidate.affiliation}{/if}{#if candidate.venueName}・会場 {candidate.venueName}{/if}{#if candidate.email} ({candidate.email}){/if}</p>{/each}<select aria-label={`重複候補の扱い ${rowIndex + 1}行目`} bind:value={csvDecisions[rowIndex]}><option value="skip">取り込まない</option><option value="include">新規として登録</option></select>{:else}重複候補なし{/if}</td></tr>{/each}</tbody></table></div><button type="button" onclick={() => void commitCsv()}>取り込みを確定</button>{/if}
         {#if csvMessage}<p class="notice" aria-live="polite">{csvMessage}</p>{/if}</section>{/if}
-      {#if rosterAttendees.length === 0}<p>登録者はいません。</p>{:else}<div class="table-scroll"><table><thead><tr><th>氏名</th><th>所属</th><th>メール</th><th>会場</th><th>チケット</th><th>受付操作</th>{#each rosterFields as field}<th>{field.label}</th>{/each}</tr></thead><tbody>{#each rosterAttendees as attendee}<tr><td>{attendee.name}</td><td>{attendee.affiliation ?? ""}</td><td>{attendee.email_normalized ?? ""}</td><td>{venues.find((venue) => venue.id === attendee.venue_id)?.name ?? ""}</td><td>{attendee.ticket_status}</td><td>{#if attendee.ticket_status === "issued" && currentRole !== "viewer"}<button class="quiet" onclick={() => requestAttendeeCheckin(attendee)}>受付</button>{:else if attendee.ticket_status === "checked_in" && isAdministrator}<button class="quiet" onclick={() => reverseCheckIn(attendee.ticket_id)}>受付取消</button>{/if}{#if isAdministrator && attendee.ticket_status === "issued" && attendee.email_normalized}<button class="quiet" onclick={() => void resendTicketLink(attendee.id)}>チケットを送信</button>{/if}{#if isAdministrator}<button class="quiet" disabled={!walkInFieldsReady} onclick={() => beginEdit(attendee)}>編集</button>{/if}</td>{#each rosterFields as field}<td>{answerText(attendee.answers[field.field_key])}</td>{/each}</tr>
-        {#if editingAttendeeId === attendee.id}<tr><td colspan={6 + rosterFields.length}><form class="form-grid" onsubmit={(event) => { event.preventDefault(); void saveAttendeeEdit(); }}><label>氏名<input bind:value={editName} required /></label><label>所属<input bind:value={editAffiliation} /></label><label>会場<select bind:value={editVenueId} disabled={attendee.ticket_status === "checked_in"}><option value="">未割当</option>{#each venues as venue}<option value={venue.id}>{venue.name}</option>{/each}</select></label>{#if walkInFieldsReady}<FieldInputs fields={walkInFields} bind:answers={editAnswers} />{:else}<p class="notice">回答項目を読み込んでいます。</p>{/if}<button disabled={!walkInFieldsReady}>変更を保存</button><button type="button" class="quiet" onclick={() => editingAttendeeId = ""}>閉じる</button></form></td></tr>{/if}{/each}</tbody></table></div>{/if}
+      {#if rosterAttendees.length === 0}<p>登録者はいません。</p>{:else}<div class="table-scroll"><table><thead><tr>{#if isAdministrator}<th><input type="checkbox" aria-label="表示中の参加者をすべて選択" checked={rosterAttendees.length > 0 && selectedRosterIds.length === rosterAttendees.length} onchange={(event) => selectedRosterIds = event.currentTarget.checked ? rosterAttendees.map((person) => person.id) : []} /></th>{/if}{#each displayColumns as column}<th>{column.label}</th>{/each}<th>受付操作</th></tr></thead><tbody>{#each rosterAttendees as attendee}<tr>{#if isAdministrator}<td><input type="checkbox" aria-label={`${attendee.name}を一括更新の対象に選択`} checked={selectedRosterIds.includes(attendee.id)} onchange={(event) => selectRosterPerson(attendee.id, event.currentTarget.checked)} /></td>{/if}{#each displayColumns as column}<td>{column.key === "name" ? attendee.name : column.key === "affiliation" ? attendee.affiliation ?? "" : column.key === "email" ? attendee.email_normalized ?? "" : column.key === "venue" ? venues.find((venue) => venue.id === attendee.venue_id)?.name ?? "" : column.key === "ticket" ? attendee.ticket_status : answerText(attendee.answers[column.key.slice(7)])}</td>{/each}<td>{#if attendee.ticket_status === "issued" && currentRole !== "viewer"}<button class="quiet" onclick={() => requestAttendeeCheckin(attendee)}>受付</button>{:else if attendee.ticket_status === "checked_in" && isAdministrator}<button class="quiet" onclick={() => reverseCheckIn(attendee.ticket_id)}>受付取消</button>{/if}{#if isAdministrator && attendee.ticket_status === "issued" && attendee.email_normalized}<button class="quiet" onclick={() => void resendTicketLink(attendee.id)}>チケットを送信</button>{/if}{#if isAdministrator}<button class="quiet" disabled={!walkInFieldsReady} onclick={() => beginEdit(attendee)}>編集</button>{/if}</td></tr>
+        {#if editingAttendeeId === attendee.id}<tr><td colspan={displayColumns.length + 1 + Number(isAdministrator)}><form class="form-grid" onsubmit={(event) => { event.preventDefault(); void saveAttendeeEdit(); }}><label>氏名<input bind:value={editName} required /></label><label>所属<input bind:value={editAffiliation} /></label><label>会場<select bind:value={editVenueId} disabled={attendee.ticket_status === "checked_in"}><option value="">未割当</option>{#each venues as venue}<option value={venue.id}>{venue.name}</option>{/each}</select></label>{#if walkInFieldsReady}<FieldInputs fields={walkInFields} bind:answers={editAnswers} />{:else}<p class="notice">回答項目を読み込んでいます。</p>{/if}<button disabled={!walkInFieldsReady}>変更を保存</button><button type="button" class="quiet" onclick={() => editingAttendeeId = ""}>閉じる</button></form></td></tr>{/if}{/each}</tbody></table></div>{/if}
       {#if editMessage}<p class="notice" aria-live="polite">{editMessage}</p>{/if}
       {#if confirmAttendee}<div class="dialog-backdrop"><dialog open class="confirm-dialog" aria-modal="true" aria-labelledby="confirm-attendee-title"><h2 id="confirm-attendee-title">参加者を確認</h2><p>受付する方のお名前と所属を確認してください。</p><dl><div><dt>氏名</dt><dd>{confirmAttendee.name}</dd></div><div><dt>所属</dt><dd>{confirmAttendee.affiliation ?? "未登録"}</dd></div><div><dt>会場</dt><dd>{venues.find((venue) => venue.id === confirmAttendee?.venue_id)?.name ?? "未割当"}</dd></div>{#each rosterFields as field}<div><dt>{field.label}</dt><dd>{answerText(confirmAttendee.answers[field.field_key])}</dd></div>{/each}</dl><button disabled={checkinBusy} onclick={() => void confirmAttendeeCheckin()}>本人確認して受付</button><button class="quiet" onclick={() => confirmAttendee = null}>戻る</button></dialog></div>{/if}
       {#if rosterCursor}<button class="quiet" onclick={() => loadRoster(selectedEventId, true)}>さらに表示</button>{/if}
@@ -801,15 +852,16 @@
       <form onsubmit={(event) => { event.preventDefault(); void createField(); }}>
         <label>項目キー<input bind:value={fieldKey} pattern={fieldKeyPattern} placeholder="company_name" required /></label>
         <label>表示名<input bind:value={fieldLabel} placeholder="所属" required /></label>
-        <label>型<select bind:value={fieldType}><option value="text">短文</option><option value="textarea">長文</option><option value="number">数値</option><option value="date">日付</option><option value="single_select">単一選択</option><option value="multi_select">複数選択</option><option value="checkbox">チェックボックス</option><option value="consent">同意</option></select></label>
+        <label>型<select aria-label="型" bind:value={fieldType}><option value="text">短文</option><option value="textarea">長文</option><option value="number">数値</option><option value="date">日付</option><option value="single_select">単一選択</option><option value="multi_select">複数選択</option><option value="checkbox">チェックボックス</option><option value="consent">同意</option></select></label>
         {#if fieldType === "single_select" || fieldType === "multi_select"}<label>選択肢（改行またはカンマ区切り）<textarea bind:value={fieldOptions} required></textarea></label>{/if}
-        <label class="inline"><input bind:checked={fieldRequired} type="checkbox" />必須項目</label><button>項目を追加</button>
+        <label class="inline"><input bind:checked={fieldRequired} type="checkbox" />必須項目</label><label class="inline"><input bind:checked={fieldAdminOnly} type="checkbox" />回答の閲覧・編集を管理者に限定する</label><button>項目を追加</button>
       </form>
       {#if fieldMessage}<p class="notice" aria-live="polite">{fieldMessage}</p>{/if}
+      {#key selectedEventId}<FieldManager eventId={selectedEventId} {api} onchange={refreshRosterWorkflows} />{/key}
       </section>{/if}
       {#if currentRole !== "viewer"}<section aria-labelledby="check-in"><h2 id="check-in">QR 受付</h2>
     {#if venues.length > 0}<label>受付会場<select bind:value={selectedVenueId}>{#each venues as venue}<option value={venue.id}>{venue.name}</option>{/each}</select></label>{/if}
-    <button class="quiet" onclick={scannerActive ? stopScanner : startScanner}>{scannerActive ? "カメラを閉じる" : "カメラで QR を読む"}</button>{#if scannerActive}<video bind:this={scannerVideo} playsinline aria-label="QR 読み取り用カメラ"></video>{/if}
+    <button class="quiet" onclick={scannerActive ? stopScanner : startScanner}>{scannerActive ? "カメラを閉じる" : "カメラで QR を読む"}</button>{#if scannerActive}<video bind:this={scannerVideo} playsinline muted aria-label="QR 読み取り用カメラ"></video>{/if}
     <p>チケット QR から読み取ったリンクを貼り付けてください。</p>
     <form onsubmit={(event) => { event.preventDefault(); void checkInTicketLink(); }}>
       <label>チケットリンク<input bind:value={ticketLink} type="url" inputmode="url" required /></label>
