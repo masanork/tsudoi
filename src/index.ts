@@ -1655,7 +1655,7 @@ app.get("/api/events/:eventId/attendees.csv", requireScope("admin"), async (c) =
   const rows = attendees.results.map((attendee) => [attendee.name, attendee.affiliation, attendee.email_normalized ?? "", attendee.venue_id ? venueLabels.get(attendee.venue_id) ?? attendee.venue_id : "", attendee.registration_source, attendee.status, attendee.created_at, ...fields.results.map((field) => answerMap.get(`${attendee.id}:${field.id}`) ?? ""), attendee.ticket_status]);
   const availableColumns = ["name", "affiliation", "email", "venue", "source", "status", "createdAt", ...fields.results.map((field) => `answer:${field.field_key}`), "ticket"];
   const requested = params.getAll("column");
-  if (requested.length > 107 || new Set(requested).size !== requested.length || requested.some((key) => !availableColumns.includes(key))) return badRequest(c, "invalid export columns");
+  if (requested.length > availableColumns.length || new Set(requested).size !== requested.length || requested.some((key) => !availableColumns.includes(key))) return badRequest(c, "invalid export columns");
   const indices = requested.length ? requested.map((key) => availableColumns.indexOf(key)) : availableColumns.slice(0, -1).map((_, index) => index);
   await audit(c.env.DB, c.get("auth"), "attendees.exported", "event", event.id, { columns: requested.length ? requested : availableColumns.slice(0, -1), count: rows.length, filters: Object.fromEntries(params.entries()) });
   c.header("Content-Type", "text/csv; charset=utf-8");

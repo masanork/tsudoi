@@ -115,6 +115,27 @@ describe("roster management workflows", () => {
     expect(JSON.parse(audit!.metadata_json)).toMatchObject({ columns: ["affiliation", "name", "ticket"], count: 52 });
   });
 
+  it("exports a displayed layout wider than the CSV import limit and still rejects invalid columns", async () => {
+    const owner = await session(), eventId = await event(owner), person = await attendee(eventId, owner.organizationId);
+    const fields = Array.from({ length: 103 }, (_, index) => ({ id: crypto.randomUUID(), key: `field_${index}`, label: `Field ${index}` }));
+    await env.DB.batch(fields.map((field, index) => env.DB.prepare("INSERT INTO form_fields (id, event_id, field_key, label, field_type, sort_order) VALUES (?, ?, ?, ?, 'text', ?)")
+      .bind(field.id, eventId, field.key, field.label, index)));
+    await env.DB.prepare("INSERT INTO attendee_answers (attendee_id, field_id, value_json) VALUES (?, ?, '\"Last answer\"')").bind(person.id, fields.at(-1)!.id).run();
+    const columns = ["name", "affiliation", "email", "venue", "ticket", ...fields.map((field) => `answer:${field.key}`)];
+    const path = `/api/events/${eventId}/attendees.csv`;
+    const params = new URLSearchParams(columns.map((column) => ["column", column]));
+    const response = await SELF.fetch(`${origin}${path}?${params}`, { headers: owner.headers });
+    expect(response.status).toBe(200);
+    const lines = (await response.text()).replace(/^\uFEFF/, "").trimEnd().split("\r\n");
+    expect(lines[0].split(",")).toEqual(["Name", "Affiliation", "Email", "Venue", "Ticket", ...fields.map((field) => field.label)].map((value) => `"${value}"`));
+    expect(lines[1].split(",")).toHaveLength(108);
+    expect(lines[1]).toMatch(/,"Last answer"$/);
+    for (const extra of ["name", "answer:unknown"]) {
+      const invalid = new URLSearchParams(params); invalid.append("column", extra);
+      expect((await SELF.fetch(`${origin}${path}?${invalid}`, { headers: owner.headers })).status).toBe(400);
+    }
+  });
+
   it("reuses organization templates with new IDs and no attendee information; key collisions roll back", async () => {
     const owner = await session(), source = await event(owner), destination = await event(owner), foreign = await session();
     const fieldId = await field(source, owner.headers); await attendee(source, owner.organizationId, "Private name");
