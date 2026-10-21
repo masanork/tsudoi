@@ -12,6 +12,7 @@ export async function verifyRosterWorkflows(page: Page, context: BrowserContext)
   await page.goto("/");
   await page.locator("li").filter({ hasText: "名簿運用検証" }).getByRole("button", { name: "管理する", exact: true }).click();
   const roster = page.getByRole("region", { name: "名簿を管理", exact: true });
+  const settings = page.getByRole("region", { name: "申込フォーム設定", exact: true });
   await expect(roster.locator("tbody tr")).toHaveCount(2);
 
   // Field changes and retirement preserve old answers; public forms use the active schema.
@@ -21,7 +22,7 @@ export async function verifyRosterWorkflows(page: Page, context: BrowserContext)
   await page.getByRole("button", { name: "項目の変更を保存", exact: true }).click();
   await expect(roster.getByRole("columnheader", { name: "参加区分", exact: true })).toBeVisible();
   await page.getByRole("button", { name: "申込から外す", exact: true }).click();
-  await expect(page.getByText("参加区分（廃止済み）", { exact: true })).toBeVisible();
+  await expect(settings.getByText("参加区分（廃止済み）", { exact: true })).toBeVisible();
   await expect(roster.getByRole("columnheader", { name: "参加区分", exact: true })).toHaveCount(0);
   expect((await (await context.request.get(`/api/events/${eventId}/roster`)).json()).attendees.some((person: { answers: Record<string, string> }) => person.answers.category === "一般")).toBe(true);
   await page.getByRole("button", { name: "申込に戻す", exact: true }).click();
