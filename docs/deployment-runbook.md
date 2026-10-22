@@ -172,6 +172,8 @@ health が `{"ok":true}` を返すことを確認する。OAuth metadata は JSO
 
 ## 7. 実 OAuth・MCP 確認
 
+2026-10-22に公式MCP Inspectorを使い、本番Workerのイベント専用キーによる接続・読み取り・更新・失効を確認した。[確認記録](acceptance/2026-10-22-mcp-inspector.md)を参照する。以下のOAuthログイン・同意と個別クライアントの確認は引き続き残る。
+
 スケジュール連携を提供する場合、実際にサポート対象とする OAuth/MCP クライアントを使い、検証イベント・テストユーザーで行う。結合テストの模擬クライアントや protected-resource metadata の取得だけでは合格にしない。
 
 1. クライアントに本番 MCP URL（`APP_ORIGIN` の `/mcp`）を登録し、実際のブラウザ OAuth 認可・同意を完了する。
