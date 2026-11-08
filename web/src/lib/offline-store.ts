@@ -285,7 +285,9 @@ export function exportPendingOperations(state: OfflineState) {
 export function disableServiceWorker() {
   if (!("serviceWorker" in navigator)) return Promise.resolve();
   return navigator.serviceWorker.getRegistrations().then(async (registrations) => {
-    await Promise.all(registrations.filter((registration) => new URL(registration.scope).origin === location.origin).map((registration) => registration.unregister()));
+    await Promise.all(registrations.filter((registration) => new URL(registration.scope).origin === location.origin).map(async (registration) => {
+      if (!registration.pushManager || !await registration.pushManager.getSubscription()) await registration.unregister();
+    }));
     const names = await caches.keys();
     await Promise.all(names.filter((name) => name.startsWith("tsudoi-static-shell-")).map((name) => caches.delete(name)));
   });

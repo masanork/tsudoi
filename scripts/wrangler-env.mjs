@@ -34,6 +34,8 @@ config.vars = {
   ...(values.RP_NAME ? { RP_NAME: values.RP_NAME } : {}),
   ...(values.EMAIL_FROM ? { EMAIL_FROM: values.EMAIL_FROM } : {}),
   ...(values.TURNSTILE_SITE_KEY ? { TURNSTILE_SITE_KEY: values.TURNSTILE_SITE_KEY } : {}),
+  ...(values.VAPID_PUBLIC_KEY ? { VAPID_PUBLIC_KEY: values.VAPID_PUBLIC_KEY } : {}),
+  ...(values.VAPID_SUBJECT ? { VAPID_SUBJECT: values.VAPID_SUBJECT } : {}),
 };
 
 const database = config.d1_databases?.[0];

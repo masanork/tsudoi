@@ -1,6 +1,6 @@
 import { env, SELF } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
-import { app } from "../../src/index";
+import { app, deliverSchedulePush } from "../../src/index";
 
 async function createApiOrganization(name: string) {
   const organizationId = crypto.randomUUID();
@@ -69,6 +69,59 @@ function parseWorkerCsv(input: string): string[][] {
 }
 
 describe("Worker D1 roster flow", () => {
+  it("encrypts push payloads and retries temporary failures without exposing message details", async () => {
+    const { organizationId, token } = await createApiOrganization("Push delivery");
+    const auth = { "content-type": "application/json", authorization: `Bearer ${token}` };
+    const created = await SELF.fetch(`https://tsudoi.test/api/organizations/${organizationId}/events`, { method: "POST", headers: auth, body: JSON.stringify({ name: "Private title", schedulingEnabled: true, registrationMode: "hybrid", initialScheduleOptions: [{ date: "2030-04-10" }] }) });
+    const { id } = await created.json<{ id: string }>();
+    const b64 = (bytes: Uint8Array) => btoa(String.fromCharCode(...bytes)).replaceAll("+", "-").replaceAll("/", "_").replaceAll("=", "");
+    const vapidPair = await crypto.subtle.generateKey({ name: "ECDSA", namedCurve: "P-256" }, true, ["sign", "verify"]);
+    const vapidPublic = b64(new Uint8Array(await crypto.subtle.exportKey("raw", vapidPair.publicKey)));
+    const vapidPrivate = (await crypto.subtle.exportKey("jwk", vapidPair.privateKey)).d!;
+    const clientPair = await crypto.subtle.generateKey({ name: "ECDH", namedCurve: "P-256" }, true, ["deriveBits"]);
+    const clientPublic = b64(new Uint8Array(await crypto.subtle.exportKey("raw", clientPair.publicKey)));
+    const subId = crypto.randomUUID();
+    await env.DB.prepare("INSERT INTO schedule_push_subscriptions (id, event_id, endpoint, p256dh, auth, owner_hash) VALUES (?, ?, ?, ?, ?, ?)").bind(subId, id, "https://fcm.googleapis.com/fcm/send/example", clientPublic, b64(crypto.getRandomValues(new Uint8Array(16))), "hash").run();
+    const poll = await (await SELF.fetch(`https://tsudoi.test/api/events/${id}/schedule`, { headers: auth })).json<{ options: Array<{ id: string }> }>();
+    expect((await SELF.fetch(`https://tsudoi.test/api/events/${id}/schedule/confirm`, { method: "POST", headers: auth, body: JSON.stringify({ optionId: poll.options[0].id, startLocal: "2030-04-10T14:00", endLocal: "2030-04-10T15:00" }) })).status).toBe(200);
+    const configuredEnv = { ...env, VAPID_PUBLIC_KEY: vapidPublic, VAPID_PRIVATE_KEY: vapidPrivate, VAPID_SUBJECT: "mailto:test@example.test" };
+    let calls = 0;
+    const send: typeof fetch = async (_input, init) => { calls++; expect(new Headers(init?.headers).get("content-encoding")).toBe("aes128gcm"); expect(init?.redirect).toBe("error"); return new Response(null, { status: calls === 1 ? 503 : 201 }); };
+    await deliverSchedulePush(configuredEnv, send);
+    expect(calls).toBe(1);
+    expect((await env.DB.prepare("SELECT attempts FROM schedule_push_deliveries WHERE event_id = ?").bind(id).first<{ attempts: number }>())?.attempts).toBe(1);
+    await env.DB.prepare("UPDATE schedule_push_deliveries SET next_attempt_at = datetime('now', '-1 minute') WHERE event_id = ?").bind(id).run();
+    await deliverSchedulePush(configuredEnv, send);
+    expect(calls).toBe(2);
+    expect((await env.DB.prepare("SELECT COUNT(*) AS n FROM schedule_push_deliveries WHERE event_id = ?").bind(id).first<{ n: number }>())?.n).toBe(0);
+  });
+  it("registers owned push subscriptions and creates durable deliveries for confirmation and changes", async () => {
+    const { organizationId, token } = await createApiOrganization("Push schedule");
+    const auth = { "content-type": "application/json", authorization: `Bearer ${token}` };
+    const created = await SELF.fetch(`https://tsudoi.test/api/organizations/${organizationId}/events`, { method: "POST", headers: auth, body: JSON.stringify({ name: "Push", schedulingEnabled: true, registrationMode: "hybrid", initialScheduleOptions: [{ date: "2030-04-10" }] }) });
+    const { id } = await created.json<{ id: string }>();
+    const endpoint = "https://fcm.googleapis.com/fcm/send/example", owner = "a".repeat(64);
+    const payload = { endpoint, p256dh: "A".repeat(87), auth: "A".repeat(22), owner };
+    const url = `https://tsudoi.test/public/events/${id}/schedule/push-subscriptions`;
+    const configuredEnv = { ...env, VAPID_PUBLIC_KEY: "public", VAPID_PRIVATE_KEY: "private", VAPID_SUBJECT: "mailto:test@example.test" };
+    const post = (body: object) => app.fetch(new Request(url, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) }), configuredEnv);
+    expect((await post({ ...payload, endpoint: "https://localhost/ssrf" })).status).toBe(400);
+    expect((await post(payload)).status).toBe(200);
+    expect((await post({ ...payload, owner: "b".repeat(64) })).status).toBe(409);
+    const poll = await (await SELF.fetch(`https://tsudoi.test/api/events/${id}/schedule`, { headers: auth })).json<{ options: Array<{ id: string }>; pushSubscriptionCount: number }>();
+    expect(poll.pushSubscriptionCount).toBe(1);
+    const confirmation = await SELF.fetch(`https://tsudoi.test/api/events/${id}/schedule/confirm`, { method: "POST", headers: auth, body: JSON.stringify({ optionId: poll.options[0].id, startLocal: "2030-04-10T14:00", endLocal: "2030-04-10T15:00" }) });
+    expect(confirmation.status).toBe(200);
+    expect((await env.DB.prepare("SELECT revision FROM schedule_push_deliveries WHERE event_id = ?").bind(id).all()).results).toEqual([{ revision: 1 }]);
+    const changed = await SELF.fetch(`https://tsudoi.test/api/events/${id}/schedule/confirmed`, { method: "PATCH", headers: auth, body: JSON.stringify({ revision: 1, startLocal: "2030-04-10T15:00", endLocal: "2030-04-10T16:00" }) });
+    expect(changed.status).toBe(200);
+    expect((await env.DB.prepare("SELECT revision FROM schedule_push_deliveries WHERE event_id = ? ORDER BY revision").bind(id).all()).results).toEqual([{ revision: 1 }, { revision: 2 }]);
+    const remove = (key: string) => app.fetch(new Request(url, { method: "DELETE", headers: { "content-type": "application/json" }, body: JSON.stringify({ endpoint, owner: key }) }), configuredEnv);
+    expect((await remove("b".repeat(64))).status).toBe(204);
+    expect((await env.DB.prepare("SELECT COUNT(*) AS n FROM schedule_push_subscriptions WHERE event_id = ?").bind(id).first<{ n: number }>())?.n).toBe(1);
+    expect((await remove(owner)).status).toBe(204);
+    expect((await env.DB.prepare("SELECT COUNT(*) AS n FROM schedule_push_deliveries WHERE event_id = ?").bind(id).first<{ n: number }>())?.n).toBe(0);
+  });
   it("confirms a selected date with local times and publishes its calendar", async () => {
     const { organizationId, token } = await createApiOrganization("Confirmed schedule");
     const auth = { "content-type": "application/json", authorization: `Bearer ${token}` };
@@ -85,6 +138,12 @@ describe("Worker D1 roster flow", () => {
     expect(calendar).toContain("DTSTART:20300410T050000Z");
     expect(calendar).toContain("LOCATION:駅前");
     expect(calendar).toContain("DESCRIPTION:受付は1階");
+    const update = (revision: number, location: string) => SELF.fetch(`https://tsudoi.test/api/events/${id}/schedule/confirmed`, { method: "PATCH", headers: auth, body: JSON.stringify({ revision, startLocal: "2030-04-11T14:00", endLocal: "2030-04-11T15:00", location }) });
+    const [changed, stale] = await Promise.all([update(1, "会場A"), update(1, "会場B")]);
+    expect([changed.status, stale.status].sort()).toEqual([200, 409]);
+    const revised = await (await SELF.fetch(`https://tsudoi.test/public/events/${id}/schedule`)).json<{ event: Record<string, string> }>();
+    expect(revised.event.starts_at).toBe("2030-04-11T05:00:00.000Z");
+    expect(["会場A", "会場B"]).toContain(revised.event.schedule_location);
   });
   it("limits schedule conversations to active polls and lets only the event administrator delete messages", async () => {
     const owner = await createApiOrganization("Conversation owner");
@@ -201,9 +260,11 @@ describe("Worker D1 roster flow", () => {
 
     const response = await SELF.fetch(`https://tsudoi.test/public/events/${eventId}/schedule/responses`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ optionId, respondentId: "respondent-1", respondentName: "Ada Lovelace", response: "yes" }) });
     expect(response.status).toBe(201);
-    const confirm = await SELF.fetch(`https://tsudoi.test/api/events/${eventId}/schedule/confirm`, { method: "POST", headers: auth, body: JSON.stringify({ optionId }) });
+    const missingTime = await SELF.fetch(`https://tsudoi.test/api/events/${eventId}/schedule/confirm`, { method: "POST", headers: auth, body: JSON.stringify({ optionId }) });
+    expect(missingTime.status).toBe(400);
+    const confirm = await SELF.fetch(`https://tsudoi.test/api/events/${eventId}/schedule/confirm`, { method: "POST", headers: auth, body: JSON.stringify({ optionId, startLocal: "2026-11-01T10:00", endLocal: "2026-11-01T11:00" }) });
     expect(confirm.status).toBe(200);
-    await expect(env.DB.prepare("SELECT starts_at, ends_at, schedule_status FROM events WHERE id = ?").bind(eventId).first()).resolves.toMatchObject({ starts_at: "2026-11-01", ends_at: "2026-11-01", schedule_status: "confirmed" });
+    await expect(env.DB.prepare("SELECT starts_at, ends_at, schedule_status FROM events WHERE id = ?").bind(eventId).first()).resolves.toMatchObject({ starts_at: "2026-11-01T01:00:00.000Z", ends_at: "2026-11-01T02:00:00.000Z", schedule_status: "confirmed" });
   });
 
   it("creates a date-only schedule poll with its initial options", async () => {
@@ -268,7 +329,7 @@ describe("Worker D1 roster flow", () => {
     expect(denied.status).toBe(401);
     const fresh = await SELF.fetch(`https://tsudoi.test/public/events/${eventId}/schedule/agent-connections`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ respondentId: "owner", respondentName: "Owner" }) });
     const { token: freshToken } = await fresh.json<{ token: string }>();
-    await SELF.fetch(`https://tsudoi.test/api/events/${eventId}/schedule/confirm`, { method: "POST", headers: auth, body: JSON.stringify({ optionId: option.id }) });
+    await SELF.fetch(`https://tsudoi.test/api/events/${eventId}/schedule/confirm`, { method: "POST", headers: auth, body: JSON.stringify({ optionId: option.id, startLocal: "2026-12-01T10:00", endLocal: "2026-12-01T11:00" }) });
     const preferenceWrite = await SELF.fetch("https://tsudoi.test/mcp", { method: "POST", headers: { "content-type": "application/json", authorization: `Bearer ${freshToken}` }, body: JSON.stringify({ jsonrpc: "2.0", id: 2, method: "tools/call", params: { name: "update_scheduling_preferences", arguments: { availabilityText: "Changed" } } }) });
     await expect(preferenceWrite.json()).resolves.toMatchObject({ result: { isError: true } });
   });

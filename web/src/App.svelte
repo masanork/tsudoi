@@ -1,6 +1,7 @@
 <script lang="ts">
   import { onDestroy, onMount, tick } from "svelte";
   import ScheduleConversation from "./lib/ScheduleConversation.svelte";
+  import SchedulePush from "./lib/SchedulePush.svelte";
   import { startAuthentication, startRegistration } from "@simplewebauthn/browser";
   import QRCode from "qrcode";
   import DistributionPanel from "./lib/DistributionPanel.svelte";
@@ -89,8 +90,9 @@
   let selectedStaffId = "";
   let selectedEventId = "";
   let currentActorId = "";
-  let schedule: { enabled: boolean; status: string; date: string | null; startsAt?: string | null; endsAt?: string | null; allDay?: boolean; timeZone?: string; location?: string; details?: string; readyToConfirm?: string[]; participants?: Array<{ displayName: string; role: string; answered: boolean }>; options: Array<{ id: string; date: string; note: string; yes: number; maybe: number; no: number; start?: string | null; end?: string | null; allDay?: boolean }> } | null = null;
+  let schedule: { enabled: boolean; status: string; date: string | null; startsAt?: string | null; endsAt?: string | null; allDay?: boolean; timeZone?: string; location?: string; details?: string; detailRevision: number; pushSubscriptionCount: number; readyToConfirm?: string[]; participants?: Array<{ displayName: string; role: string; answered: boolean }>; options: Array<{ id: string; date: string; note: string; yes: number; maybe: number; no: number; start?: string | null; end?: string | null; allDay?: boolean }> } | null = null;
   let confirmationOption = "", confirmationStart = "", confirmationEnd = "", confirmationLocation = "", confirmationDetails = "";
+  let editingConfirmation = false;
   let scheduleInviteUrl = "";
   let scheduleDate = "";
   let scheduleNote = "";
@@ -141,6 +143,7 @@
   let turnstileToken = "";
   let publicSchedule: { event: { name: string; description: string; timezone: string; schedule_status: string; starts_at: string; ends_at: string; schedule_location: string; schedule_details: string }; options: Array<{ id: string; date: string; note: string; yes: number; maybe: number; no: number; start?: string | null; end?: string | null; allDay?: boolean }> } | null = null;
   let scheduleRespondentName = "";
+  let scheduleLink = "", scheduleLinkError = "";
   let scheduleRespondentId = "";
   let scheduleResponseMessage = "";
   let scheduleResponses: Record<string, string> = {};
@@ -255,6 +258,22 @@
   async function confirmSchedule(optionId: string) {
     try { await api(`/events/${selectedEventId}/schedule/confirm`, { method: "POST", body: JSON.stringify({ optionId, startLocal: confirmationStart, endLocal: confirmationEnd, location: confirmationLocation, details: confirmationDetails }) }); confirmationOption = ""; await loadEvents(); await loadSchedule(selectedEventId); message = "日程を確定しました。"; }
     catch (error) { message = error instanceof Error ? error.message : "日程を確定できませんでした。"; }
+  }
+  function localDateTime(instant: string, zone: string) {
+    const parts = new Intl.DateTimeFormat("en-CA", { timeZone: zone, year: "numeric", month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit", hourCycle: "h23" }).formatToParts(new Date(instant));
+    const part = (name: string) => parts.find((item) => item.type === name)?.value ?? "";
+    return `${part("year")}-${part("month")}-${part("day")}T${part("hour")}:${part("minute")}`;
+  }
+  function editConfirmation() {
+    if (!schedule?.startsAt || !schedule.endsAt) return;
+    confirmationStart = schedule.allDay ? `${schedule.startsAt}T09:00` : localDateTime(schedule.startsAt, schedule.timeZone ?? "Asia/Tokyo");
+    confirmationEnd = schedule.allDay ? `${schedule.endsAt}T10:00` : localDateTime(schedule.endsAt, schedule.timeZone ?? "Asia/Tokyo");
+    confirmationLocation = schedule.location ?? ""; confirmationDetails = schedule.details ?? ""; editingConfirmation = true;
+  }
+  async function saveConfirmation() {
+    if (!schedule) return;
+    try { await api(`/events/${selectedEventId}/schedule/confirmed`, { method: "PATCH", body: JSON.stringify({ revision: schedule.detailRevision, startLocal: confirmationStart, endLocal: confirmationEnd, location: confirmationLocation, details: confirmationDetails }) }); editingConfirmation = false; await loadEvents(); await loadSchedule(selectedEventId); message = "確定内容を変更しました。"; }
+    catch { message = "変更できませんでした。別の操作で更新された場合は再読込してください。"; }
   }
   async function initializeOrganizer() {
     try {
@@ -667,6 +686,10 @@
     try { const response = await fetch(`/public/events/${scheduleEventId}/schedule`); const body = await response.json(); if (!response.ok) throw new Error(body.message ?? body.error); publicSchedule = body; if (body.options[0]?.date) { const [year, month] = body.options[0].date.split("-").map(Number); calendarMonth = new Date(year, month - 1, 1); } }
     catch { scheduleResponseMessage = "この日程調整は利用できません。"; }
   }
+  function openScheduleLink() {
+    try { const url = new URL(scheduleLink, location.origin); if (url.origin !== location.origin || !/^\/events\/[a-f0-9-]+\/schedule$/i.test(url.pathname)) throw new Error(); location.assign(url.pathname); }
+    catch { scheduleLinkError = "このサイトの日程調整リンクを入力してください。"; }
+  }
   async function submitScheduleResponse(optionId: string, responseValue: string) {
     try {
       const response = await fetch(`/public/events/${scheduleEventId}/schedule/responses`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ optionId, response: responseValue, respondentId: scheduleRespondentId, respondentName: scheduleRespondentName }) });
@@ -738,6 +761,7 @@
         <section class="schedule-form"><h3>AI に日程調整を任せる</h3><p class="muted">Grok には下の MCP URL をカスタムコネクタとして一度追加します。招待リンクのトークンで、この調整に参加できます。イベントごとのトークンは、OAuth を使わないクライアント向けです。</p><label>MCP URL<input readonly value={mcpUrl} /></label><button disabled={!scheduleRespondentName.trim()} onclick={() => void createAgentConnection()}>AI連携用トークンを発行</button><button class="quiet" disabled={!scheduleRespondentName.trim()} onclick={() => void loadAgentConnections()}>接続を確認</button>{#if agentConnection}<p class="notice">このトークンは一度だけ表示されます。AIのMCP接続設定に登録してください。</p><label>MCP URL<input readonly value={agentConnection.mcpUrl} /></label><label>アクセストークン<input readonly value={agentConnection.token} /></label><p class="muted">有効期限: {agentConnection.expiresInDays} 日。日程確定後は可否の変更が自動で停止します。</p>{/if}{#if agentConnections.length > 0}<h4>AI連携</h4><ul>{#each agentConnections as connection}<li><span>{connection.revoked_at ? "解除済み" : `有効（${connection.expires_at}まで）`}</span>{#if !connection.revoked_at}<button class="quiet" onclick={() => void revokeAgentConnection(connection.id)}>解除</button>{/if}</li>{/each}</ul>{/if}</section>
       {/if}
     </section>
+    <SchedulePush eventId={scheduleEventId} />
     <ScheduleConversation eventId={scheduleEventId} />
   {:else}<p class="notice" aria-live="polite">{scheduleResponseMessage}</p>{/if}
   {#if scheduleResponseMessage}<p class="notice" aria-live="polite">{scheduleResponseMessage}</p>{/if}
@@ -761,6 +785,7 @@
       {:else}<p>登録済みの Passkey を使って管理画面を開きます。</p><button onclick={signIn}>Passkey でログイン</button>{/if}
       <p class="notice" aria-live="polite">{setupMessage}</p>
     </section>
+    <section><h2>日程調整に参加</h2><p>共有された日程調整リンクを入力してください。ホーム画面から開いた場合も、ここから参加できます。</p><form onsubmit={(event) => { event.preventDefault(); openScheduleLink(); }}><label>日程調整リンク<input type="url" bind:value={scheduleLink} required /></label><button>日程調整を開く</button></form>{#if scheduleLinkError}<p aria-live="polite">{scheduleLinkError}</p>{/if}</section>
   {:else}
     <header class="app-header"><div><p class="eyebrow">EVENT ROSTER</p><h1>tsudoi</h1></div><nav aria-label="管理ナビゲーション">
       {#if screen !== "home"}<button class="quiet" onclick={goHome}>イベント</button>{/if}
@@ -799,7 +824,7 @@
     {:else}
       <section class="event-title"><h2>{events.find((event) => event.id === selectedEventId)?.name ?? "イベント管理"}</h2><p>必要な作業を選んでください。</p></section>
       <button type="button" class="quiet" onclick={openOfflinePanel}>オフライン受付を開く</button>
-      {#if schedule?.enabled}{#key selectedEventId}<ScheduleConversation eventId={selectedEventId} admin={isAdministrator} />{/key}{/if}
+      {#if schedule?.enabled}<p>通知登録: {schedule.pushSubscriptionCount} 件（端末数。配達・既読数ではありません）</p>{#key selectedEventId}<ScheduleConversation eventId={selectedEventId} admin={isAdministrator} />{/key}{/if}
       {#if schedule?.enabled && schedule.status !== "confirmed"}
         <section aria-labelledby="schedule-management"><h2 id="schedule-management">日程を調整</h2><p>候補日を選んで、参加者に回答してもらいます。</p>
           <p class="muted">共有用URL: <a href={`/events/${selectedEventId}/schedule`} target="_blank" rel="noreferrer">日程調整ページを開く</a></p>
@@ -810,7 +835,7 @@
           {#if confirmationOption}<form onsubmit={(event) => { event.preventDefault(); void confirmSchedule(confirmationOption); }}><h3>日時と場所を確定</h3><p>時刻は {schedule.timeZone} で入力します。</p><label>開始<input type="datetime-local" bind:value={confirmationStart} required /></label><label>終了<input type="datetime-local" bind:value={confirmationEnd} required /></label><label>場所<input bind:value={confirmationLocation} maxlength="500" /></label><label>補足<textarea bind:value={confirmationDetails} maxlength="2000"></textarea></label><button>日程を確定する</button></form>{/if}
         </section>
       {:else if schedule?.enabled}
-        <section class="notice"><strong>日程確定済み</strong><p>{schedule.startsAt ? scheduleOptionLabel({ date: schedule.date ?? "", start: schedule.startsAt, end: schedule.endsAt, allDay: schedule.allDay }) : ""}</p>{#if schedule.location}<p>場所: {schedule.location}</p>{/if}{#if schedule.details}<p>{schedule.details}</p>{/if}<a href={`/public/events/${selectedEventId}/schedule/calendar.ics`}>カレンダーに追加</a></section>
+        <section class="notice"><strong>日程確定済み</strong><p>{schedule.startsAt ? scheduleOptionLabel({ date: schedule.date ?? "", start: schedule.startsAt, end: schedule.endsAt, allDay: schedule.allDay }) : ""}</p>{#if schedule.location}<p>場所: {schedule.location}</p>{/if}{#if schedule.details}<p>{schedule.details}</p>{/if}<a href={`/public/events/${selectedEventId}/schedule/calendar.ics`}>カレンダーに追加</a>{#if isAdministrator}<button type="button" onclick={editConfirmation}>確定内容を変更</button>{/if}{#if editingConfirmation}<form onsubmit={(event) => { event.preventDefault(); void saveConfirmation(); }}><p>時刻は {schedule.timeZone} で入力します。</p><label>開始<input type="datetime-local" bind:value={confirmationStart} required /></label><label>終了<input type="datetime-local" bind:value={confirmationEnd} required /></label><label>場所<input bind:value={confirmationLocation} maxlength="500" /></label><label>補足<textarea bind:value={confirmationDetails} maxlength="2000"></textarea></label><button>変更を保存</button><button type="button" class="quiet" onclick={() => editingConfirmation = false}>キャンセル</button></form>{/if}</section>
       {/if}
       {#if isAdministrator}{#key selectedEventId}<AnnouncementPanel eventId={selectedEventId} {api} />{/key}{/if}
       <div class="management-grid"><a href="#roster">名簿を管理</a><a href="#distribution">物品配布</a><a href="#presence">入退館管理</a><a href="#paper-cards">紙QRカード</a><a href="#households">世帯・代理受取</a>{#if currentRole !== "viewer"}<a href="#check-in">QR 受付</a>{/if}{#if isAdministrator}<a href="#settings">申込フォーム設定</a>{/if}</div>

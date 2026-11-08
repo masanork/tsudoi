@@ -1,6 +1,7 @@
 import { Hono } from "hono";
 import { cors } from "hono/cors";
 import { timingSafeEqual } from "node:crypto";
+import { buildPushPayload } from "@block65/webcrypto-web-push";
 import type { Context, MiddlewareHandler } from "hono";
 import type { ContentfulStatusCode } from "hono/utils/http-status";
 import { generateAuthenticationOptions, generateRegistrationOptions, verifyAuthenticationResponse, verifyRegistrationResponse } from "@simplewebauthn/server";
@@ -16,7 +17,8 @@ type Role = "owner" | "admin" | "staff" | "viewer";
 export type OrganizerAuth = { organizationId: string; scopes: string[]; actorId: string; role: Role | "api_token"; kind: "session" | "api_token" };
 type AppVariables = { auth: OrganizerAuth; participantAttendeeId: string };
 type JsonRecord = Record<string, unknown>;
-type AppBindings = Cloudflare.Env & { TURNSTILE_SITE_KEY?: string; TURNSTILE_SECRET?: string };
+type PushConfig = { VAPID_PUBLIC_KEY?: string; VAPID_PRIVATE_KEY?: string; VAPID_SUBJECT?: string };
+type AppBindings = Cloudflare.Env & PushConfig & { TURNSTILE_SITE_KEY?: string; TURNSTILE_SECRET?: string };
 export type AppEnv = { Bindings: AppBindings; Variables: AppVariables };
 type NotificationJob =
   | { type: "ticket_link"; to: string; eventName: string; link: string; ticketUrl?: string }
@@ -411,7 +413,8 @@ app.get("/api/events/:eventId/schedule", requireScope("roster:read"), async (c) 
     WHERE o.event_id = ? GROUP BY o.id ORDER BY o.starts_at`).bind(event.id).all<{ id: string; starts_at: string; ends_at: string; note: string; responses: number; yes: number; maybe: number; no: number }>();
   const participants = await c.env.DB.prepare(`SELECT display_name, role, EXISTS(SELECT 1 FROM schedule_responses r WHERE r.event_id = schedule_participants.event_id AND r.respondent_id = schedule_participants.respondent_id) AS answered
     FROM schedule_participants WHERE event_id = ? ORDER BY joined_at`).bind(event.id).all<{ display_name: string; role: string; answered: number }>();
-  return c.json({ ...scheduleSummary(event), readyToConfirm: await readyOptionIds(c.env.DB, event.id), participants: participants.results.map((participant) => ({ displayName: participant.display_name, role: participant.role, answered: Number(participant.answered) === 1 })), options: options.results.map((option) => scheduleOptionForClient(option, timeZone)) });
+  const subscriptions = await c.env.DB.prepare("SELECT COUNT(*) AS count FROM schedule_push_subscriptions WHERE event_id = ?").bind(event.id).first<{ count: number }>();
+  return c.json({ ...scheduleSummary(event), pushSubscriptionCount: subscriptions?.count ?? 0, readyToConfirm: await readyOptionIds(c.env.DB, event.id), participants: participants.results.map((participant) => ({ displayName: participant.display_name, role: participant.role, answered: Number(participant.answered) === 1 })), options: options.results.map((option) => scheduleOptionForClient(option, timeZone)) });
 });
 
 app.post("/api/events/:eventId/schedule/options", requireScope("admin"), async (c) => {
@@ -450,17 +453,38 @@ app.post("/api/events/:eventId/schedule/confirm", requireScope("admin"), async (
     if (!start || !end || calendarDate(start, timeZone) !== optionDate || Date.parse(end) <= Date.parse(start) || Date.parse(end) - Date.parse(start) > 86400000) return badRequest(c, "invalid confirmation time");
     startsAt = start; endsAt = end;
   }
+  if (canonicalDate(startsAt)) return badRequest(c, "confirmation time is required");
   const location = optionalString(body.location) ?? "", details = optionalString(body.details) ?? "";
   if (location.length > 500 || details.length > 2000) return badRequest(c, "confirmation details too long");
   const [updated] = await c.env.DB.batch([
-    c.env.DB.prepare("UPDATE events SET starts_at = ?, ends_at = ?, schedule_location = ?, schedule_details = ?, schedule_status = 'confirmed', updated_at = CURRENT_TIMESTAMP WHERE id = ? AND schedule_status != 'confirmed' AND archived_at IS NULL")
+    c.env.DB.prepare("UPDATE events SET starts_at = ?, ends_at = ?, schedule_location = ?, schedule_details = ?, schedule_detail_revision = schedule_detail_revision + 1, schedule_status = 'confirmed', updated_at = CURRENT_TIMESTAMP WHERE id = ? AND schedule_status != 'confirmed' AND archived_at IS NULL")
       .bind(startsAt, endsAt, location, details, event.id),
     c.env.DB.prepare(`INSERT INTO schedule_revisions (event_id, revision, kind, summary_json)
       SELECT ?, COALESCE(MAX(revision), 0) + 1, 'confirmed', ? FROM schedule_revisions WHERE event_id = ? HAVING changes() = 1`)
       .bind(event.id, JSON.stringify({ optionId: option.id }), event.id),
   ]);
-  if (updated.meta.changes !== 1) return c.json({ error: "schedule_not_confirmable" }, 409);
+  if (!updated.meta.changes) return c.json({ error: "schedule_not_confirmable" }, 409);
+  c.executionCtx.waitUntil(deliverSchedulePush(c.env));
   return c.json({ confirmed: true, date: canonicalDate(startsAt) ?? calendarDate(startsAt, timeZone), calendar: confirmedCalendar({ uid: event.id, title: event.name, startsAt, endsAt, timeZone, url: `${c.env.APP_ORIGIN}/events/${event.id}/schedule` }) });
+});
+
+app.patch("/api/events/:eventId/schedule/confirmed", requireScope("admin"), async (c) => {
+  const event = await eventForAuth(c);
+  if (!event || event.scheduling_enabled !== 1 || event.schedule_status !== "confirmed") return c.json({ error: "not_found" }, 404);
+  const body = await jsonBody(c), timeZone = event.timezone ?? "Asia/Tokyo";
+  const start = localScheduleInstant(body.startLocal, timeZone), end = localScheduleInstant(body.endLocal, timeZone);
+  const location = optionalString(body.location) ?? "", details = optionalString(body.details) ?? "";
+  if (!start || !end || Date.parse(end) <= Date.parse(start) || Date.parse(end) - Date.parse(start) > 86400000 || location.length > 500 || details.length > 2000 || typeof body.revision !== "number" || !Number.isInteger(body.revision) || body.revision < 0) return badRequest(c, "invalid confirmation details");
+  const [updated] = await c.env.DB.batch([
+    c.env.DB.prepare(`UPDATE events SET starts_at = ?, ends_at = ?, schedule_location = ?, schedule_details = ?, schedule_detail_revision = schedule_detail_revision + 1, updated_at = CURRENT_TIMESTAMP
+      WHERE id = ? AND schedule_status = 'confirmed' AND archived_at IS NULL AND schedule_detail_revision = ?`)
+      .bind(start, end, location, details, event.id, body.revision),
+    c.env.DB.prepare(`INSERT INTO schedule_revisions (event_id, revision, kind, summary_json)
+      SELECT ?, COALESCE(MAX(revision), 0) + 1, 'confirmed_changed', '{}' FROM schedule_revisions WHERE event_id = ? HAVING changes() = 1`).bind(event.id, event.id),
+  ]);
+  if (!updated.meta.changes) return c.json({ error: "revision_conflict" }, 409);
+  c.executionCtx.waitUntil(deliverSchedulePush(c.env));
+  return c.json({ updated: true, revision: body.revision + 1 });
 });
 
 app.post("/api/events/:eventId/schedule/invites", requireScope("admin"), async (c) => {
@@ -2297,6 +2321,35 @@ app.get("/public/events/:eventId/schedule/messages", async (c) => {
   return c.json({ messages: rows.results.reverse() });
 });
 
+app.get("/public/events/:eventId/schedule/push-config", async (c) => {
+  const event = await c.env.DB.prepare("SELECT id FROM events WHERE id = ? AND scheduling_enabled = 1 AND archived_at IS NULL").bind(c.req.param("eventId")).first();
+  if (!event) return c.json({ error: "not_found" }, 404);
+  return c.json({ publicKey: c.env.VAPID_PUBLIC_KEY && c.env.VAPID_PRIVATE_KEY && c.env.VAPID_SUBJECT ? c.env.VAPID_PUBLIC_KEY : null });
+});
+
+app.post("/public/events/:eventId/schedule/push-subscriptions", async (c) => {
+  const limited = await rateLimit(c, `schedule-push:${clientIp(c)}`, 30, 3600);
+  if (limited) return limited;
+  if (!c.env.VAPID_PUBLIC_KEY || !c.env.VAPID_PRIVATE_KEY || !c.env.VAPID_SUBJECT) return c.json({ error: "push_unavailable" }, 503);
+  const body = await jsonBody(c), endpoint = requiredString(body, "endpoint"), p256dh = requiredString(body, "p256dh"), auth = requiredString(body, "auth"), owner = requiredString(body, "owner");
+  if (!endpoint || !validPushEndpoint(endpoint) || !p256dh || !/^[A-Za-z0-9_-]{87}$/.test(p256dh) || !auth || !/^[A-Za-z0-9_-]{22}$/.test(auth) || !owner || !/^[A-Za-z0-9_-]{32,128}$/.test(owner)) return badRequest(c, "invalid subscription");
+  const ownerHash = await sha256(owner), eventId = c.req.param("eventId");
+  const event = await c.env.DB.prepare("SELECT id FROM events WHERE id = ? AND scheduling_enabled = 1 AND archived_at IS NULL").bind(eventId).first();
+  if (!event) return c.json({ error: "not_found" }, 404);
+  const result = await c.env.DB.prepare(`INSERT INTO schedule_push_subscriptions (id, event_id, endpoint, p256dh, auth, owner_hash)
+    SELECT ?, ?, ?, ?, ?, ? WHERE (SELECT COUNT(*) FROM schedule_push_subscriptions WHERE event_id = ?) < 1000 OR EXISTS (SELECT 1 FROM schedule_push_subscriptions WHERE event_id = ? AND endpoint = ?)
+    ON CONFLICT(event_id, endpoint) DO UPDATE SET p256dh = excluded.p256dh, auth = excluded.auth WHERE owner_hash = excluded.owner_hash`)
+    .bind(crypto.randomUUID(), eventId, endpoint, p256dh, auth, ownerHash, eventId, eventId, endpoint).run();
+  return result.meta.changes === 1 ? c.json({ subscribed: true }) : c.json({ error: "subscription_conflict_or_limit" }, 409);
+});
+
+app.delete("/public/events/:eventId/schedule/push-subscriptions", async (c) => {
+  const body = await jsonBody(c), endpoint = requiredString(body, "endpoint"), owner = requiredString(body, "owner");
+  if (!endpoint || !owner || !/^[A-Za-z0-9_-]{32,128}$/.test(owner)) return badRequest(c, "invalid subscription");
+  await c.env.DB.prepare("DELETE FROM schedule_push_subscriptions WHERE event_id = ? AND endpoint = ? AND owner_hash = ?").bind(c.req.param("eventId"), endpoint, await sha256(owner)).run();
+  return c.body(null, 204);
+});
+
 app.get("/public/events/:eventId/schedule/calendar.ics", async (c) => {
   const event = await c.env.DB.prepare("SELECT * FROM events WHERE id = ? AND scheduling_enabled = 1 AND schedule_status = 'confirmed' AND archived_at IS NULL").bind(c.req.param("eventId")).first<EventRow>();
   if (!event || !event.starts_at || !event.ends_at) return c.json({ error: "not_found" }, 404);
@@ -3274,7 +3327,7 @@ function scheduleSummary(event: EventRow) {
   const starts = event.starts_at ?? "";
   const timeZone = event.timezone ?? "Asia/Tokyo";
   const allDay = !starts || canonicalDate(starts) === starts;
-  return { enabled: event.scheduling_enabled === 1, status: event.schedule_status, date: !starts ? null : allDay ? starts : calendarDate(starts, timeZone), startsAt: starts || null, endsAt: event.ends_at || null, allDay, timeZone, location: event.schedule_location ?? "", details: event.schedule_details ?? "" };
+  return { enabled: event.scheduling_enabled === 1, status: event.schedule_status, date: !starts ? null : allDay ? starts : calendarDate(starts, timeZone), startsAt: starts || null, endsAt: event.ends_at || null, allDay, timeZone, location: event.schedule_location ?? "", details: event.schedule_details ?? "", detailRevision: event.schedule_detail_revision ?? 0 };
 }
 function isUuid(value: string) { return /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(value); }
 function isUniqueConstraintError(error: unknown, columns: string) { return error instanceof Error && error.message.includes(`UNIQUE constraint failed: ${columns}`); }
@@ -3453,6 +3506,34 @@ function csvAnswer(value: string, fieldType?: string) {
   } catch { return ""; }
 }
 function clientIp(c: Context<AppEnv>) { return c.req.header("cf-connecting-ip") ?? "local"; }
+function validPushEndpoint(value: string) {
+  try {
+    const url = new URL(value), host = url.hostname;
+    return value.length <= 2048 && url.protocol === "https:" && !url.username && !url.password && !url.port && !url.hash &&
+      (host === "fcm.googleapis.com" || host === "updates.push.services.mozilla.com" || host === "web.push.apple.com" || host.endsWith(".push.apple.com"));
+  } catch { return false; }
+}
+
+export async function deliverSchedulePush(env: Cloudflare.Env & PushConfig, send: typeof fetch = fetch) {
+  if (!env.VAPID_PUBLIC_KEY || !env.VAPID_PRIVATE_KEY || !env.VAPID_SUBJECT) return;
+  // Leave room for request authentication and scheduled maintenance within D1's Free-plan query limit.
+  for (let i = 0; i < 10; i++) {
+    const claim = await env.DB.prepare(`UPDATE schedule_push_deliveries SET attempts = attempts + 1, next_attempt_at = datetime('now', '+10 minutes')
+      WHERE rowid = (SELECT rowid FROM schedule_push_deliveries WHERE next_attempt_at <= CURRENT_TIMESTAMP AND attempts < 8 ORDER BY next_attempt_at LIMIT 1)
+      RETURNING event_id, subscription_id, revision, attempts`).first<{ event_id: string; subscription_id: string; revision: number; attempts: number }>();
+    if (!claim) break;
+    const sub = await env.DB.prepare("SELECT s.endpoint, s.p256dh, s.auth FROM schedule_push_subscriptions s JOIN events e ON e.id = s.event_id WHERE s.id = ? AND s.event_id = ? AND e.archived_at IS NULL AND e.schedule_status = 'confirmed'").bind(claim.subscription_id, claim.event_id).first<{ endpoint: string; p256dh: string; auth: string }>();
+    if (!sub) { await env.DB.prepare("DELETE FROM schedule_push_deliveries WHERE event_id = ? AND subscription_id = ? AND revision = ?").bind(claim.event_id, claim.subscription_id, claim.revision).run(); continue; }
+    try {
+      if (!validPushEndpoint(sub.endpoint)) throw new Error("invalid push endpoint");
+      const payload = await buildPushPayload({ data: JSON.stringify({ url: `/events/${claim.event_id}/schedule`, title: "日程が更新されました" }), options: { ttl: 86400 } }, { endpoint: sub.endpoint, expirationTime: null, keys: { p256dh: sub.p256dh, auth: sub.auth } }, { subject: env.VAPID_SUBJECT, publicKey: env.VAPID_PUBLIC_KEY, privateKey: env.VAPID_PRIVATE_KEY });
+      const response = await send(sub.endpoint, { ...payload, redirect: "error" });
+      if (response.ok) await env.DB.prepare("DELETE FROM schedule_push_deliveries WHERE event_id = ? AND subscription_id = ? AND revision = ?").bind(claim.event_id, claim.subscription_id, claim.revision).run();
+      else if (response.status === 404 || response.status === 410) await env.DB.prepare("DELETE FROM schedule_push_subscriptions WHERE id = ?").bind(claim.subscription_id).run();
+      else if (response.status >= 400 && response.status < 500 && response.status !== 429) await env.DB.prepare("DELETE FROM schedule_push_deliveries WHERE event_id = ? AND subscription_id = ? AND revision = ?").bind(claim.event_id, claim.subscription_id, claim.revision).run();
+    } catch { console.warn(JSON.stringify({ event: "schedule_push_delivery_failed", attempts: claim.attempts })); }
+  }
+}
 async function inviteForToken(c: Context<AppEnv>) {
   return c.env.DB.prepare("SELECT id, organization_id, role, email_normalized FROM organization_invites WHERE token_hash = ? AND consumed_at IS NULL AND expires_at > CURRENT_TIMESTAMP")
     .bind(await sha256(c.req.param("token") ?? "")).first<{ id: string; organization_id: string; role: string; email_normalized: string | null }>();
@@ -3627,7 +3708,7 @@ async function consumeAuthChallenge(db: D1Database, table: "organizer_webauthn_c
 }
 async function audit(db: D1Database, auth: OrganizerAuth, action: string, targetType: string, targetId: string, metadata: JsonRecord = {}) { await db.prepare("INSERT INTO audit_logs (id, organization_id, actor_id, action, target_type, target_id, metadata_json) VALUES (?, ?, ?, ?, ?, ?, ?)").bind(crypto.randomUUID(), auth.organizationId, auth.actorId, action, targetType, targetId, JSON.stringify(metadata)).run(); }
 
-export type EventRow = { id: string; organization_id: string; name: string; status: string; archived_at?: string | null; registration_mode: string; capacity: number | null; timezone?: string; scheduling_enabled?: number; schedule_status?: string; starts_at?: string; ends_at?: string; schedule_location?: string; schedule_details?: string };
+export type EventRow = { id: string; organization_id: string; name: string; status: string; archived_at?: string | null; registration_mode: string; capacity: number | null; timezone?: string; scheduling_enabled?: number; schedule_status?: string; starts_at?: string; ends_at?: string; schedule_location?: string; schedule_details?: string; schedule_detail_revision?: number };
 export type FieldRow = { id: string; field_key: string; field_type: string; required: number; options_json: string };
 type DistributionAttendee = { id: string; name: string; affiliation: string; venue_id: string | null; operation_venue_id:string|null; venue_name: string | null; ticket_id: string; qr_token_hash: string | null };
 type DistributionClaimRow = { id: string; request_id: string; payload_hash: string; outcome: "accepted" | "limit_reached"; used_after: number; remaining_after: number; quantity: number; attendee_id: string; venue_id: string | null; created_at: string };
@@ -3642,6 +3723,7 @@ export default {
   fetch: app.fetch,
   async scheduled(_controller, env) {
     const deletedCount = await cleanupExpiredImportPreviews(env.DB);
+    await deliverSchedulePush(env);
     console.info(JSON.stringify({
       event: "import_preview_cleanup",
       deletedCount,
