@@ -94,6 +94,17 @@ describe("Worker D1 roster flow", () => {
     await deliverSchedulePush(configuredEnv, send);
     expect(calls).toBe(2);
     expect((await env.DB.prepare("SELECT COUNT(*) AS n FROM schedule_push_deliveries WHERE event_id = ?").bind(id).first<{ n: number }>())?.n).toBe(0);
+    const subscriptionAuth = b64(crypto.getRandomValues(new Uint8Array(16)));
+    await env.DB.batch(Array.from({ length: 24 }, (_, index) => env.DB.prepare("INSERT INTO schedule_push_subscriptions (id, event_id, endpoint, p256dh, auth, owner_hash) VALUES (?, ?, ?, ?, ?, ?)")
+      .bind(crypto.randomUUID(), id, `https://fcm.googleapis.com/fcm/send/${index}`, clientPublic, subscriptionAuth, "hash")));
+    await env.DB.prepare("UPDATE events SET schedule_detail_revision = schedule_detail_revision + 1 WHERE id = ?").bind(id).run();
+    calls = 0;
+    const delivered = new Set<string>();
+    const sendAll: typeof fetch = async (input) => { calls++; delivered.add(String(input)); return new Response(null, { status: 201 }); };
+    await Promise.all([deliverSchedulePush(configuredEnv, sendAll), deliverSchedulePush(configuredEnv, sendAll)]);
+    expect(calls).toBe(25);
+    expect(delivered.size).toBe(25);
+    expect((await env.DB.prepare("SELECT COUNT(*) AS n FROM schedule_push_deliveries WHERE event_id = ?").bind(id).first<{ n: number }>())?.n).toBe(0);
   });
   it("registers owned push subscriptions and creates durable deliveries for confirmation and changes", async () => {
     const { organizationId, token } = await createApiOrganization("Push schedule");

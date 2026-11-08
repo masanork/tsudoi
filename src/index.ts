@@ -3516,23 +3516,30 @@ function validPushEndpoint(value: string) {
 
 export async function deliverSchedulePush(env: Cloudflare.Env & PushConfig, send: typeof fetch = fetch) {
   if (!env.VAPID_PUBLIC_KEY || !env.VAPID_PRIVATE_KEY || !env.VAPID_SUBJECT) return;
-  // Leave room for request authentication and scheduled maintenance within D1's Free-plan query limit.
-  for (let i = 0; i < 10; i++) {
+  // Paid D1 allows 1,000 queries per invocation. Four senders stay under the
+  // Workers connection limit; the deadline leaves time for in-flight requests.
+  let remaining = 200;
+  const deadline = Date.now() + 20_000;
+  await Promise.all(Array.from({ length: 4 }, async () => {
+  while (remaining > 0 && Date.now() < deadline) {
+    remaining -= 1;
     const claim = await env.DB.prepare(`UPDATE schedule_push_deliveries SET attempts = attempts + 1, next_attempt_at = datetime('now', '+10 minutes')
       WHERE rowid = (SELECT rowid FROM schedule_push_deliveries WHERE next_attempt_at <= CURRENT_TIMESTAMP AND attempts < 8 ORDER BY next_attempt_at LIMIT 1)
       RETURNING event_id, subscription_id, revision, attempts`).first<{ event_id: string; subscription_id: string; revision: number; attempts: number }>();
-    if (!claim) break;
+    if (!claim) return;
     const sub = await env.DB.prepare("SELECT s.endpoint, s.p256dh, s.auth FROM schedule_push_subscriptions s JOIN events e ON e.id = s.event_id WHERE s.id = ? AND s.event_id = ? AND e.archived_at IS NULL AND e.schedule_status = 'confirmed'").bind(claim.subscription_id, claim.event_id).first<{ endpoint: string; p256dh: string; auth: string }>();
     if (!sub) { await env.DB.prepare("DELETE FROM schedule_push_deliveries WHERE event_id = ? AND subscription_id = ? AND revision = ?").bind(claim.event_id, claim.subscription_id, claim.revision).run(); continue; }
     try {
       if (!validPushEndpoint(sub.endpoint)) throw new Error("invalid push endpoint");
       const payload = await buildPushPayload({ data: JSON.stringify({ url: `/events/${claim.event_id}/schedule`, title: "日程が更新されました" }), options: { ttl: 86400 } }, { endpoint: sub.endpoint, expirationTime: null, keys: { p256dh: sub.p256dh, auth: sub.auth } }, { subject: env.VAPID_SUBJECT, publicKey: env.VAPID_PUBLIC_KEY, privateKey: env.VAPID_PRIVATE_KEY });
-      const response = await send(sub.endpoint, { ...payload, redirect: "error" });
+      const response = await send(sub.endpoint, { ...payload, redirect: "error", signal: AbortSignal.timeout(5000) });
+      if (response.body) await response.body.cancel().catch(() => {});
       if (response.ok) await env.DB.prepare("DELETE FROM schedule_push_deliveries WHERE event_id = ? AND subscription_id = ? AND revision = ?").bind(claim.event_id, claim.subscription_id, claim.revision).run();
       else if (response.status === 404 || response.status === 410) await env.DB.prepare("DELETE FROM schedule_push_subscriptions WHERE id = ?").bind(claim.subscription_id).run();
       else if (response.status >= 400 && response.status < 500 && response.status !== 429) await env.DB.prepare("DELETE FROM schedule_push_deliveries WHERE event_id = ? AND subscription_id = ? AND revision = ?").bind(claim.event_id, claim.subscription_id, claim.revision).run();
     } catch { console.warn(JSON.stringify({ event: "schedule_push_delivery_failed", attempts: claim.attempts })); }
   }
+  }));
 }
 async function inviteForToken(c: Context<AppEnv>) {
   return c.env.DB.prepare("SELECT id, organization_id, role, email_normalized FROM organization_invites WHERE token_hash = ? AND consumed_at IS NULL AND expires_at > CURRENT_TIMESTAMP")

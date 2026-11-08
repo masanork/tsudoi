@@ -228,7 +228,7 @@
     } catch (error) { message = error instanceof Error ? error.message : "作成に失敗しました。"; }
   }
   async function loadSchedule(eventId: string) {
-    try { schedule = await api(`/events/${eventId}/schedule`); }
+    try { const loaded = await api(`/events/${eventId}/schedule`); if (selectedEventId === eventId) schedule = loaded; }
     catch (error) { message = error instanceof Error ? error.message : "日程調整を読み込めませんでした。"; }
   }
   async function addScheduleOption() {
@@ -311,7 +311,7 @@
       await Promise.all([loadEvents(), loadProfile()]); message = "初期管理者を登録しました。まずはイベントを作成しましょう。";
     } catch (error) { setupMessage = error instanceof Error ? error.message : "Passkey を登録できませんでした。"; }
   }
-  function openEvent(eventId: string) { stopScanner(); csvColumns = []; csvRows = []; csvMapping = {}; csvPreview = null; csvDecisions = []; csvMessage = ""; confirmAttendee = null; editingAttendeeId = ""; editMessage = ""; checkinMessage = ""; ticketLinkMessage = ""; lastCheckinBy = ""; rosterAttendees = []; venues = []; selectedVenueId = ""; selectedEventId = eventId; screen = "event"; void selectEvent(eventId); }
+  function openEvent(eventId: string) { stopScanner(); csvColumns = []; csvRows = []; csvMapping = {}; csvPreview = null; csvDecisions = []; csvMessage = ""; confirmAttendee = null; editingAttendeeId = ""; editMessage = ""; checkinMessage = ""; ticketLinkMessage = ""; lastCheckinBy = ""; rosterAttendees = []; venues = []; selectedVenueId = ""; schedule = null; editingConfirmation = false; confirmationOption = ""; confirmationStart = ""; confirmationEnd = ""; confirmationLocation = ""; confirmationDetails = ""; selectedEventId = eventId; screen = "event"; void selectEvent(eventId); }
   async function signIn() {
     try {
       if (!window.PublicKeyCredential) throw new Error("この端末は Passkey に対応していません。");

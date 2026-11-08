@@ -3,9 +3,10 @@
   let { eventId }: { eventId: string } = $props();
   let publicKey = $state<string | null>(null), enabled = $state(false), message = $state(""), busy = $state(false);
   let key = $derived(`tsudoi-push-owner-${eventId}`);
+  let enabledKey = $derived(`tsudoi-push-enabled-${eventId}`);
   function decode(value: string) { const raw = atob(value.replaceAll("-", "+").replaceAll("_", "/") + "=".repeat((4 - value.length % 4) % 4)); return Uint8Array.from(raw, (char) => char.charCodeAt(0)); }
   function ownerToken() { let value = localStorage.getItem(key); if (!value) { value = Array.from(crypto.getRandomValues(new Uint8Array(32)), (byte) => byte.toString(16).padStart(2, "0")).join(""); localStorage.setItem(key, value); } return value; }
-  onMount(() => { void (async () => { try { const r = await fetch(`/public/events/${eventId}/schedule/push-config`); if (r.ok) publicKey = (await r.json()).publicKey; const registration = await navigator.serviceWorker?.getRegistration("/"); enabled = Boolean(localStorage.getItem(key) && await registration?.pushManager.getSubscription()); } catch { message = "通知設定を確認できませんでした。"; } })(); });
+  onMount(() => { void (async () => { try { const r = await fetch(`/public/events/${eventId}/schedule/push-config`); if (r.ok) publicKey = (await r.json()).publicKey; const registration = await navigator.serviceWorker?.getRegistration("/"); enabled = Boolean(localStorage.getItem(enabledKey) && localStorage.getItem(key) && await registration?.pushManager.getSubscription()); } catch { message = "通知設定を確認できませんでした。"; } })(); });
   async function subscribe() {
     if (!publicKey) return;
     busy = true;
@@ -17,7 +18,7 @@
       const json = subscription.toJSON();
       const response = await fetch(`/public/events/${eventId}/schedule/push-subscriptions`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ endpoint: json.endpoint, p256dh: json.keys?.p256dh, auth: json.keys?.auth, owner: ownerToken() }) });
       if (!response.ok) throw new Error("通知を登録できませんでした。");
-      enabled = true; message = "この端末で確定・変更通知を受け取ります。";
+      localStorage.setItem(enabledKey, "1"); enabled = true; message = "この端末で確定・変更通知を受け取ります。";
     } catch (error) { message = error instanceof Error ? error.message : "通知を登録できませんでした。"; }
     finally { busy = false; }
   }
@@ -27,7 +28,7 @@
       const subscription = await (await navigator.serviceWorker.getRegistration("/"))?.pushManager.getSubscription();
       const owner = localStorage.getItem(key);
       if (subscription && owner) { const response = await fetch(`/public/events/${eventId}/schedule/push-subscriptions`, { method: "DELETE", headers: { "content-type": "application/json" }, body: JSON.stringify({ endpoint: subscription.endpoint, owner }) }); if (!response.ok) throw new Error(); }
-      localStorage.removeItem(key); enabled = false; message = "この日程調整の通知を解除しました。";
+      localStorage.removeItem(key); localStorage.removeItem(enabledKey); enabled = false; message = "この日程調整の通知を解除しました。";
     } catch { message = "通知を解除できませんでした。"; }
     finally { busy = false; }
   }

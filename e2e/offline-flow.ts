@@ -213,10 +213,11 @@ export async function verifyOfflineFlow(page: Page, context: BrowserContext, fix
       await siblingPanel.getByRole("combobox", { name: "参加者を選択", exact: true }).selectOption(person.attendeeId);
       await siblingPanel.getByRole("combobox", { name: "配布回", exact: true }).selectOption(roundId);
       await siblingPanel.getByLabel("数量", { exact: true }).fill("1");
-      await Promise.all([
-        panel.getByRole("button", { name: "配布を記録", exact: true }).click(),
-        siblingPanel.getByRole("button", { name: "配布を記録", exact: true }).click(),
-      ]);
+      const mainClaim = panel.getByRole("button", { name: "配布を記録", exact: true });
+      const siblingClaim = siblingPanel.getByRole("button", { name: "配布を記録", exact: true });
+      // The other tab may consume the quota before Playwright can click.
+      const attempt = (button: typeof mainClaim) => button.click({ timeout: 3_000 }).catch(async () => { await expect(button).toBeDisabled(); });
+      await Promise.all([attempt(mainClaim), attempt(siblingClaim)]);
       await expect.poll(async () => (await storedState(page)).operations.length).toBe(1);
       await expect(panel.getByRole("button", { name: "配布を記録", exact: true })).toBeDisabled();
       await expect(siblingPanel.getByRole("button", { name: "配布を記録", exact: true })).toBeDisabled();
