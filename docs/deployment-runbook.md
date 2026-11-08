@@ -1,8 +1,8 @@
 # 本番反映・実環境確認ランブック
 
-最新配置は2026-10-21の名簿運用機能と表示列CSVのレビュー修正。Git commit `6fa7605`、Worker version `2f712d70-c69f-4580-b0c3-eb3ea11b046d`、DB migration `0001`〜`0008` を確認済み。[最新反映記録](releases/2026-10-21-roster-workflows.md)を参照し、次回も作業直前に取得し直す。以下のPR9までのmigration一覧・配置記録は過去の基準であり、現在の名簿運用コードを配置するには追加の `0008_roster_workflows.sql` が必要。
+最新配置は2026-11-09の日程相談・確定・通知。Git commit `089ac9375631c27ef723f3da1c534417874b24a4`、Worker version `c4a5dbfa-b0f2-4d51-a02a-3f966f341174`、DB migration `0001`〜`0012` を確認済み。[最新反映記録](releases/2026-11-09-scheduling.md)を参照し、次回も作業直前に取得し直す。以下のPR9までのmigration一覧・配置記録は過去の基準であり、現在のコードを配置するには `0008`〜`0012` も必要。
 
-この手順は次回の本番反映と、実機・実メール・OAuth/MCP 確認に使う。2026-10-06 07:26 JSTにオフライン配布のタブ間残数更新を直したPR9マージcommit `4018bcdaec13f961f0c7c35ab3691e898ac90d57` を反映した。本番Worker versionは `e6227e46-f2dc-4c5f-b27d-6a92d1ce7b12`（100%配信）、本番DBには `0001`〜`0007` が適用済み。[最新反映記録](releases/2026-10-06-field-operations.md)と[以前の履歴](releases/2026-10-05-production.md)を参照し、次回は作業直前に状態を再取得する。
+この手順は次回の本番反映と、実機・実メール・OAuth/MCP 確認に使う。過去の現場運用リリースについては[2026-10-06の反映記録](releases/2026-10-06-field-operations.md)と[以前の履歴](releases/2026-10-05-production.md)を参照する。
 
 手順を実行する担当者は、本番操作の権限と時間帯を確認し、送信可能な検証用メールアドレスを用意する。実機、メール受信、実 OAuth/MCP クライアントの確認ができない場合は「未確認」と記録し、合格扱いにしない。
 
@@ -37,6 +37,8 @@ Workerを旧版へ戻しても追加テーブルや履歴を削除しない。�
 
 3. Turnstileを有効にしている環境では、`TURNSTILE_SITE_KEY` が本番の公開フォーム設定と一致し、対応する `TURNSTILE_SECRET` が Wrangler secret として設定されていることを担当者が確認する。今回の本番ではsite keyは未設定。新たに有効化する場合は別途検証する。secret の値は表示・記録しない。送信元アドレスと Worker の Email binding が一致し、Queue producer/consumer が同じ本番 Queue を参照することを確認する。
 
+   日程通知の `VAPID_PUBLIC_KEY`・`VAPID_PRIVATE_KEY`・`VAPID_SUBJECT` は本番 Worker の secrets として設定済み。通常の再デプロイでは既存の鍵を維持し、再生成・上書きしない。公開鍵を変更すると既存端末の購読が使えなくなるため、鍵更新は再購読を含む別計画とする。ローカル環境ファイルに別の VAPID 値を追加して既存 binding と衝突させない。新環境での設定方法と送信上限は[日程調整の設計メモ](scheduling-conversation-design.md)を参照する。
+
 4. 反映前チェックを実行する。
 
    ```bash
@@ -69,15 +71,16 @@ node scripts/wrangler-env.mjs production d1 execute DB --remote --command "PRAGM
 node scripts/wrangler-env.mjs production d1 execute DB --remote --command "SELECT name FROM sqlite_master WHERE type='table' AND name='roster_import_previews';"
 ```
 
-migration履歴には `0001_initial.sql`〜`0007_field_operations.sql` があり、schemaには既存の名簿列・CSVプレビューに加え、配布・入退館・世帯・紙QRの11テーブルと `distribution_claims.proxy_group_id` があることを確認する。次の読み取りで追加スキーマを照合する。
+migration履歴には `0001_initial.sql`〜`0012_schedule_push.sql` があり、schemaには既存の名簿列・CSVプレビューに加え、配布・入退館・世帯・紙QRの11テーブルと `distribution_claims.proxy_group_id` があることを確認する。次の読み取りで追加スキーマを照合する。
 
 ```bash
 node scripts/wrangler-env.mjs production d1 execute DB --remote --command "SELECT name FROM sqlite_master WHERE type='table' AND name IN ('distributions','distribution_claims','attendee_presence','presence_requests','presence_movements','households','household_memberships','distribution_proxy_claims','distribution_proxy_items','ticket_qr_cards','ticket_qr_card_requests') ORDER BY name; SELECT name FROM pragma_table_info('distribution_claims') WHERE name='proxy_group_id';"
+node scripts/wrangler-env.mjs production d1 execute DB --remote --command "SELECT name, type FROM sqlite_master WHERE name IN ('schedule_messages','schedule_push_subscriptions','schedule_push_deliveries','schedule_push_after_change') ORDER BY name; SELECT name FROM pragma_table_info('events') WHERE name IN ('schedule_location','schedule_details','schedule_detail_revision') ORDER BY name;"
 ```
 
 未適用migrationの変更が履歴より先に実スキーマへ存在していないことも照合する。履歴とschemaが食い違う、想定外のmigrationがある、または対象DBを特定できない場合は停止してDB担当者に照合する。migrationファイルを編集・再採番して履歴を合わせてはならない。
 
-このWorkerは `0001`〜`0007` を必要とする。本番では適用済み。未適用の既存環境ではコードを出す前に適用する。適用済みDBで次のコマンドを実行しても、同じmigrationを再実行しない。
+このWorkerは `0001`〜`0012` を必要とする。本番では適用済み。未適用の既存環境ではコードを出す前に適用する。適用済みDBで次のコマンドを実行しても、同じmigrationを再実行しない。
 
 ```bash
 npm run db:migrate:production
@@ -87,7 +90,7 @@ node scripts/wrangler-env.mjs production d1 execute DB --remote --command "PRAGM
 node scripts/wrangler-env.mjs production d1 execute DB --remote --command "SELECT name FROM sqlite_master WHERE type='table' AND name='roster_import_previews';"
 ```
 
-一覧が `No migrations to apply!` であることに加え、migration履歴とschemaの双方で `0001`〜`0007` の適用を確認する。適用後も上記の追加スキーマ照合を実行する。`0004` は名簿列とCSVプレビュー、`0005`〜`0007` は配布・入退館・紙QR・世帯のテーブルと索引、nullableの代理受取関連列を追加する。列やテーブルを落とすdown migrationはない。適用中のエラー、または履歴と実DBの不一致があればデプロイを止め、migrationを手作業で再実行・修正しない。[D1 migrations の履歴と適用方法](https://developers.cloudflare.com/d1/reference/migrations/)
+一覧が `No migrations to apply!` であることに加え、migration履歴とschemaの双方で `0001`〜`0012` の適用を確認する。適用後も上記の追加スキーマ照合を実行する。`0004` は名簿列とCSVプレビュー、`0005`〜`0007` は配布・入退館・紙QR・世帯、`0008` は名簿運用、`0009`〜`0012` は日程相談と通知を追加する。列やテーブルを落とすdown migrationはない。適用中のエラー、または履歴と実DBの不一致があればデプロイを止め、migrationを手作業で再実行・修正しない。[D1 migrations の履歴と適用方法](https://developers.cloudflare.com/d1/reference/migrations/)
 
 新規環境を作る場合は、先に一度デプロイして Wrangler に D1 等のリソースを作成させ、その後 `npm run db:migrate:production` を実行し、全 migration の適用を確認してからアプリの利用を始める。既存本番の順序とは異なる。
 
@@ -195,10 +198,10 @@ rollback 先が active になる前にデータ構造の互換性を確認する
 
 復旧時はhandler対応版のactive配信を先に確認し、対象環境の `triggers.crons` を `["*/5 * * * *"]` に戻して `node scripts/wrangler-env.mjs production triggers deploy` を再実行する。Triggers設定と伝播後の `import_preview_cleanup` 成功ログを確認してから、定時削除の復旧を完了とする。Worker versionの切替だけでCronが再開したと判断しない。
 
-**`0004`〜`0007` はロールバック時にも保持する。** migrationを戻すSQLは実行せず、列・テーブル・履歴を削除しない。これらは追加的なスキーマ変更であり、データベースmigrationの後戻しはWorkerのrollbackに含めない。将来のschema cleanupが必要なら、別リリースで利用状況を確認し、独立した計画・レビューを経て行う。
+**`0004`〜`0012` はロールバック時にも保持する。** migrationを戻すSQLは実行せず、列・テーブル・履歴を削除しない。これらは追加的なスキーマ変更であり、データベースmigrationの後戻しはWorkerのrollbackに含めない。将来のschema cleanupが必要なら、別リリースで利用状況を確認し、独立した計画・レビューを経て行う。
 
 バージョン rollback 後に新コードで作成された名簿取込・所属情報のデータを旧版が読み書きする可能性がある。旧版で期待動作しないと判明した場合、データを削除・変換せず、互換コードの再デプロイまたは前進修正を選ぶ。参加者・チケット・回答・監査ログに対する手作業の変更を行わない。
 
 ## 完了記録
 
-各項目を「合格」「失敗」「未確認」のいずれかで記録し、未確認は残件として明示する。少なくともGit commit、Worker version、`0001`〜`0007` のmigration状態、health/metadata、主催者ログイン・名簿・受付と現場運用API、iOS、Android、実メール受信、実OAuth/MCPを含める。検証用セッションでのAPI確認と実機Passkeyによるログインは区別する。認証情報、秘密値、メールアドレス、参加者情報は記録しない。
+各項目を「合格」「失敗」「未確認」のいずれかで記録し、未確認は残件として明示する。少なくともGit commit、Worker version、`0001`〜`0012` のmigration状態、health/metadata、主催者ログイン・名簿・受付と現場運用API、iOS、Android、実メール受信、実OAuth/MCPを含める。検証用セッションでのAPI確認と実機Passkeyによるログインは区別する。認証情報、秘密値、メールアドレス、参加者情報は記録しない。
