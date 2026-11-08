@@ -38,6 +38,21 @@ test("completes Passkey setup, registration, roster reception, duplicate detecti
   await page.getByLabel("お名前", { exact: true }).fill("受付担当");
   await page.getByRole("button", { name: "Passkey を登録して始める" }).click();
   await expect(page.getByRole("heading", { name: "新しいイベントを作成" })).toBeVisible();
+  const poll = await context.request.post("/api/events", { data: { name: "日程相談", schedulingEnabled: true, registrationMode: "hybrid" } });
+  expect(poll.status()).toBe(201);
+  const { id: pollId } = await poll.json();
+  const visitorContext = await context.browser()!.newContext();
+  try {
+    const visitor = await visitorContext.newPage();
+    await visitor.goto(`http://localhost:4173/events/${pollId}/schedule`);
+    const conversation = visitor.getByRole("region", { name: "日程の相談" });
+    await conversation.getByLabel("お名前").fill("参加者");
+    await conversation.getByLabel("メッセージ").fill("14時からはどうですか？");
+    await conversation.getByRole("button", { name: "投稿する" }).click();
+    await expect(conversation.getByText("14時からはどうですか？")).toBeVisible();
+    await visitor.reload();
+    await expect(conversation.getByText("14時からはどうですか？")).toBeVisible();
+  } finally { await visitorContext.close(); }
   await page.getByLabel("イベント名", { exact: true }).fill("受付検証イベント");
   await page.getByLabel("開催日", { exact: true }).fill("2026-12-10");
   const created = page.waitForResponse((response) => response.url().endsWith("/api/events") && response.request().method() === "POST");

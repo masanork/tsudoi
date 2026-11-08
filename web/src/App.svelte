@@ -1,5 +1,6 @@
 <script lang="ts">
   import { onDestroy, onMount, tick } from "svelte";
+  import ScheduleConversation from "./lib/ScheduleConversation.svelte";
   import { startAuthentication, startRegistration } from "@simplewebauthn/browser";
   import QRCode from "qrcode";
   import DistributionPanel from "./lib/DistributionPanel.svelte";
@@ -736,6 +737,7 @@
         <section class="schedule-form"><h3>AI に日程調整を任せる</h3><p class="muted">Grok には下の MCP URL をカスタムコネクタとして一度追加します。招待リンクのトークンで、この調整に参加できます。イベントごとのトークンは、OAuth を使わないクライアント向けです。</p><label>MCP URL<input readonly value={mcpUrl} /></label><button disabled={!scheduleRespondentName.trim()} onclick={() => void createAgentConnection()}>AI連携用トークンを発行</button><button class="quiet" disabled={!scheduleRespondentName.trim()} onclick={() => void loadAgentConnections()}>接続を確認</button>{#if agentConnection}<p class="notice">このトークンは一度だけ表示されます。AIのMCP接続設定に登録してください。</p><label>MCP URL<input readonly value={agentConnection.mcpUrl} /></label><label>アクセストークン<input readonly value={agentConnection.token} /></label><p class="muted">有効期限: {agentConnection.expiresInDays} 日。日程確定後は可否の変更が自動で停止します。</p>{/if}{#if agentConnections.length > 0}<h4>AI連携</h4><ul>{#each agentConnections as connection}<li><span>{connection.revoked_at ? "解除済み" : `有効（${connection.expires_at}まで）`}</span>{#if !connection.revoked_at}<button class="quiet" onclick={() => void revokeAgentConnection(connection.id)}>解除</button>{/if}</li>{/each}</ul>{/if}</section>
       {/if}
     </section>
+    <ScheduleConversation eventId={scheduleEventId} />
   {:else}<p class="notice" aria-live="polite">{scheduleResponseMessage}</p>{/if}
   {#if scheduleResponseMessage}<p class="notice" aria-live="polite">{scheduleResponseMessage}</p>{/if}
 {:else if registrationEventId}
@@ -796,6 +798,7 @@
     {:else}
       <section class="event-title"><h2>{events.find((event) => event.id === selectedEventId)?.name ?? "イベント管理"}</h2><p>必要な作業を選んでください。</p></section>
       <button type="button" class="quiet" onclick={openOfflinePanel}>オフライン受付を開く</button>
+      {#if schedule?.enabled}{#key selectedEventId}<ScheduleConversation eventId={selectedEventId} admin={isAdministrator} />{/key}{/if}
       {#if schedule?.enabled && schedule.status !== "confirmed"}
         <section aria-labelledby="schedule-management"><h2 id="schedule-management">日程を調整</h2><p>候補日を選んで、参加者に回答してもらいます。</p>
           <p class="muted">共有用URL: <a href={`/events/${selectedEventId}/schedule`} target="_blank" rel="noreferrer">日程調整ページを開く</a></p>

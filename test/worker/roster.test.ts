@@ -69,6 +69,27 @@ function parseWorkerCsv(input: string): string[][] {
 }
 
 describe("Worker D1 roster flow", () => {
+  it("limits schedule conversations to active polls and lets only the event administrator delete messages", async () => {
+    const owner = await createApiOrganization("Conversation owner");
+    const other = await createApiOrganization("Other organization");
+    const auth = { "content-type": "application/json", authorization: `Bearer ${owner.token}` };
+    const created = await SELF.fetch(`https://tsudoi.test/api/organizations/${owner.organizationId}/events`, { method: "POST", headers: auth, body: JSON.stringify({ name: "Discussion", schedulingEnabled: true, registrationMode: "hybrid" }) });
+    const { id } = await created.json<{ id: string }>();
+    const path = `https://tsudoi.test/public/events/${id}/schedule/messages`;
+    const post = (message: string) => SELF.fetch(path, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ name: "参加者", message }) });
+    expect((await post("x".repeat(2001))).status).toBe(400);
+    const response = await post("14時からはどうですか？");
+    expect(response.status).toBe(201);
+    const message = await response.json<{ id: string }>();
+    expect((await (await SELF.fetch(path)).json<{ messages: unknown[] }>()).messages).toEqual([expect.objectContaining({ body: "14時からはどうですか？" })]);
+    const deletePath = `https://tsudoi.test/api/events/${id}/schedule/messages/${message.id}`;
+    expect((await SELF.fetch(deletePath, { method: "DELETE", headers: { authorization: `Bearer ${other.token}` } })).status).toBe(404);
+    expect((await SELF.fetch(deletePath, { method: "DELETE", headers: { authorization: `Bearer ${owner.token}` } })).status).toBe(204);
+    expect((await (await SELF.fetch(path)).json<{ messages: unknown[] }>()).messages).toEqual([]);
+    await post("残る投稿");
+    expect((await SELF.fetch(`https://tsudoi.test/api/events/${id}`, { method: "DELETE", headers: { authorization: `Bearer ${owner.token}` } })).status).toBe(200);
+    expect((await SELF.fetch(path)).status).toBe(404);
+  });
   it("uses an HttpOnly organizer session without a bearer token", async () => {
     const { sessionToken } = await createOrganizerSession("Session organization");
     const response = await SELF.fetch("https://tsudoi.test/api/events", { headers: { cookie: `tsudoi_organizer=${sessionToken}` } });

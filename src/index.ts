@@ -378,6 +378,7 @@ app.delete("/api/events/:eventId", requireScope("admin"), async (c) => {
     return c.json({ action: "archived" });
   }
   await c.env.DB.batch([
+    c.env.DB.prepare("DELETE FROM schedule_messages WHERE event_id = ?").bind(event.id),
     c.env.DB.prepare("DELETE FROM schedule_revisions WHERE event_id = ?").bind(event.id),
     c.env.DB.prepare("DELETE FROM schedule_invites WHERE event_id = ?").bind(event.id),
     c.env.DB.prepare("DELETE FROM schedule_participants WHERE event_id = ?").bind(event.id),
@@ -2273,6 +2274,41 @@ app.get("/public/events/:eventId/schedule", async (c) => {
     FROM schedule_options o LEFT JOIN schedule_responses r ON r.option_id = o.id
     WHERE o.event_id = ? GROUP BY o.id ORDER BY o.starts_at`).bind(c.req.param("eventId")).all<{ id: string; starts_at: string; ends_at: string; note: string; yes: number; maybe: number; no: number }>();
   return c.json({ event, options: options.results.map((option) => scheduleOptionForClient(option, String(event.timezone ?? "Asia/Tokyo"))) });
+});
+
+app.get("/public/events/:eventId/schedule/messages", async (c) => {
+  const event = await c.env.DB.prepare("SELECT id FROM events WHERE id = ? AND scheduling_enabled = 1 AND archived_at IS NULL").bind(c.req.param("eventId")).first();
+  if (!event) return c.json({ error: "not_found" }, 404);
+  const rows = await c.env.DB.prepare("SELECT id, display_name, body, created_at FROM schedule_messages WHERE event_id = ? ORDER BY created_at DESC, rowid DESC LIMIT 100").bind(c.req.param("eventId")).all();
+  return c.json({ messages: rows.results.reverse() });
+});
+
+app.post("/public/events/:eventId/schedule/messages", async (c) => {
+  const limited = await rateLimit(c, `schedule-message:${clientIp(c)}`, 30, 3600);
+  if (limited) return limited;
+  const body = await jsonBody(c);
+  const name = requiredString(body, "name"), message = requiredString(body, "message");
+  if (!name || name.length > 100 || !message || message.length > 2000) return badRequest(c, "invalid message");
+  const id = crypto.randomUUID();
+  const result = await c.env.DB.prepare(`INSERT INTO schedule_messages (id, event_id, display_name, body)
+    SELECT ?, id, ?, ? FROM events WHERE id = ? AND scheduling_enabled = 1 AND archived_at IS NULL`)
+    .bind(id, name, message, c.req.param("eventId")).run();
+  if (result.meta.changes !== 1) return c.json({ error: "not_found" }, 404);
+  return c.json({ id }, 201);
+});
+
+app.delete("/api/events/:eventId/schedule/messages/:messageId", requireScope("admin"), async (c) => {
+  const event = await eventForAuth(c);
+  if (!event || event.archived_at || event.scheduling_enabled !== 1) return c.json({ error: "not_found" }, 404);
+  const messageId = c.req.param("messageId") ?? "";
+  const [result] = await c.env.DB.batch([
+    c.env.DB.prepare("DELETE FROM schedule_messages WHERE id = ? AND event_id = ?").bind(messageId, event.id),
+    c.env.DB.prepare(`INSERT INTO audit_logs (id, organization_id, actor_id, action, target_type, target_id)
+      SELECT ?, ?, ?, 'schedule.message_deleted', 'schedule_message', ? WHERE changes() = 1`)
+      .bind(crypto.randomUUID(), event.organization_id, c.get("auth").actorId, messageId),
+  ]);
+  if (result.meta.changes !== 1) return c.json({ error: "not_found" }, 404);
+  return c.body(null, 204);
 });
 
 app.post("/public/events/:eventId/schedule/responses", async (c) => {
