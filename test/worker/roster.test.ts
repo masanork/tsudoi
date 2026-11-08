@@ -789,6 +789,7 @@ describe("Worker D1 roster flow", () => {
   });
 
   it("lets two OAuth-connected agents find a shared time and a confirmed calendar event", async () => {
+    const date = new Date(Date.now() + 14 * 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
     const discovery = await SELF.fetch("https://tsudoi.test/mcp", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "ping" }) });
     expect(discovery.status).toBe(401);
     expect(discovery.headers.get("WWW-Authenticate")).toContain("resource_metadata=\"https://tsudoi.test/.well-known/oauth-protected-resource/mcp\"");
@@ -810,10 +811,10 @@ describe("Worker D1 roster flow", () => {
     const beaJoined = await schedulingTool(bea.accessToken, "join_poll", { inviteToken: url });
     expect(adaJoined.value).toMatchObject({ joined: true, eventId, role: "required" });
     expect(beaJoined.value).toMatchObject({ joined: true, role: "required" });
-    await schedulingTool(ada.accessToken, "update_scheduling_preferences", { eventId, availabilityText: "Tuesday morning", constraints: { timeZone: "Asia/Tokyo", durationMinutes: 60, windows: [{ start: "2026-11-03T10:00:00+09:00", end: "2026-11-03T13:00:00+09:00" }] } });
-    await schedulingTool(bea.accessToken, "update_scheduling_preferences", { eventId, availabilityText: "Tuesday late morning", constraints: { timeZone: "UTC", durationMinutes: 90, windows: [{ start: "2026-11-03T02:00:00Z", end: "2026-11-03T05:00:00Z" }] } });
+    await schedulingTool(ada.accessToken, "update_scheduling_preferences", { eventId, availabilityText: "Morning", constraints: { timeZone: "Asia/Tokyo", durationMinutes: 60, windows: [{ start: `${date}T10:00:00+09:00`, end: `${date}T13:00:00+09:00` }] } });
+    await schedulingTool(bea.accessToken, "update_scheduling_preferences", { eventId, availabilityText: "Late morning", constraints: { timeZone: "UTC", durationMinutes: 90, windows: [{ start: `${date}T02:00:00Z`, end: `${date}T05:00:00Z` }] } });
     const suggestion = await schedulingTool(ada.accessToken, "suggest_slots", { eventId });
-    expect(suggestion.value.slots[0]).toEqual({ start: "2026-11-03T02:00:00.000Z", end: "2026-11-03T03:00:00.000Z" });
+    expect(suggestion.value.slots[0]).toEqual({ start: `${date}T02:00:00.000Z`, end: `${date}T03:00:00.000Z` });
     const proposed = await schedulingTool(bea.accessToken, "propose_schedule_option", { eventId, start: suggestion.value.slots[0].start, end: suggestion.value.slots[0].end, note: "overlap" });
     const optionId = proposed.value.id as string;
     const adaVote = await schedulingTool(ada.accessToken, "submit_schedule_availability", { eventId, responses: [{ optionId, response: "yes" }] });
@@ -830,7 +831,7 @@ describe("Worker D1 roster flow", () => {
     expect(confirmed.status).toBe(200);
     const finalPoll = await schedulingTool(bea.accessToken, "get_schedule_status", { eventId });
     expect(finalPoll.value.calendar.icalendar).toContain("BEGIN:VEVENT");
-    expect(finalPoll.value.calendar.icalendar).toContain("DTSTART:20261103T020000Z");
+    expect(finalPoll.value.calendar.icalendar).toContain(`DTSTART:${date.replaceAll("-", "")}T020000Z`);
     const changes = await schedulingTool(ada.accessToken, "get_schedule_changes", { eventId, since: 0 });
     expect(changes.value.changes.map((change: { kind: string }) => change.kind)).toContain("confirmed");
     const closed = await schedulingTool(ada.accessToken, "propose_schedule_option", { eventId, date: "2026-11-04" });
