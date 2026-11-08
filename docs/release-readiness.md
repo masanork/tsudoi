@@ -1,6 +1,6 @@
 # リリース準備メモ
 
-最新本番確認日: 2026-11-09。日程相談、日時・場所の確定と変更、Web Push の PR #14 を配置し、DB migration `0001`〜`0012` と公開・専用検証イベントの API を確認した。配置 version、commit、15項目の確認、通知・実機・オフライン端末に関する未確認事項は[本番反映記録](releases/2026-11-09-scheduling.md)を参照する。実端末への Push 到達や未同期記録の整合性は未確認。
+最新本番確認日: 2026-11-09。日程相談、日時・場所の確定と変更、Web Push の PR #14 を配置し、DB migration `0001`〜`0012` と公開・専用検証イベントの API を確認した。配置 version、commit、20項目の確認、通知・実機・オフライン端末に関する未確認事項は[本番反映記録](releases/2026-11-09-scheduling.md)を参照する。実端末への Push 到達や未同期記録の整合性は未確認。
 
 2026-10-22の履歴: 名簿運用機能と表示列CSVのレビュー修正をcommit `6fa7605`、version `2f712d70-c69f-4580-b0c3-eb3ea11b046d` として配信した。DBは `0001`〜`0008` を適用。PR #12はmainへマージされ、[マージ後のmain CI](https://github.com/masanork/tsudoi/actions/runs/39617385448)も成功した。初回の新API35確認、公開7チェック・108列CSVの8確認に加え、公式MCP Inspectorでイベント専用キーの接続・更新・失効に関する27確認が成功した。詳細は[当時の本番反映記録](releases/2026-10-21-roster-workflows.md)と[MCP接続記録](acceptance/2026-10-22-mcp-inspector.md)を参照する。
 
