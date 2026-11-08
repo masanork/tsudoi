@@ -1,7 +1,12 @@
 import { describe, expect, it } from "vitest";
-import { confirmedCalendar, extractInviteToken, parseConstraints, parseScheduleSlot, pkceS256, suggestSlots } from "../src/schedule-protocol";
+import { confirmedCalendar, extractInviteToken, localScheduleInstant, parseConstraints, parseScheduleSlot, pkceS256, suggestSlots } from "../src/schedule-protocol";
 
 describe("schedule protocol", () => {
+  it("rejects nonexistent and ambiguous local times", () => {
+    expect(localScheduleInstant("2026-03-08T02:30", "America/New_York")).toBeUndefined();
+    expect(localScheduleInstant("2026-11-01T01:30", "America/New_York")).toBeUndefined();
+    expect(localScheduleInstant("2030-04-10T14:00", "Asia/Tokyo")).toBe("2030-04-10T05:00:00.000Z");
+  });
   it("rejects normalized invalid calendar dates and meetings that cross into an unavailable day", () => {
     expect(parseScheduleSlot({ start: "2026-02-30T09:00:00Z", end: "2026-02-30T10:00:00Z" })).toBeUndefined();
     expect(parseScheduleSlot({ start: "2026-11-02T24:00:00Z", end: "2026-11-03T01:00:00Z" })).toBeUndefined();

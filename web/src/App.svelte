@@ -89,7 +89,8 @@
   let selectedStaffId = "";
   let selectedEventId = "";
   let currentActorId = "";
-  let schedule: { enabled: boolean; status: string; date: string | null; startsAt?: string | null; endsAt?: string | null; allDay?: boolean; timeZone?: string; readyToConfirm?: string[]; participants?: Array<{ displayName: string; role: string; answered: boolean }>; options: Array<{ id: string; date: string; note: string; yes: number; maybe: number; no: number; start?: string | null; end?: string | null; allDay?: boolean }> } | null = null;
+  let schedule: { enabled: boolean; status: string; date: string | null; startsAt?: string | null; endsAt?: string | null; allDay?: boolean; timeZone?: string; location?: string; details?: string; readyToConfirm?: string[]; participants?: Array<{ displayName: string; role: string; answered: boolean }>; options: Array<{ id: string; date: string; note: string; yes: number; maybe: number; no: number; start?: string | null; end?: string | null; allDay?: boolean }> } | null = null;
+  let confirmationOption = "", confirmationStart = "", confirmationEnd = "", confirmationLocation = "", confirmationDetails = "";
   let scheduleInviteUrl = "";
   let scheduleDate = "";
   let scheduleNote = "";
@@ -138,7 +139,7 @@
   let registrationName = ""; let registrationEmail = ""; let registrationAnswers: FormAnswers = {}; let registrationMessage = "";
   let turnstileSiteKey = "";
   let turnstileToken = "";
-  let publicSchedule: { event: { name: string; description: string; timezone: string; schedule_status: string }; options: Array<{ id: string; date: string; note: string; yes: number; maybe: number; no: number; start?: string | null; end?: string | null; allDay?: boolean }> } | null = null;
+  let publicSchedule: { event: { name: string; description: string; timezone: string; schedule_status: string; starts_at: string; ends_at: string; schedule_location: string; schedule_details: string }; options: Array<{ id: string; date: string; note: string; yes: number; maybe: number; no: number; start?: string | null; end?: string | null; allDay?: boolean }> } | null = null;
   let scheduleRespondentName = "";
   let scheduleRespondentId = "";
   let scheduleResponseMessage = "";
@@ -252,7 +253,7 @@
     catch (error) { message = error instanceof Error ? error.message : "招待リンクを発行できませんでした。"; }
   }
   async function confirmSchedule(optionId: string) {
-    try { await api(`/events/${selectedEventId}/schedule/confirm`, { method: "POST", body: JSON.stringify({ optionId }) }); await loadEvents(); await loadSchedule(selectedEventId); message = "日程を確定しました。"; }
+    try { await api(`/events/${selectedEventId}/schedule/confirm`, { method: "POST", body: JSON.stringify({ optionId, startLocal: confirmationStart, endLocal: confirmationEnd, location: confirmationLocation, details: confirmationDetails }) }); confirmationOption = ""; await loadEvents(); await loadSchedule(selectedEventId); message = "日程を確定しました。"; }
     catch (error) { message = error instanceof Error ? error.message : "日程を確定できませんでした。"; }
   }
   async function initializeOrganizer() {
@@ -728,7 +729,7 @@
   <header><p class="eyebrow">SCHEDULE POLL</p><h1>tsudoi</h1><p>{publicSchedule?.event.name ?? "日程調整"}</p></header>
   {#if publicSchedule}
     <section><h2>{publicSchedule.event.name} の日程調整</h2><p>{publicSchedule.event.description}</p>
-      {#if publicSchedule.event.schedule_status === "confirmed"}<p class="notice">日程は確定しています。</p>{:else}
+      {#if publicSchedule.event.schedule_status === "confirmed"}<div class="notice"><strong>日程は確定しています。</strong><p>{scheduleOptionLabel({ date: publicSchedule.event.starts_at, start: publicSchedule.event.starts_at, end: publicSchedule.event.ends_at, allDay: !publicSchedule.event.starts_at.includes("T") })}</p>{#if publicSchedule.event.schedule_location}<p>場所: {publicSchedule.event.schedule_location}</p>{/if}{#if publicSchedule.event.schedule_details}<p style="white-space: pre-wrap">{publicSchedule.event.schedule_details}</p>{/if}<a href={`/public/events/${scheduleEventId}/schedule/calendar.ics`}>カレンダーに追加</a></div>{:else}
         <label>お名前<input bind:value={scheduleRespondentName} required placeholder="山田太郎" /></label>
         <p class="muted">参加できる候補日をクリックしてください。もう一度クリックすると回答を外せます。</p>
         <div class="calendar-head"><button type="button" class="quiet" aria-label="前月" onclick={() => moveCalendarMonth(-1)}>‹</button><strong>{monthLabel(calendarMonth)}</strong><button type="button" class="quiet" aria-label="翌月" onclick={() => moveCalendarMonth(1)}>›</button></div>
@@ -805,10 +806,11 @@
           {#if isAdministrator}<div class="schedule-form"><p class="muted">Grok のコネクタ URL は参加者にも共通です。招待リンクを渡すと、相手の Grok がこの調整へ参加できます。</p><label>MCP URL<input readonly value={mcpUrl} /></label><button type="button" onclick={() => void createScheduleInvite("required")}>必須参加者の招待リンク</button><button type="button" class="quiet" onclick={() => void createScheduleInvite("optional")}>任意参加者の招待リンク</button>{#if scheduleInviteUrl}<label>招待リンク（14日間）<input readonly value={scheduleInviteUrl} /></label>{/if}</div>{/if}
           {#if schedule.participants && schedule.participants.length > 0}{@const waiting = schedule.participants.filter((participant) => !participant.answered)}<p class="muted">{waiting.length > 0 ? `未回答: ${waiting.map((participant) => participant.displayName).join("、")}` : "招待した参加者は回答済みです。"}</p>{/if}
           {#if isAdministrator}<form onsubmit={(event) => { event.preventDefault(); void addScheduleOption(); }} class="schedule-form"><div class="calendar-head"><button type="button" class="quiet" aria-label="前月" onclick={() => moveCalendarMonth(-1)}>‹</button><strong>{monthLabel(calendarMonth)}</strong><button type="button" class="quiet" aria-label="翌月" onclick={() => moveCalendarMonth(1)}>›</button></div><div class="calendar-grid">{#each ["日", "月", "火", "水", "木", "金", "土"] as weekday}<span class="calendar-weekday">{weekday}</span>{/each}{#each calendarDays(calendarMonth) as date}<div class="calendar-cell">{#if date}<button type="button" class:chosen={scheduleDraftDates.includes(date)} onclick={() => toggleScheduleDraftDate(date)}>{Number(date.slice(-2))}</button>{/if}</div>{/each}</div><label>メモ（任意・選んだ日すべてに付与）<input bind:value={scheduleNote} placeholder="会場の都合など" /></label><button disabled={scheduleDraftDates.length === 0}>選んだ {scheduleDraftDates.length} 日を候補に追加</button></form>{/if}
-          {#if schedule.options.length === 0}<p>候補日を追加してください。</p>{:else}<div class="schedule-list">{#each schedule.options as option}<div class="schedule-option"><div><strong>{scheduleOptionLabel(option)}</strong>{#if option.note}<p class="muted">{option.note}</p>{/if}<p class="muted">○ {option.yes ?? 0}　△ {option.maybe ?? 0}　× {option.no ?? 0}</p>{#if schedule.readyToConfirm?.includes(option.id)}<p class="muted">必須参加者が全員参加できる枠です。</p>{/if}</div>{#if isAdministrator}<button onclick={() => void confirmSchedule(option.id)}>この日に確定</button>{/if}</div>{/each}</div>{/if}
+          {#if schedule.options.length === 0}<p>候補日を追加してください。</p>{:else}<div class="schedule-list">{#each schedule.options as option}<div class="schedule-option"><div><strong>{scheduleOptionLabel(option)}</strong>{#if option.note}<p class="muted">{option.note}</p>{/if}<p class="muted">○ {option.yes ?? 0}　△ {option.maybe ?? 0}　× {option.no ?? 0}</p>{#if schedule.readyToConfirm?.includes(option.id)}<p class="muted">必須参加者が全員参加できる枠です。</p>{/if}</div>{#if isAdministrator}<button onclick={() => { confirmationOption = option.id; confirmationStart = `${option.date}T09:00`; confirmationEnd = `${option.date}T10:00`; }}>この日を選ぶ</button>{/if}</div>{/each}</div>{/if}
+          {#if confirmationOption}<form onsubmit={(event) => { event.preventDefault(); void confirmSchedule(confirmationOption); }}><h3>日時と場所を確定</h3><p>時刻は {schedule.timeZone} で入力します。</p><label>開始<input type="datetime-local" bind:value={confirmationStart} required /></label><label>終了<input type="datetime-local" bind:value={confirmationEnd} required /></label><label>場所<input bind:value={confirmationLocation} maxlength="500" /></label><label>補足<textarea bind:value={confirmationDetails} maxlength="2000"></textarea></label><button>日程を確定する</button></form>{/if}
         </section>
       {:else if schedule?.enabled}
-        <section class="notice"><strong>日程確定済み</strong><p>{schedule.startsAt ? scheduleOptionLabel({ date: schedule.date ?? "", start: schedule.startsAt, end: schedule.endsAt, allDay: schedule.allDay }) : ""}</p><p class="muted">{schedule.allDay === false ? "この時刻を参加者へ案内できます。" : "時刻は参加者へ別途ご連絡ください。"}</p></section>
+        <section class="notice"><strong>日程確定済み</strong><p>{schedule.startsAt ? scheduleOptionLabel({ date: schedule.date ?? "", start: schedule.startsAt, end: schedule.endsAt, allDay: schedule.allDay }) : ""}</p>{#if schedule.location}<p>場所: {schedule.location}</p>{/if}{#if schedule.details}<p>{schedule.details}</p>{/if}<a href={`/public/events/${selectedEventId}/schedule/calendar.ics`}>カレンダーに追加</a></section>
       {/if}
       {#if isAdministrator}{#key selectedEventId}<AnnouncementPanel eventId={selectedEventId} {api} />{/key}{/if}
       <div class="management-grid"><a href="#roster">名簿を管理</a><a href="#distribution">物品配布</a><a href="#presence">入退館管理</a><a href="#paper-cards">紙QRカード</a><a href="#households">世帯・代理受取</a>{#if currentRole !== "viewer"}<a href="#check-in">QR 受付</a>{/if}{#if isAdministrator}<a href="#settings">申込フォーム設定</a>{/if}</div>

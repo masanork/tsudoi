@@ -1,0 +1,2 @@
+ALTER TABLE events ADD COLUMN schedule_location TEXT NOT NULL DEFAULT '';
+ALTER TABLE events ADD COLUMN schedule_details TEXT NOT NULL DEFAULT '';

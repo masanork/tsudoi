@@ -2,6 +2,15 @@
 // IANA time zones, iCalendar weekdays (RFC 5545), and a published VEVENT.
 // Overlap itself is not a separate standard; it is computed from those values.
 
+import { Temporal } from "@js-temporal/polyfill";
+
+export function localScheduleInstant(value: unknown, timeZone: string): string | undefined {
+  if (typeof value !== "string" || !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}$/.test(value)) return undefined;
+  try {
+    return Temporal.PlainDateTime.from(value).toZonedDateTime(timeZone, { disambiguation: "reject" }).toInstant().toString({ fractionalSecondDigits: 3 });
+  } catch { return undefined; }
+}
+
 const WEEKDAY_ALIASES: Record<string, string> = {
   su: "SU", sun: "SU", sunday: "SU",
   mo: "MO", mon: "MO", monday: "MO",
@@ -124,7 +133,7 @@ export function suggestSlots(input: { constraints: SchedulingConstraints[]; dura
   return { durationMinutes, slots };
 }
 
-export function confirmedCalendar(input: { uid: string; title: string; startsAt: string; endsAt: string; timeZone: string; url: string; stamp?: Date }): { title: string; start: string; end: string; timeZone: string; url: string; allDay: boolean; icalendar: string } {
+export function confirmedCalendar(input: { uid: string; title: string; startsAt: string; endsAt: string; timeZone: string; url: string; location?: string; description?: string; stamp?: Date }): { title: string; start: string; end: string; timeZone: string; url: string; allDay: boolean; icalendar: string } {
   const allDay = canonicalDate(input.startsAt) === input.startsAt;
   const stamp = icalUtc((input.stamp ?? new Date()).toISOString());
   const uid = `${input.uid.replace(/[^A-Za-z0-9.@-]/g, "")}@tsudoi`;
@@ -142,6 +151,8 @@ export function confirmedCalendar(input: { uid: string; title: string; startsAt:
     startLine,
     endLine,
     `SUMMARY:${icalText(input.title)}`,
+    ...(input.location ? [`LOCATION:${icalText(input.location)}`] : []),
+    ...(input.description ? [`DESCRIPTION:${icalText(input.description)}`] : []),
     `URL:${icalText(input.url)}`,
     "END:VEVENT",
     "END:VCALENDAR",

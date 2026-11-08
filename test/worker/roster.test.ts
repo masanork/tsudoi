@@ -69,6 +69,23 @@ function parseWorkerCsv(input: string): string[][] {
 }
 
 describe("Worker D1 roster flow", () => {
+  it("confirms a selected date with local times and publishes its calendar", async () => {
+    const { organizationId, token } = await createApiOrganization("Confirmed schedule");
+    const auth = { "content-type": "application/json", authorization: `Bearer ${token}` };
+    const created = await SELF.fetch(`https://tsudoi.test/api/organizations/${organizationId}/events`, { method: "POST", headers: auth, body: JSON.stringify({ name: "Meeting", schedulingEnabled: true, registrationMode: "hybrid", initialScheduleOptions: [{ date: "2030-04-10" }] }) });
+    const { id } = await created.json<{ id: string }>();
+    const poll = await (await SELF.fetch(`https://tsudoi.test/api/events/${id}/schedule`, { headers: auth })).json<{ options: Array<{ id: string }> }>();
+    const confirm = (startLocal: string, endLocal: string) => SELF.fetch(`https://tsudoi.test/api/events/${id}/schedule/confirm`, { method: "POST", headers: auth, body: JSON.stringify({ optionId: poll.options[0].id, startLocal, endLocal, location: "駅前", details: "受付は1階" }) });
+    expect((await confirm("2030-04-11T14:00", "2030-04-11T15:00")).status).toBe(400);
+    const [first, second] = await Promise.all([confirm("2030-04-10T14:00", "2030-04-10T15:00"), confirm("2030-04-10T14:00", "2030-04-10T15:00")]);
+    expect([first.status, second.status].sort()).toEqual([200, 409]);
+    const publicPoll = await (await SELF.fetch(`https://tsudoi.test/public/events/${id}/schedule`)).json<{ event: Record<string, string> }>();
+    expect(publicPoll.event).toMatchObject({ starts_at: "2030-04-10T05:00:00.000Z", ends_at: "2030-04-10T06:00:00.000Z", schedule_location: "駅前", schedule_details: "受付は1階" });
+    const calendar = await (await SELF.fetch(`https://tsudoi.test/public/events/${id}/schedule/calendar.ics`)).text();
+    expect(calendar).toContain("DTSTART:20300410T050000Z");
+    expect(calendar).toContain("LOCATION:駅前");
+    expect(calendar).toContain("DESCRIPTION:受付は1階");
+  });
   it("limits schedule conversations to active polls and lets only the event administrator delete messages", async () => {
     const owner = await createApiOrganization("Conversation owner");
     const other = await createApiOrganization("Other organization");

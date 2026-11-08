@@ -10,7 +10,7 @@ import { checkIn } from "./check-in";
 import { cleanupExpiredImportPreviews } from "./maintenance";
 import { registerRosterWorkflows } from "./roster-workflows";
 import { rosterFilter } from "./roster-filters";
-import { calendarDate, canonicalDate, confirmedCalendar, extractInviteToken, parseConstraints, parseScheduleSlot, pkceS256, suggestSlots } from "./schedule-protocol";
+import { calendarDate, canonicalDate, confirmedCalendar, extractInviteToken, localScheduleInstant, parseConstraints, parseScheduleSlot, pkceS256, suggestSlots } from "./schedule-protocol";
 
 type Role = "owner" | "admin" | "staff" | "viewer";
 export type OrganizerAuth = { organizationId: string; scopes: string[]; actorId: string; role: Role | "api_token"; kind: "session" | "api_token" };
@@ -442,11 +442,25 @@ app.post("/api/events/:eventId/schedule/confirm", requireScope("admin"), async (
   const option = await c.env.DB.prepare("SELECT id, starts_at, ends_at FROM schedule_options WHERE id = ? AND event_id = ?")
     .bind(optionId, event.id).first<{ id: string; starts_at: string; ends_at: string }>();
   if (!option) return c.json({ error: "schedule_option_not_found" }, 404);
-  await c.env.DB.prepare("UPDATE events SET starts_at = ?, ends_at = ?, schedule_status = 'confirmed', updated_at = CURRENT_TIMESTAMP WHERE id = ?")
-    .bind(option.starts_at, option.ends_at, event.id).run();
-  await recordScheduleRevision(c.env.DB, event.id, "confirmed", { optionId: option.id });
   const timeZone = event.timezone ?? "Asia/Tokyo";
-  return c.json({ confirmed: true, date: canonicalDate(option.starts_at) === option.starts_at ? option.starts_at : calendarDate(option.starts_at, timeZone), calendar: confirmedCalendar({ uid: event.id, title: event.name, startsAt: option.starts_at, endsAt: option.ends_at, timeZone, url: `${c.env.APP_ORIGIN}/events/${event.id}/schedule` }) });
+  let startsAt = option.starts_at, endsAt = option.ends_at;
+  if (body.startLocal !== undefined || body.endLocal !== undefined) {
+    const start = localScheduleInstant(body.startLocal, timeZone), end = localScheduleInstant(body.endLocal, timeZone);
+    const optionDate = canonicalDate(option.starts_at) ?? calendarDate(option.starts_at, timeZone);
+    if (!start || !end || calendarDate(start, timeZone) !== optionDate || Date.parse(end) <= Date.parse(start) || Date.parse(end) - Date.parse(start) > 86400000) return badRequest(c, "invalid confirmation time");
+    startsAt = start; endsAt = end;
+  }
+  const location = optionalString(body.location) ?? "", details = optionalString(body.details) ?? "";
+  if (location.length > 500 || details.length > 2000) return badRequest(c, "confirmation details too long");
+  const [updated] = await c.env.DB.batch([
+    c.env.DB.prepare("UPDATE events SET starts_at = ?, ends_at = ?, schedule_location = ?, schedule_details = ?, schedule_status = 'confirmed', updated_at = CURRENT_TIMESTAMP WHERE id = ? AND schedule_status != 'confirmed' AND archived_at IS NULL")
+      .bind(startsAt, endsAt, location, details, event.id),
+    c.env.DB.prepare(`INSERT INTO schedule_revisions (event_id, revision, kind, summary_json)
+      SELECT ?, COALESCE(MAX(revision), 0) + 1, 'confirmed', ? FROM schedule_revisions WHERE event_id = ? HAVING changes() = 1`)
+      .bind(event.id, JSON.stringify({ optionId: option.id }), event.id),
+  ]);
+  if (updated.meta.changes !== 1) return c.json({ error: "schedule_not_confirmable" }, 409);
+  return c.json({ confirmed: true, date: canonicalDate(startsAt) ?? calendarDate(startsAt, timeZone), calendar: confirmedCalendar({ uid: event.id, title: event.name, startsAt, endsAt, timeZone, url: `${c.env.APP_ORIGIN}/events/${event.id}/schedule` }) });
 });
 
 app.post("/api/events/:eventId/schedule/invites", requireScope("admin"), async (c) => {
@@ -2264,7 +2278,7 @@ app.get("/public/events/:eventId", async (c) => {
 });
 
 app.get("/public/events/:eventId/schedule", async (c) => {
-  const event = await c.env.DB.prepare("SELECT id, name, description, timezone, scheduling_enabled, schedule_status FROM events WHERE id = ? AND scheduling_enabled = 1 AND archived_at IS NULL")
+  const event = await c.env.DB.prepare("SELECT id, name, description, timezone, scheduling_enabled, schedule_status, starts_at, ends_at, schedule_location, schedule_details FROM events WHERE id = ? AND scheduling_enabled = 1 AND archived_at IS NULL")
     .bind(c.req.param("eventId")).first();
   if (!event) return c.json({ error: "not_found" }, 404);
   const options = await c.env.DB.prepare(`SELECT o.id, o.starts_at, o.ends_at, o.note,
@@ -2281,6 +2295,13 @@ app.get("/public/events/:eventId/schedule/messages", async (c) => {
   if (!event) return c.json({ error: "not_found" }, 404);
   const rows = await c.env.DB.prepare("SELECT id, display_name, body, created_at FROM schedule_messages WHERE event_id = ? ORDER BY created_at DESC, rowid DESC LIMIT 100").bind(c.req.param("eventId")).all();
   return c.json({ messages: rows.results.reverse() });
+});
+
+app.get("/public/events/:eventId/schedule/calendar.ics", async (c) => {
+  const event = await c.env.DB.prepare("SELECT * FROM events WHERE id = ? AND scheduling_enabled = 1 AND schedule_status = 'confirmed' AND archived_at IS NULL").bind(c.req.param("eventId")).first<EventRow>();
+  if (!event || !event.starts_at || !event.ends_at) return c.json({ error: "not_found" }, 404);
+  const calendar = confirmedCalendar({ uid: event.id, title: event.name, startsAt: event.starts_at, endsAt: event.ends_at, timeZone: event.timezone ?? "Asia/Tokyo", location: event.schedule_location, description: event.schedule_details, url: `${c.env.APP_ORIGIN}/events/${event.id}/schedule` });
+  return c.body(calendar.icalendar, 200, { "Content-Type": "text/calendar; charset=utf-8", "Content-Disposition": "attachment; filename=tsudoi.ics" });
 });
 
 app.post("/public/events/:eventId/schedule/messages", async (c) => {
@@ -3253,7 +3274,7 @@ function scheduleSummary(event: EventRow) {
   const starts = event.starts_at ?? "";
   const timeZone = event.timezone ?? "Asia/Tokyo";
   const allDay = !starts || canonicalDate(starts) === starts;
-  return { enabled: event.scheduling_enabled === 1, status: event.schedule_status, date: !starts ? null : allDay ? starts : calendarDate(starts, timeZone), startsAt: starts || null, endsAt: event.ends_at || null, allDay, timeZone };
+  return { enabled: event.scheduling_enabled === 1, status: event.schedule_status, date: !starts ? null : allDay ? starts : calendarDate(starts, timeZone), startsAt: starts || null, endsAt: event.ends_at || null, allDay, timeZone, location: event.schedule_location ?? "", details: event.schedule_details ?? "" };
 }
 function isUuid(value: string) { return /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(value); }
 function isUniqueConstraintError(error: unknown, columns: string) { return error instanceof Error && error.message.includes(`UNIQUE constraint failed: ${columns}`); }
@@ -3606,7 +3627,7 @@ async function consumeAuthChallenge(db: D1Database, table: "organizer_webauthn_c
 }
 async function audit(db: D1Database, auth: OrganizerAuth, action: string, targetType: string, targetId: string, metadata: JsonRecord = {}) { await db.prepare("INSERT INTO audit_logs (id, organization_id, actor_id, action, target_type, target_id, metadata_json) VALUES (?, ?, ?, ?, ?, ?, ?)").bind(crypto.randomUUID(), auth.organizationId, auth.actorId, action, targetType, targetId, JSON.stringify(metadata)).run(); }
 
-export type EventRow = { id: string; organization_id: string; name: string; status: string; archived_at?: string | null; registration_mode: string; capacity: number | null; timezone?: string; scheduling_enabled?: number; schedule_status?: string; starts_at?: string; ends_at?: string };
+export type EventRow = { id: string; organization_id: string; name: string; status: string; archived_at?: string | null; registration_mode: string; capacity: number | null; timezone?: string; scheduling_enabled?: number; schedule_status?: string; starts_at?: string; ends_at?: string; schedule_location?: string; schedule_details?: string };
 export type FieldRow = { id: string; field_key: string; field_type: string; required: number; options_json: string };
 type DistributionAttendee = { id: string; name: string; affiliation: string; venue_id: string | null; operation_venue_id:string|null; venue_name: string | null; ticket_id: string; qr_token_hash: string | null };
 type DistributionClaimRow = { id: string; request_id: string; payload_hash: string; outcome: "accepted" | "limit_reached"; used_after: number; remaining_after: number; quantity: number; attendee_id: string; venue_id: string | null; created_at: string };
