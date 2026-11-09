@@ -1,6 +1,6 @@
 # 本番反映・実環境確認ランブック
 
-最新配置は2026-11-09の日程相談・確定・通知。Git commit `089ac9375631c27ef723f3da1c534417874b24a4`、Worker version `c4a5dbfa-b0f2-4d51-a02a-3f966f341174`、DB migration `0001`〜`0012` を確認済み。[最新反映記録](releases/2026-11-09-scheduling.md)を参照し、次回も作業直前に取得し直す。以下のPR9までのmigration一覧・配置記録は過去の基準であり、現在のコードを配置するには `0008`〜`0012` も必要。
+最新配置は2026-11-09の Web Push 送信修正。Git commit `97e2e079803de74d4946b1ecabcfd5de52e539fa`、Worker version `d6f8c9cc-a0fe-47ec-8da5-0d38eda27549`、DB migration `0001`〜`0012` を確認済み。[最新反映記録](releases/2026-11-09-push-fix.md)を参照し、次回も作業直前に取得し直す。以下のPR9までのmigration一覧・配置記録は過去の基準であり、現在のコードを配置するには `0008`〜`0012` も必要。
 
 この手順は次回の本番反映と、実機・実メール・OAuth/MCP 確認に使う。過去の現場運用リリースについては[2026-10-06の反映記録](releases/2026-10-06-field-operations.md)と[以前の履歴](releases/2026-10-05-production.md)を参照する。
 
