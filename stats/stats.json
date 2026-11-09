@@ -1,13 +1,13 @@
 {
-  "generatedAt": "2026-11-09T00:44:19.725Z",
-  "commit": "19991b3",
+  "generatedAt": "2026-11-09T21:11:32.715Z",
+  "commit": "fabfd12",
   "worker": {
     "files": 7,
     "lines": 4308
   },
   "web": {
-    "files": 18,
-    "lines": 3473
+    "files": 19,
+    "lines": 3490
   },
   "tests": {
     "files": 15,
