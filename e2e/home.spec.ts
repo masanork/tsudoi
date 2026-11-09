@@ -22,3 +22,19 @@ test("routes a visitor to an event registration screen", async ({ page }) => {
   await page.goto("/events/demo-event/register");
   await expect(page.getByText("EVENT REGISTRATION")).toBeVisible();
 });
+
+test("explains available options when an organizer has no passkey", async ({ page }) => {
+  await page.route("**/api/setup/status", (route) => route.fulfill({ json: { initialSetupRequired: false } }));
+  await page.route("**/api/session", (route) => route.fulfill({ status: 401, json: { error: "unauthorized" } }));
+  await page.goto("/");
+  await page.getByText("Passkey が見つからない場合").click();
+  await expect(page.getByText("招待は元のアカウントの復旧ではありません。", { exact: false })).toBeVisible();
+  await expect(page.getByText("現在はこの画面から元の管理者アカウントを復旧できません。", { exact: false })).toBeVisible();
+});
+
+test("explains how a participant can retrieve a ticket without a passkey", async ({ page }) => {
+  await page.goto("/ticket");
+  await page.getByText("Passkey が見つからない場合").click();
+  await expect(page.getByText("イベントの主催者に再送を依頼してください。", { exact: false })).toBeVisible();
+  await expect(page.getByText("新しい Passkey を追加する機能は、現在この画面にはありません。", { exact: false })).toBeVisible();
+});

@@ -2,6 +2,7 @@
   import { onDestroy, onMount, tick } from "svelte";
   import ScheduleConversation from "./lib/ScheduleConversation.svelte";
   import SchedulePush from "./lib/SchedulePush.svelte";
+  import PasskeyHelp from "./lib/PasskeyHelp.svelte";
   import { startAuthentication, startRegistration } from "@simplewebauthn/browser";
   import QRCode from "qrcode";
   import DistributionPanel from "./lib/DistributionPanel.svelte";
@@ -747,7 +748,7 @@
       {#if participantTicket.status === "issued"}<button onclick={cancelParticipantTicket}>参加をキャンセルする</button>{/if}
     </section>
     {#if participantTicket.status === "issued"}<section aria-labelledby="participant-qr"><h2 id="participant-qr">受付 QR</h2><p>表示後 15 分間有効です。会場で期限が切れたら更新してください。</p>{#if participantQr}<img src={participantQr} alt="受付用 QR コード" width="320" height="320" />{/if}<button onclick={refreshParticipantQr}>QR を更新</button></section>{/if}
-  {:else}<section><p class="notice" aria-live="polite">{participantMessage}</p><button onclick={signInParticipant}>Passkey でログイン</button></section>{/if}
+  {:else}<section><p class="notice" aria-live="polite">{participantMessage}</p><button onclick={signInParticipant}>Passkey でログイン</button><PasskeyHelp audience="participant" /></section>{/if}
 {:else if scheduleEventId}
   <header><p class="eyebrow">SCHEDULE POLL</p><h1>tsudoi</h1><p>{publicSchedule?.event.name ?? "日程調整"}</p></header>
   {#if publicSchedule}
@@ -780,9 +781,9 @@
       {#if initialSetupRequired}<p>この端末の Passkey で管理を始めます。イベントごとに主催者・共同主催者を設定できます。</p>
         <label>お名前<input bind:value={administratorName} autocomplete="name" placeholder="例: 山田 太郎" required /></label>
         <div class="avatar-setup"><img src={administratorAvatarUrl || identiconUrl(administratorName)} alt="プロフィール画像のプレビュー" /><div><label>プロフィール画像（任意）<input accept="image/png,image/jpeg,image/webp" onchange={(event) => void selectAdministratorAvatar(event.currentTarget.files?.[0])} type="file" /></label><p class="muted">未設定時は名前から作る Identicon を使います。PNG・JPEG・WebP、200KB以下。</p>{#if administratorAvatarUrl}<button type="button" class="quiet" onclick={() => administratorAvatarUrl = ""}>画像を外す</button>{/if}</div></div>
-        <label>メールアドレス（任意・非公開）<input bind:value={administratorEmail} autocomplete="email" type="email" placeholder="通知・復旧用" /></label>
+        <label>メールアドレス（任意・非公開）<input bind:value={administratorEmail} autocomplete="email" type="email" placeholder="通知用" /></label>
         <button onclick={registerInitialAdministrator}>Passkey を登録して始める</button>
-      {:else}<p>登録済みの Passkey を使って管理画面を開きます。</p><button onclick={signIn}>Passkey でログイン</button>{/if}
+      {:else}<p>登録済みの Passkey を使って管理画面を開きます。</p><button onclick={signIn}>Passkey でログイン</button><PasskeyHelp audience="organizer" />{/if}
       <p class="notice" aria-live="polite">{setupMessage}</p>
     </section>
     <section><h2>日程調整に参加</h2><p>共有された日程調整リンクを入力してください。ホーム画面から開いた場合も、ここから参加できます。</p><form onsubmit={(event) => { event.preventDefault(); openScheduleLink(); }}><label>日程調整リンク<input type="url" bind:value={scheduleLink} required /></label><button>日程調整を開く</button></form>{#if scheduleLinkError}<p aria-live="polite">{scheduleLinkError}</p>{/if}</section>
