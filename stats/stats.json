@@ -1,9 +1,9 @@
 {
-  "generatedAt": "2026-11-08T22:49:30.035Z",
-  "commit": "a254bdc",
+  "generatedAt": "2026-11-09T00:16:35.907Z",
+  "commit": "1d346ec",
   "worker": {
     "files": 7,
-    "lines": 4306
+    "lines": 4308
   },
   "web": {
     "files": 18,
@@ -11,7 +11,7 @@
   },
   "tests": {
     "files": 15,
-    "lines": 3186
+    "lines": 3193
   },
   "coverage": 100
 }
