@@ -3532,7 +3532,9 @@ export async function deliverSchedulePush(env: Cloudflare.Env & PushConfig, send
     try {
       if (!validPushEndpoint(sub.endpoint)) throw new Error("invalid push endpoint");
       const payload = await buildPushPayload({ data: JSON.stringify({ url: `/events/${claim.event_id}/schedule`, title: "日程が更新されました" }), options: { ttl: 86400 } }, { endpoint: sub.endpoint, expirationTime: null, keys: { p256dh: sub.p256dh, auth: sub.auth } }, { subject: env.VAPID_SUBJECT, publicKey: env.VAPID_PUBLIC_KEY, privateKey: env.VAPID_PRIVATE_KEY });
-      const response = await send(sub.endpoint, { ...payload, redirect: "error", signal: AbortSignal.timeout(5000) });
+      // Workers do not implement redirect: "error". Manual prevents a redirect
+      // from sending the encrypted payload to an unvalidated destination.
+      const response = await send(sub.endpoint, { ...payload, redirect: "manual", signal: AbortSignal.timeout(5000) });
       if (response.body) await response.body.cancel().catch(() => {});
       if (response.ok) await env.DB.prepare("DELETE FROM schedule_push_deliveries WHERE event_id = ? AND subscription_id = ? AND revision = ?").bind(claim.event_id, claim.subscription_id, claim.revision).run();
       else if (response.status === 404 || response.status === 410) await env.DB.prepare("DELETE FROM schedule_push_subscriptions WHERE id = ?").bind(claim.subscription_id).run();

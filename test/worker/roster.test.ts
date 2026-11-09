@@ -86,7 +86,7 @@ describe("Worker D1 roster flow", () => {
     expect((await SELF.fetch(`https://tsudoi.test/api/events/${id}/schedule/confirm`, { method: "POST", headers: auth, body: JSON.stringify({ optionId: poll.options[0].id, startLocal: "2030-04-10T14:00", endLocal: "2030-04-10T15:00" }) })).status).toBe(200);
     const configuredEnv = { ...env, VAPID_PUBLIC_KEY: vapidPublic, VAPID_PRIVATE_KEY: vapidPrivate, VAPID_SUBJECT: "mailto:test@example.test" };
     let calls = 0;
-    const send: typeof fetch = async (_input, init) => { calls++; expect(new Headers(init?.headers).get("content-encoding")).toBe("aes128gcm"); expect(init?.redirect).toBe("error"); return new Response(null, { status: calls === 1 ? 503 : 201 }); };
+    const send: typeof fetch = async (input, init) => { calls++; const request = new Request(String(input), init); expect(request.headers.get("content-encoding")).toBe("aes128gcm"); expect(request.redirect).toBe("manual"); return new Response(null, { status: calls === 1 ? 503 : 201 }); };
     await deliverSchedulePush(configuredEnv, send);
     expect(calls).toBe(1);
     expect((await env.DB.prepare("SELECT attempts FROM schedule_push_deliveries WHERE event_id = ?").bind(id).first<{ attempts: number }>())?.attempts).toBe(1);
@@ -105,6 +105,13 @@ describe("Worker D1 roster flow", () => {
     expect(calls).toBe(25);
     expect(delivered.size).toBe(25);
     expect((await env.DB.prepare("SELECT COUNT(*) AS n FROM schedule_push_deliveries WHERE event_id = ?").bind(id).first<{ n: number }>())?.n).toBe(0);
+    await env.DB.prepare("DELETE FROM schedule_push_subscriptions WHERE event_id = ? AND id != ?").bind(id, subId).run();
+    await env.DB.prepare("UPDATE events SET schedule_detail_revision = schedule_detail_revision + 1 WHERE id = ?").bind(id).run();
+    calls = 0;
+    const redirect: typeof fetch = async (_input, init) => { calls++; expect(init?.redirect).toBe("manual"); return new Response(null, { status: 302, headers: { location: "https://untrusted.example/" } }); };
+    await deliverSchedulePush(configuredEnv, redirect);
+    expect(calls).toBe(1);
+    expect((await env.DB.prepare("SELECT attempts FROM schedule_push_deliveries WHERE event_id = ?").bind(id).first<{ attempts: number }>())?.attempts).toBe(1);
   });
   it("registers owned push subscriptions and creates durable deliveries for confirmation and changes", async () => {
     const { organizationId, token } = await createApiOrganization("Push schedule");
